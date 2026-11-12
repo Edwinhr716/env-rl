@@ -440,6 +440,18 @@ user needs to know across them.
   stays as a re-export of the new module, with the same names.
 
 ### Fixed
+- Python client: `SandboxFleet.run()` keeps the error of a failed run when the
+  teardown at its end also fails. Before, the teardown's
+  `InfrastructureError` replaced it in each strategy (`none`, `naive`,
+  `sliding`, `pipelined`): a `KeyboardInterrupt` from a task or a failed warm
+  came out as "could not delete N environment(s)". The teardown error is now
+  logged as a warning and the run's error is raised; after a run that
+  succeeded, the teardown error is raised as before. This is the rule
+  `with fleet:` already follows. `with fleet:` on a `SandboxFleet` now also
+  logs the teardown error it does not raise, as `async with fleet:` on an
+  `AsyncSandboxFleet` does; before, it dropped it without a trace.
+  `SandboxFleet.close()` logs a backend close error when the teardown also
+  failed; it raises the teardown error, as before.
 - `internal/benchmarking/schema/v1/scenario.schema.json` describes every
   field `bench run` reads: it lacked 41 of them (`description`, `seed`,
   `window`, `overlays`, and fields of the SUT, job, window and overlay

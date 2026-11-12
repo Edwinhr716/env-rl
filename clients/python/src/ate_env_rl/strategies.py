@@ -15,10 +15,11 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import contextvars
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -103,6 +104,32 @@ def process_parallel(
     return results
 
 
+@contextlib.contextmanager
+def _torn_down(fleet: Any, teardown: bool) -> Iterator[None]:
+    """Tear the fleet down after the body, without losing the body's error.
+
+    A teardown error after a failed body is logged and the body's error is
+    raised: in its place it would hide the cause, and it would turn an
+    interrupt (a BaseException) into a failed run. After a body that
+    succeeded, a teardown error is raised. The same rule as
+    SandboxFleet.__exit__.
+    """
+    try:
+        yield
+    except BaseException:
+        if teardown:
+            try:
+                fleet.teardown()
+            except Exception:
+                logger.warning(
+                    "Fleet teardown failed after a failed run; the run's error is raised",
+                    exc_info=True,
+                )
+        raise
+    if teardown:
+        fleet.teardown()
+
+
 def run_none(
     fleet: Any,
     process_fn: Callable[[Task, SandboxHandle], Any],
@@ -110,12 +137,9 @@ def run_none(
     teardown: bool = True,
 ) -> list[Any]:
     """No pre-warming: on-demand 1:1 acquisition per task."""
-    try:
+    with _torn_down(fleet, teardown):
         # fleet.tasks is a snapshot: tasks added during the run are not run.
         return process_parallel(fleet, fleet.tasks, process_fn, concurrency)
-    finally:
-        if teardown:
-            fleet.teardown()
 
 
 def run_naive(
@@ -125,13 +149,10 @@ def run_naive(
     teardown: bool = True,
 ) -> list[Any]:
     """Pre-warm every image up front, process all tasks in parallel, tear down."""
-    try:
+    with _torn_down(fleet, teardown):
         fleet.setup()
         # fleet.tasks is a snapshot: tasks added during the run are not run.
         return process_parallel(fleet, fleet.tasks, process_fn, concurrency)
-    finally:
-        if teardown:
-            fleet.teardown()
 
 
 def run_sliding(
@@ -153,7 +174,7 @@ def run_sliding(
         by_image[t.image].append((i, t))
 
     results: list[Any] = [None] * len(tasks)
-    try:
+    with _torn_down(fleet, teardown):
         for start in range(0, len(images), window):
             batch = images[start : start + window]
             fleet.warm_images(batch, wait=True)
@@ -173,9 +194,6 @@ def run_sliding(
 
             for img in batch:
                 fleet.unwarm_image(img)
-    finally:
-        if teardown:
-            fleet.teardown()
 
     return results
 
@@ -206,44 +224,43 @@ def run_pipelined(
     batches = [images[s:s + window] for s in range(0, len(images), window)]
 
     prefetch_executor = ThreadPoolExecutor(max_workers=1)
-    try:
-        if batches:
-            fleet.warm_images(batches[0], wait=True)
+    with _torn_down(fleet, teardown):
+        try:
+            if batches:
+                fleet.warm_images(batches[0], wait=True)
 
-        for n, batch in enumerate(batches):
-            # Asynchronously prefetch window N+1
-            nxt_future = (
-                prefetch_executor.submit(
-                    contextvars.copy_context().run, fleet.warm_images, batches[n + 1], wait=True
+            for n, batch in enumerate(batches):
+                # Asynchronously prefetch window N+1
+                nxt_future = (
+                    prefetch_executor.submit(
+                        contextvars.copy_context().run, fleet.warm_images, batches[n + 1], wait=True
+                    )
+                    if n + 1 < len(batches)
+                    else None
                 )
-                if n + 1 < len(batches)
-                else None
-            )
 
-            batch_pairs = [(i, t) for img in batch for (i, t) in by_image[img]]
-            batch_tasks = [t for _i, t in batch_pairs]
+                batch_pairs = [(i, t) for img in batch for (i, t) in by_image[img]]
+                batch_tasks = [t for _i, t in batch_pairs]
 
-            logger.info(
-                "Pipelined window [%d/%d]: %d image(s), %d task(s)",
-                n + 1,
-                len(batches),
-                len(batch),
-                len(batch_tasks),
-            )
-            batch_results = process_parallel(fleet, batch_tasks, process_fn, concurrency)
-            for (orig_idx, _t), r in zip(batch_pairs, batch_results):
-                results[orig_idx] = r
+                logger.info(
+                    "Pipelined window [%d/%d]: %d image(s), %d task(s)",
+                    n + 1,
+                    len(batches),
+                    len(batch),
+                    len(batch_tasks),
+                )
+                batch_results = process_parallel(fleet, batch_tasks, process_fn, concurrency)
+                for (orig_idx, _t), r in zip(batch_pairs, batch_results):
+                    results[orig_idx] = r
 
-            # Unwarm batch N before awaiting next batch to maintain <= 2 windows bound
-            for img in batch:
-                fleet.unwarm_image(img)
+                # Unwarm batch N before awaiting next batch to maintain <= 2 windows bound
+                for img in batch:
+                    fleet.unwarm_image(img)
 
-            if nxt_future is not None:
-                nxt_future.result()
-    finally:
-        prefetch_executor.shutdown(wait=True)
-        if teardown:
-            fleet.teardown()
+                if nxt_future is not None:
+                    nxt_future.result()
+        finally:
+            prefetch_executor.shutdown(wait=True)
 
     return results
 

@@ -221,3 +221,163 @@ async def test_async_fleet_exit_raises_teardown_error_when_body_succeeds(monkeyp
         async with fleet:
             pass
     assert closed == [True]
+
+
+_STRATEGIES = ["none", "naive", "sliding", "pipelined"]
+
+
+def _fleet_with_failing_reap(monkeypatch, strategy):
+    from ate_env_rl import SandboxFleet
+
+    fleet = SandboxFleet(FleetConfig(backend="mock", strategy=strategy, window_size=1))
+    fleet.add_tasks([Task(id=f"t-{i}", image=f"img-{i}") for i in range(2)])
+
+    def reap(run_id):
+        raise InfrastructureError("could not delete 1 environment(s)")
+
+    monkeypatch.setattr(fleet.backend, "reap", reap)
+    return fleet
+
+
+@pytest.mark.parametrize("strategy", _STRATEGIES)
+def test_fleet_run_keeps_an_interrupt_when_the_teardown_fails(monkeypatch, caplog, strategy):
+    fleet = _fleet_with_failing_reap(monkeypatch, strategy)
+
+    def interrupted(task, handle):
+        raise KeyboardInterrupt
+
+    # The teardown error in the interrupt's place would turn a Ctrl-C into a
+    # failed run with the wrong cause.
+    with pytest.raises(KeyboardInterrupt):
+        fleet.run(interrupted)
+    assert "Fleet teardown failed after a failed run" in caplog.text
+    assert "could not delete 1 environment(s)" in caplog.text
+
+
+@pytest.mark.parametrize("strategy", ["naive", "sliding", "pipelined"])
+def test_fleet_run_keeps_a_warm_error_when_the_teardown_fails(monkeypatch, caplog, strategy):
+    fleet = _fleet_with_failing_reap(monkeypatch, strategy)
+
+    def no_warm(*args, **kwargs):
+        raise _FailingReap("warm failed")
+
+    # naive warms in setup(), the window strategies in warm_images().
+    monkeypatch.setattr(fleet, "setup" if strategy == "naive" else "warm_images", no_warm)
+    with pytest.raises(_FailingReap, match="warm failed"):
+        fleet.run(lambda task, handle: None)
+    assert "Fleet teardown failed after a failed run" in caplog.text
+
+
+@pytest.mark.parametrize("strategy", _STRATEGIES)
+def test_fleet_run_raises_the_teardown_error_when_the_run_succeeds(monkeypatch, strategy):
+    fleet = _fleet_with_failing_reap(monkeypatch, strategy)
+    with pytest.raises(InfrastructureError, match="could not delete"):
+        fleet.run(lambda task, handle: None)
+
+
+def test_fleet_exit_keeps_the_body_exception_and_logs_the_teardown_error(monkeypatch, caplog):
+    fleet = _fleet_with_failing_reap(monkeypatch, "naive")
+    with pytest.raises(_FailingReap, match="body failed"):
+        with fleet:
+            raise _FailingReap("body failed")
+    # The teardown error is not raised, so the log is the only place it shows.
+    assert "Fleet teardown failed after an error in the body" in caplog.text
+    assert "could not delete 1 environment(s)" in caplog.text
+
+
+def test_fleet_exit_raises_the_teardown_error_when_the_body_succeeds(monkeypatch, caplog):
+    fleet = _fleet_with_failing_reap(monkeypatch, "naive")
+    with pytest.raises(InfrastructureError, match="could not delete"):
+        with fleet:
+            pass
+    # Raised, so not also logged as a teardown that lost to a body error.
+    assert "Fleet teardown failed" not in caplog.text
+
+
+def test_pipelined_keeps_a_prefetch_error_when_the_teardown_fails(monkeypatch, caplog):
+    fleet = _fleet_with_failing_reap(monkeypatch, "pipelined")
+    real_warm = fleet.warm_images
+    warmed: list[list[str]] = []
+    processed: list[str] = []
+
+    def warm_images(images, **kwargs):
+        warmed.append(list(images))
+        if len(warmed) > 1:  # window 1, warmed by the prefetch thread
+            raise _FailingReap("prefetch failed")
+        return real_warm(images, **kwargs)
+
+    monkeypatch.setattr(fleet, "warm_images", warm_images)
+    with pytest.raises(_FailingReap, match="prefetch failed"):
+        fleet.run(lambda task, handle: processed.append(task.id))
+    # Window 0 warmed and ran; the error is the one of the prefetch of window 1.
+    assert warmed == [["img-0"], ["img-1"]]
+    assert processed == ["t-0"]
+    assert "Fleet teardown failed after a failed run" in caplog.text
+    assert "could not delete 1 environment(s)" in caplog.text
+
+
+@pytest.mark.parametrize("strategy", _STRATEGIES)
+def test_strategy_without_teardown_does_not_tear_down_after_a_failed_body(
+    monkeypatch, caplog, strategy
+):
+    from ate_env_rl.strategies import STRATEGIES
+
+    fleet = _fleet_with_failing_reap(monkeypatch, strategy)
+    teardowns: list[bool] = []
+    monkeypatch.setattr(fleet, "teardown", lambda: teardowns.append(True))
+
+    def interrupted(task, handle):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        STRATEGIES[strategy](fleet, interrupted, 1, teardown=False)
+    assert teardowns == []
+    assert "Fleet teardown failed" not in caplog.text
+
+
+@pytest.mark.parametrize("strategy", _STRATEGIES)
+def test_strategy_without_teardown_does_not_tear_down_after_a_run_that_succeeds(
+    monkeypatch, strategy
+):
+    from ate_env_rl.strategies import STRATEGIES
+
+    fleet = _fleet_with_failing_reap(monkeypatch, strategy)
+    teardowns: list[bool] = []
+    monkeypatch.setattr(fleet, "teardown", lambda: teardowns.append(True))
+    assert STRATEGIES[strategy](fleet, lambda task, handle: task.id, 1, teardown=False) == [
+        "t-0",
+        "t-1",
+    ]
+    assert teardowns == []
+
+
+def test_fleet_close_logs_the_backend_close_error_that_the_teardown_error_replaces(
+    monkeypatch, caplog
+):
+    fleet = _fleet_with_failing_reap(monkeypatch, "naive")
+
+    def close():
+        raise RuntimeError("channel close failed")
+
+    monkeypatch.setattr(fleet.backend, "close", close, raising=False)
+    # close() raises one error, the teardown's; the backend's is logged.
+    with pytest.raises(InfrastructureError, match="could not delete"):
+        fleet.close()
+    assert "Backend close failed after a failed teardown" in caplog.text
+    assert "channel close failed" in caplog.text
+
+
+def test_fleet_close_raises_the_backend_close_error_when_the_teardown_succeeds(
+    monkeypatch, caplog
+):
+    from ate_env_rl import SandboxFleet
+
+    fleet = SandboxFleet(FleetConfig(backend="mock"))
+
+    def close():
+        raise RuntimeError("channel close failed")
+
+    monkeypatch.setattr(fleet.backend, "close", close, raising=False)
+    with pytest.raises(RuntimeError, match="channel close failed"):
+        fleet.close()
+    assert "Backend close failed" not in caplog.text

@@ -149,13 +149,23 @@ class SandboxFleet:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        # A teardown or close error is raised only when the body succeeded, so
+        # it never replaces the body's exception; after a failed body it is
+        # logged, the only place it shows.
         try:
             self.close()
         except Exception:
             if exc_type is None:
                 raise
+            logger.warning("Fleet teardown failed after an error in the body", exc_info=True)
 
     def close(self) -> None:
+        """Tear the fleet down, then close the backend, also after a teardown error.
+
+        Raises one error: the teardown's, or the backend close's when the
+        teardown succeeded. A backend close error after a failed teardown is
+        logged.
+        """
         teardown_err: Exception | None = None
         try:
             self.teardown()
@@ -168,6 +178,12 @@ class SandboxFleet:
                 except Exception as be:
                     if teardown_err is None:
                         teardown_err = be
+                    else:
+                        logger.warning(
+                            "Backend close failed after a failed teardown; "
+                            "the teardown error is raised",
+                            exc_info=True,
+                        )
         if teardown_err is not None:
             raise teardown_err
 

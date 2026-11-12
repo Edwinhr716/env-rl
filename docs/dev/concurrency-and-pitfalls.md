@@ -119,10 +119,14 @@ Dispatch synchronous Python calls to a persistent `LoopRunner` background thread
 
 Record release errors in `RunReport` and retry unreleased actors during `fleet.teardown()`.
 
-- **Location**: `clients/python/src/ate_env_rl/backend/substrate.py`.
+- **Location**: `clients/python/src/ate_env_rl/backend/substrate.py` (release errors, retries);
+  `clients/python/src/ate_env_rl/fleet.py`, `async_fleet.py` and `strategies.py` (which error is
+  raised).
 - **Why**: Network errors during `delete` must not crash workers or leak orphan actors.
 - **Mechanism**: `SubstrateBackendDriver` logs failed deletes in `RunReport.release_errors` and
-  retains `_owned_actors`; `fleet.teardown()` retries, raising `InfrastructureError` if any fail.
+  retains `_owned_actors`; `fleet.teardown()` retries, raising `InfrastructureError` if any fail. A
+  teardown error never replaces the error of the body: `SandboxFleet.run()` and `with fleet:` log it
+  and raise the body's error (also an interrupt); they raise it only when the body succeeded.
 
 ### 9. Python warm-pool bookkeeping across awaits
 
