@@ -108,8 +108,8 @@ arguments go to `uv pip compile`: `./lock.sh --upgrade-package <name>` moves one
 
 ## 3. Register the base template
 
-This needs ate-env installed as in the [root README](../../README.md#get-started): Substrate v0.6.0
-or later, and ate-env-api's SPIFFE ID (`spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, namespace
+This needs ate-env installed as in the [root README](../../README.md#get-started): Substrate at or
+after the version that README names, and ate-env-api's SPIFFE ID (`spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, namespace
 `ate-env` by default) in the router's ingress allow-list. The template below uses the default limits of
 `ate-env manifest template` (2 CPUs, 4 GiB); pass `--cpu` and `--memory` to change them.
 
@@ -169,7 +169,7 @@ them by name. This also holds for a base without `--rootfs-image` that has the k
 answers `/health` through the proxy, checks the session key, creates `working_dir`, and deletes the
 environment on exit. `AteEnvWorkspace(env_id=...)` attaches to an existing environment and leaves
 it in place. Any failure after the create deletes the environment before the error reaches the
-caller.
+caller, unless `delete_on_exit=False`: then the environment stays, and the caller deletes it.
 
 | Field | Default | Meaning | `AgentSandboxWorkspace` |
 |---|---|---|---|
@@ -225,17 +225,20 @@ caller.
   retries, it also reads the environment's state over gRPC, at most once every 5 s, and stops on
   CRASHED (`RuntimeError`: delete it and create a new one), DELETING, or a deleted environment.
   The Substrate router holds each request while the environment wakes, up to about 10 s; a longer
-  wake gets the router's 504, or 503 with `X-Env-State` from an ate-env-api that has the port-proxy
-  state check, and the wait retries it. Thus, after `pause()`, call `resume()` before other
-  requests. A direct call while the wake takes longer than about 10 s, usually only the first wake
+  wake gets 503 with `Retry-After` and `X-Env-State` from the port proxy, and the wait retries it.
+  Thus, after `pause()`, call `resume()` before other requests. A direct call while the wake takes longer than about 10 s, usually only the first wake
   of an environment on a new image, gets that error: `execute_command` returns `exit_code -1` with
   it in `stderr`, `file_upload` and `file_download` return `success=False`, and `RemoteConversation`
   calls raise `httpx.HTTPStatusError` (openhands-sdk 1.55.0).
 - A 401 or 403 from the port proxy in the session-key check names `api_token`, not the session key,
   for example when the token changes after the health wait.
 - Only the workspace that created or attached the environment deletes it. A failed constructor
-  deletes only what it created, a `model_copy()` never deletes and opens its own HTTP client, and
-  `__del__` does nothing during interpreter shutdown. A create that fails ambiguously (a timeout,
+  deletes the environment it created, unless `delete_on_exit=False`: then the environment stays
+  and the caller deletes it. It deletes an environment it attached to (`env_id=`) only
+  with `delete_on_exit=True`, and only when the failure comes after the attach (for example a
+  health wait that times out); a failed validation or a failed attach deletes nothing. A
+  `model_copy()` never deletes and opens its own HTTP client, and `__del__` does nothing during
+  interpreter shutdown. A create that fails ambiguously (a timeout,
   a lost answer) deletes the environment by name and retries for 10 s, because the server can still
   be creating it. Get, suspend and delete have a 30 s deadline.
 - `renew_ws_capability()` puts a new port capability, valid `ws_capability_ttl` from now, in
@@ -482,8 +485,8 @@ agent-server 1.55.0 from this layer, 2026-10-15:
   `debian:bullseye-slim` (glibc 2.31) answered `/health` and ran a command with the key (401
   without). The arm64 build of this lock is not verified locally.
 
-These runs came before the Substrate v0.6.0 requirement in section 3 and before the later changes
-to this package. They do not test those changes.
+These runs came before the Substrate requirement in section 3 (then v0.6.0) and before the later
+changes to this package. They do not test those changes.
 
 ## Limits
 
@@ -537,5 +540,7 @@ to this package. They do not test those changes.
   tool runner): see [`examples/openhands`](../../examples/openhands/README.md#limits).
 - `fresh_eval_env` costs one more acquire per graded episode: a Substrate actor has one container,
   so the clean grading container of the MLPerf setup is a second environment from the warm pool.
-- The R2E-Gym adapter is tested against a stand-in for R2E-Gym (it is not on PyPI); a live
-  SWE-bench episode on a cluster is the acceptance step still open.
+- The repository's tests run the R2E-Gym adapter against a stand-in for R2E-Gym (it is not on
+  PyPI). Live episodes on a cluster passed on 2026-10-27 with instances that grade offline
+  (`django__django-11099`, `sympy__sympy-20590`: reward 1.0 for the gold patch, 0.0 for the empty
+  patch). An instance that installs packages before its tests needs egress from the environment.

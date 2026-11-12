@@ -180,9 +180,11 @@ supported means for each path.
 
 You need a cluster with Agent Substrate at or after
 [`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c), a snapshots bucket,
-`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. No
-release has been published yet; see [docs/release.md](./docs/release.md) for the release process.
-Build the CLI and images from source:
+`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. The
+latest release is
+[`v0.1.0`](https://github.com/ai-on-gke/sandboxenv-rl/releases/tag/v0.1.0) (2026-11-07);
+[docs/release.md](./docs/release.md) lists what a release publishes. `main` has changed after it,
+thus the steps below build the CLI and images from source:
 
 ```bash
 git clone https://github.com/ai-on-gke/sandboxenv-rl && cd sandboxenv-rl
@@ -543,9 +545,9 @@ environment see. A secret that only the runtime needs, such as its API key, goes
 `--sidecar-env NAME=VALUE`: the container carries it as `ATE_SIDECAR_ENV_NAME`, and the guest
 removes it from its own environment before it starts anything and gives `NAME` to the sidecars
 only, not to the commands that ate-env-api starts or their children. A command in the environment
-can still read it from the sidecar's `/proc/<pid>/environ`: today, at the Substrate pin, the guest,
-the sidecars and the commands run as root; after the Substrate bump that runs containers as the
-image's `USER`, they share that one user. Each viewer of the atespace reads it in the template; see
+can still read it from the sidecar's `/proc/<pid>/environ`: the guest, the sidecars and the
+commands run as one user, the image's `USER` at the Substrate pin (root on a Substrate from before
+`5d226a50`). Each viewer of the atespace reads it in the template; see
 [docs/security/threat-model.md](docs/security/threat-model.md). `--sidecar-env` needs a guest image
 with its support: the template also carries the guest flag `-sidecar-env-required`, thus an older
 guest exits at start instead of running the sidecars without the values.

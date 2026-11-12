@@ -26,10 +26,10 @@ nothing for it beyond, for a binary that is not statically linked, a
 compatible C library (the OpenHands layer needs glibc 2.31 or newer). They
 inherit the container's user, environment and filesystem, plus the
 `--sidecar-env` variables. The commands that ate-env-api starts do not get
-those variables, but they run as the same user as the sidecars: root today, at
-the Substrate pin; the image's `USER` after the Substrate bump that runs
-containers as it. Thus they can still read them from `/proc/<pid>/environ` of
-a sidecar or of the guest.
+those variables, but they run as the same user as the sidecars: the image's
+`USER` at the Substrate pin (root on a Substrate from before `5d226a50`). Thus
+they can still read them from `/proc/<pid>/environ` of a sidecar or of the
+guest.
 
 Template derivation keeps all of it. A base with layers yields derived
 templates with the same layers and the same guest flags, so environments
