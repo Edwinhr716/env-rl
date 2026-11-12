@@ -57,3 +57,19 @@ func MarkStartFailureForTest(ctx context.Context, err error, reason string) erro
 }
 
 var NonEmptyForTest = nonEmpty
+
+var SpanOperationsForTest = []string{
+	opCreateEnvironment,
+	opGetEnvironment,
+	opSuspendEnvironment,
+	opDeleteEnvironment,
+	opStartProcess,
+	opExec,
+	opReadFile,
+	opWriteFile,
+	opGetServerInfo,
+	opGetImageStatus,
+	opEnsureImageTemplate,
+	opListPlacementDomains,
+	opWarmImage,
+}

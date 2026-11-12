@@ -496,3 +496,11 @@ Append-only. Each entry: date, who, what, why.
 - 2026-11-12, #361: option (a) chosen for plan question 3 (Python Env.shell attributes vs Go
   Env.Run). Added `ate_env.timed_out` to `ate_env_client.shell` to close the 17.2 attribute
   difference without a breaking span rename.
+- 2026-11-12, #362: `proto/testdata/client-parity/spans.json` moves AC-17.1 and 17.2 onto shared
+  vectors read by `TestSpansParity` (`clients/go/parity_test.go`) and `test_spans_parity`
+  (`clients/python/tests/test_parity_vectors.py`), with `go_only` and `python_only` entries for the
+  recorded differences. New AC-17.2 difference recorded from the default-atespace vectors: Python's
+  `Client.get`, `Client.suspend` and `Client.delete` default `atespace` to `"ate-env"` and record
+  `ate.atespace="ate-env"`, whereas Go's `Client.Get`, `Client.Suspend` and `Client.Delete` take a
+  positional `atespace` string and omit `ate.atespace` when it is `""` (the server resolves the
+  default).

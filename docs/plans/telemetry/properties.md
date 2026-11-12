@@ -31,7 +31,7 @@ State on `main` with #221:
 | P-10            | AC-15.9      | Fixed by #238. Before it, a delete cancelled after the run's reap, or a `release` whose delete failed or was cancelled while a reap ran, left the actor under the reaped run id, so no later reap deleted it. |
 | P-10            | AC-15.2      | Fixed by #276. Before it, a cold `acquire` cancelled while its `create()` was in flight (by its own `timeout_s` or its caller) left an actor whose create landed alive and untracked, so no reap deleted it.  |
 | P-10            | AC-15.10     | Fixed by #242. Before it, an `acquire` whose cold create overlapped its own run's reap returned an environment owned under the reaped run id; unless the caller released it, no later reap deleted it.        |
-| P-21, P-22      | AC-17, AC-18 | Partial. Example tests only; the Go tests copy the Python tables by hand.                                                                                                                                     |
+| P-21, P-22      | AC-17, AC-18 | Partial. Shared vectors in `proto/testdata/client-parity/` (#329, #362) replace the hand-copied tables and close AC-17; no property test yet for P-21 or P-22.                                                |
 
 ## Labels and cardinality (AC-9)
 
@@ -330,9 +330,9 @@ the Python-only keys in [decisions.md](./decisions.md).
   three semconv values; written to one fixture both test suites read.
 - Proposed test: a shared `testdata/span_parity.json` checked by `TestSpanParity` (Go) and
   `test_span_parity` (Python).
-- Example coverage on `main`: `TestRPCAttrsFollowTheSemconvMode` and
-  `test_rpc_attrs_follow_the_semconv_mode`, `TestExecutableMatchesPythonClient` and
-  `test_executable_attr_skips_env_assignments`, each pair with a hand-copied table.
+- Example coverage on `main`: shared vectors in `proto/testdata/client-parity/`
+  (`semconv_mode.json`, `rpc_attrs.json`, `executable.json`, `spans.json`), read by
+  `clients/go/parity_test.go` and `clients/python/tests/test_parity_vectors.py` (#329, #362).
 
 ### P-23: The warm-replica gauge adds up across fleets
 

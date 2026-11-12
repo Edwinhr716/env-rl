@@ -1,0 +1,287 @@
+[
+  {
+    "operation": "create_environment",
+    "inputs": {
+      "id": "traced",
+      "atespace": "t-space",
+      "template": "layered",
+      "template_atespace": "t-space",
+      "rootfs_image": "ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "expected_span": "create_environment",
+    "expected_attributes": {
+      "ate.actor.name": "traced",
+      "ate.atespace": "t-space",
+      "ate.template.name": "layered",
+      "ate.template.atespace": "t-space",
+      "ate_env.rootfs_image": "ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "go_only": {
+      "attributes": {
+        "ate.template.name": "layered-0123456789ab"
+      },
+      "reason": "Go Create/ImageStatus/EnsureImageTemplate backfill server-resolved ate.template.* from the response (docs/plans/telemetry/decisions.md, 2026-11-10)"
+    }
+  },
+  {
+    "operation": "get_environment",
+    "inputs": {
+      "id": "traced",
+      "atespace": "t-space"
+    },
+    "expected_span": "get_environment",
+    "expected_attributes": {
+      "ate.actor.name": "traced",
+      "ate.atespace": "t-space"
+    }
+  },
+  {
+    "name": "get_environment/default_atespace",
+    "operation": "get_environment",
+    "inputs": {
+      "id": "traced"
+    },
+    "expected_span": "get_environment",
+    "expected_attributes": {
+      "ate.actor.name": "traced"
+    },
+    "python_only": {
+      "attributes": {
+        "ate.atespace": "ate-env"
+      },
+      "reason": "Python Client.get/suspend/delete default atespace to ate-env; Go takes a positional atespace and omits ate.atespace when empty (docs/plans/telemetry/decisions.md, 2026-11-12)"
+    }
+  },
+  {
+    "operation": "suspend_environment",
+    "inputs": {
+      "id": "traced",
+      "atespace": "t-space"
+    },
+    "expected_span": "suspend_environment",
+    "expected_attributes": {
+      "ate.actor.name": "traced",
+      "ate.atespace": "t-space"
+    }
+  },
+  {
+    "name": "suspend_environment/default_atespace",
+    "operation": "suspend_environment",
+    "inputs": {
+      "id": "traced"
+    },
+    "expected_span": "suspend_environment",
+    "expected_attributes": {
+      "ate.actor.name": "traced"
+    },
+    "python_only": {
+      "attributes": {
+        "ate.atespace": "ate-env"
+      },
+      "reason": "Python Client.get/suspend/delete default atespace to ate-env; Go takes a positional atespace and omits ate.atespace when empty (docs/plans/telemetry/decisions.md, 2026-11-12)"
+    }
+  },
+  {
+    "operation": "delete_environment",
+    "inputs": {
+      "id": "traced",
+      "atespace": "t-space"
+    },
+    "expected_span": "delete_environment",
+    "expected_attributes": {
+      "ate.actor.name": "traced",
+      "ate.atespace": "t-space"
+    }
+  },
+  {
+    "name": "delete_environment/default_atespace",
+    "operation": "delete_environment",
+    "inputs": {
+      "id": "traced"
+    },
+    "expected_span": "delete_environment",
+    "expected_attributes": {
+      "ate.actor.name": "traced"
+    },
+    "python_only": {
+      "attributes": {
+        "ate.atespace": "ate-env"
+      },
+      "reason": "Python Client.get/suspend/delete default atespace to ate-env; Go takes a positional atespace and omits ate.atespace when empty (docs/plans/telemetry/decisions.md, 2026-11-12)"
+    }
+  },
+  {
+    "operation": "get_server_info",
+    "inputs": {},
+    "expected_span": "get_server_info",
+    "expected_attributes": {}
+  },
+  {
+    "operation": "get_image_status",
+    "inputs": {
+      "rootfs_image": "ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "expected_span": "get_image_status",
+    "expected_attributes": {
+      "ate_env.rootfs_image": "ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "go_only": {
+      "attributes": {
+        "ate.template.name": "default-template-0123456789ab",
+        "ate.template.atespace": "ate-env"
+      },
+      "reason": "Go Create/ImageStatus/EnsureImageTemplate backfill server-resolved ate.template.* from the response (docs/plans/telemetry/decisions.md, 2026-11-10)"
+    }
+  },
+  {
+    "operation": "ensure_image_template",
+    "inputs": {
+      "rootfs_image": "ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "template": "layered",
+      "template_atespace": "t-space",
+      "atespace": "t-space"
+    },
+    "expected_span": "ensure_image_template",
+    "expected_attributes": {
+      "ate.atespace": "t-space",
+      "ate.template.name": "layered",
+      "ate.template.atespace": "t-space",
+      "ate_env.rootfs_image": "ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "go_only": {
+      "attributes": {
+        "ate.template.name": "layered-0123456789ab"
+      },
+      "reason": "Go Create/ImageStatus/EnsureImageTemplate backfill server-resolved ate.template.* from the response (docs/plans/telemetry/decisions.md, 2026-11-10)"
+    }
+  },
+  {
+    "operation": "list_placement_domains",
+    "inputs": {
+      "template": "layered",
+      "template_atespace": "x-space",
+      "atespace": "t-space"
+    },
+    "expected_span": "list_placement_domains",
+    "expected_attributes": {
+      "ate.atespace": "t-space",
+      "ate.template.name": "layered",
+      "ate.template.atespace": "x-space"
+    }
+  },
+  {
+    "operation": "warm_image",
+    "inputs": {
+      "rootfs_image": "ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "template": "layered",
+      "template_atespace": "t-space",
+      "atespace": "t-space"
+    },
+    "expected_span": "warm_image",
+    "expected_attributes": {
+      "ate.atespace": "t-space",
+      "ate.template.name": "layered",
+      "ate.template.atespace": "t-space",
+      "ate_env.rootfs_image": "ubuntu@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  },
+  {
+    "operation": "start_process",
+    "inputs": {
+      "id": "traced",
+      "atespace": "t-space",
+      "command": ["echo"]
+    },
+    "expected_span": "start_process",
+    "expected_attributes": {
+      "ate.actor.name": "traced",
+      "ate.atespace": "t-space",
+      "ate_env.command.executable": "echo",
+      "ate_env.first_command": true
+    }
+  },
+  {
+    "operation": "exec",
+    "inputs": {
+      "id": "traced",
+      "atespace": "t-space",
+      "command": ["echo"]
+    },
+    "expected_span": "exec",
+    "expected_attributes": {
+      "ate.actor.name": "traced",
+      "ate.atespace": "t-space",
+      "ate_env.command.executable": "echo",
+      "ate_env.exit_code": 0,
+      "ate_env.first_command": true,
+      "ate_env.timed_out": false
+    },
+    "python_only": {
+      "attributes": {
+        "ate_env.run_id": "r1"
+      },
+      "reason": "Python fleet SandboxHandle.exec supplies run_id (docs/plans/go-client-parity/README.md D6; docs/plans/telemetry/decisions.md, 2026-11-10)"
+    }
+  },
+  {
+    "name": "exec/timed_out",
+    "operation": "exec",
+    "inputs": {
+      "id": "traced",
+      "atespace": "t-space",
+      "command": ["sleep", "10"],
+      "timeout_ms": 100
+    },
+    "expected_span": "exec",
+    "expected_attributes": {
+      "ate.actor.name": "traced",
+      "ate.atespace": "t-space",
+      "ate_env.command.executable": "sleep",
+      "ate_env.first_command": true,
+      "ate_env.timed_out": true
+    },
+    "go_only": {
+      "attributes": {
+        "ate_env.exit_code": 137
+      },
+      "reason": "Go Env.Run records ate_env.exit_code 137 on a timeout; Python ExecResult.exit_code is None so SandboxHandle.exec omits ate_env.exit_code (docs/plans/telemetry/decisions.md, 2026-11-10, #330)"
+    },
+    "python_only": {
+      "attributes": {
+        "ate_env.run_id": "r1"
+      },
+      "reason": "Python fleet SandboxHandle.exec supplies run_id (docs/plans/go-client-parity/README.md D6; docs/plans/telemetry/decisions.md, 2026-11-10)"
+    }
+  },
+  {
+    "operation": "write_file",
+    "inputs": {
+      "id": "traced",
+      "atespace": "t-space",
+      "path": "notes.txt",
+      "content": "hello world"
+    },
+    "expected_span": "write_file",
+    "expected_attributes": {
+      "ate.actor.name": "traced",
+      "ate.atespace": "t-space",
+      "ate_env.file.path": "notes.txt",
+      "ate_env.file.size": 11
+    }
+  },
+  {
+    "operation": "read_file",
+    "inputs": {
+      "id": "traced",
+      "atespace": "t-space",
+      "path": "notes.txt"
+    },
+    "expected_span": "read_file",
+    "expected_attributes": {
+      "ate.actor.name": "traced",
+      "ate.atespace": "t-space",
+      "ate_env.file.path": "notes.txt",
+      "ate_env.file.size": 11
+    }
+  }
+]

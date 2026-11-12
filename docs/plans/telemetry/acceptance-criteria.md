@@ -35,7 +35,7 @@ Conventions:
 | AC-14 | Blast radius: existing tests pass unchanged; telemetry-off overhead under 2%        | all                                | partial: suites green; overhead not measured                                                                                                          |
 | AC-15 | Warm-pool accounting under concurrent acquire, recycle, `warm_pool` and teardown    | #221, #238, #239, #240, #242, #276 | pass: 15.1 to 15.10 (`test_warm_pool_accounting.py`, `verify/*.dfy`)                                                                                  |
 | AC-16 | The span and attribute inventory in `interfaces.md` matches the code, checked in CI | follow-up                          | not met: the table is hand-written; last checked against `c0c41ac`                                                                                    |
-| AC-17 | The Go and Python clients emit the same span names and keys for shared operations   | 7                                  | partial: 17.3, 17.4 on shared vectors (#329); 17.1, 17.2 on per-client tests                                                                          |
+| AC-17 | The Go and Python clients emit the same span names and keys for shared operations   | 7                                  | pass: 17.1 to 17.4 on shared vectors (#329, #362) with documented differences                                                                         |
 | AC-18 | No command line, secret or file content in any span attribute value                 | follow-up                          | partial: example tests in both clients; no property test                                                                                              |
 | AC-19 | Several fleets in one process share the warm-replica gauge                          | 2                                  | pass: `test_warm_gauge_adds_up_across_observers_and_resets_only_own_share`                                                                            |
 | AC-20 | CI verifies the Dafny models with the documented counts                             | follow-up                          | pass: `Dafny models` job, `hack/verify/dafny.py`                                                                                                      |
@@ -425,8 +425,11 @@ Conventions:
 - 17.2: for the same inputs, both clients record the same `ate.*` and `ate_env.*` keys and values,
   except the differences [decisions.md](./decisions.md) records (`ate_env.run_id` is Python
   fleet-only; the `exec` span name pairs `Env.Run` with `SandboxHandle.exec` while Python's direct
-  `Env.shell` uses `shell`; Go's `Create`, `ImageStatus` and `EnsureImageTemplate` also backfill
-  server-resolved `ate.template.*` from the response).
+  `Env.shell` uses `shell`; on a timeout Go's `exec` records `ate_env.exit_code` 137 while Python's
+  omits `ate_env.exit_code`; Go's `Create`, `ImageStatus` and `EnsureImageTemplate` also backfill
+  server-resolved `ate.template.*` from the response; Python's `get`, `suspend` and `delete` default
+  `atespace` to `ate-env` and record `ate.atespace` while Go omits `ate.atespace` when `atespace` is
+  empty).
 - 17.3: under each `OTEL_SEMCONV_STABILITY_OPT_IN` value (unset, `rpc/old`, `rpc/dup`), both clients
   record the same `rpc.*`, `server.address` and `server.port` keys and values for the same call, and
   the `rpc.*` keys and values are the ones otelgrpc records for that value.
@@ -434,10 +437,11 @@ Conventions:
 - Command: `go test ./clients/go -run Parity` and
   `pytest clients/python/tests/test_parity_vectors.py`, which read the same files in
   `proto/testdata/client-parity/`: `semconv_mode.json` and `rpc_attrs.json` for 17.3,
-  `executable.json` for 17.4.
-- Status: partial. 17.3 and 17.4 pass on the shared vectors (#329): a changed value fails a test in
-  each suite. 17.1 and 17.2 rest on per-client tests (`TestTracingCallerConnSpansMatchPythonClient`,
-  `test_client_rpc_spans_are_client_kind_with_rpc_attributes`) that can drift apart.
+  `executable.json` for 17.4, `spans.json` for 17.1 and 17.2. `spans.json` lists each shared
+  operation's span name and `ate.*` / `ate_env.*` attributes; a recorded difference is a `go_only`
+  or `python_only` entry on that operation, so a new difference fails a suite.
+- Status: pass. 17.1 to 17.4 pass on the shared vectors (#329, #362): a changed value fails a test
+  in each suite.
 - Properties: P-22.
 
 ## AC-18: No secrets or content in attribute values

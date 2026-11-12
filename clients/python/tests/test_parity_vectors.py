@@ -175,3 +175,193 @@ def test_rpc_coverage():
         assert hasattr(Client, python_method_name), (
             f"Python Client missing method {python_method_name} for RPC {method.name}"
         )
+
+
+SHARED_SPAN_OPERATIONS = {
+    "create_environment",
+    "get_environment",
+    "suspend_environment",
+    "delete_environment",
+    "get_server_info",
+    "get_image_status",
+    "ensure_image_template",
+    "list_placement_domains",
+    "warm_image",
+    "start_process",
+    "exec",
+    "read_file",
+    "write_file",
+}
+
+
+def test_spans_coverage():
+    ops = {v["operation"] for v in load_vector("spans.json")}
+    missing = SHARED_SPAN_OPERATIONS - ops
+    assert not missing, f"spans.json missing shared operations: {sorted(missing)}"
+
+
+@pytest.mark.parametrize(
+    "v",
+    load_vector("spans.json"),
+    ids=lambda v: v.get("name", v["operation"]),
+)
+async def test_spans_parity(v, spans, fake_stack):
+    """17.1 and 17.2: span names and ate.* / ate_env.* attributes from spans.json.
+
+    The Go suite reads the same file (TestSpansParity). python_only entries
+    add to the expected attributes here; go_only entries apply to Go only.
+    """
+    from ate_env_rl import CommandTimeoutError, TracerConfig
+    from ate_env_rl._gen.ateenv.v1alpha import guest_pb2
+    from ate_env_rl.errors import RpcError
+    from ate_env_rl.handle import SandboxHandle
+    from ate_env_rl.loop_runner import LoopRunner
+    from ate_env_rl.runtime.substrate_env_client import SubstrateEnvClientRuntime
+    from ate_env_rl.types import Task
+
+    from .fakes import FakeProc
+
+    client, fakes = fake_stack
+    client.tracer = tracing.tracer_from_config(TracerConfig(enable_tracing=True))
+    fakes.environments.template_selectors[("t-space", "layered")] = {}
+    fakes.environments.template_selectors[("x-space", "layered")] = {}
+    fakes.filesystem.files["notes.txt"] = b"hello world"
+
+    op = v["operation"]
+    inputs = v.get("inputs", {})
+
+    id_val = inputs.get("id")
+    atespace = inputs.get("atespace")
+    template = inputs.get("template")
+    template_atespace = inputs.get("template_atespace")
+    rootfs = inputs.get("rootfs_image", "")
+    path = inputs.get("path", "")
+    content = inputs.get("content", "")
+    command = inputs.get("command", [])
+    timeout_ms = inputs.get("timeout_ms")
+
+    if id_val and op != "create_environment":
+        create_kwargs: dict = {"id": id_val}
+        if atespace is not None:
+            create_kwargs["atespace"] = atespace
+        if template is not None:
+            create_kwargs["template_name"] = template
+        if template_atespace is not None:
+            create_kwargs["template_atespace"] = template_atespace
+        try:
+            await client.create(**create_kwargs)
+        except RpcError as e:
+            if e.code != grpc.StatusCode.ALREADY_EXISTS:
+                raise
+
+    spans.clear()
+
+    atespace_kw = {"atespace": atespace} if atespace is not None else {}
+    env = client.env(id_val, **atespace_kw) if id_val else None
+    if op == "create_environment":
+        kwargs: dict = {"id": id_val}
+        if atespace is not None:
+            kwargs["atespace"] = atespace
+        if template is not None:
+            kwargs["template_name"] = template
+        if template_atespace is not None:
+            kwargs["template_atespace"] = template_atespace
+        if rootfs:
+            kwargs["rootfs_image"] = rootfs
+        await client.create(**kwargs)
+    elif op == "get_environment":
+        await client.get(id_val, **atespace_kw)
+    elif op == "suspend_environment":
+        await client.suspend(id_val, **atespace_kw)
+    elif op == "delete_environment":
+        await client.delete(id_val, **atespace_kw)
+    elif op == "get_server_info":
+        await client.server_info()
+    elif op in ("get_image_status", "ensure_image_template"):
+        kwargs = {"ensure": op == "ensure_image_template"}
+        if template is not None:
+            kwargs["template_name"] = template
+        if template_atespace is not None:
+            kwargs["template_atespace"] = template_atespace
+        if atespace is not None:
+            kwargs["atespace"] = atespace
+        await client.image_status(rootfs, **kwargs)
+    elif op == "list_placement_domains":
+        kwargs = {}
+        if template is not None:
+            kwargs["template_name"] = template
+        if template_atespace is not None:
+            kwargs["template_atespace"] = template_atespace
+        if atespace is not None:
+            kwargs["atespace"] = atespace
+        await client.list_placement_domains(**kwargs)
+    elif op == "warm_image":
+        kwargs = {}
+        if template is not None:
+            kwargs["template_name"] = template
+        if atespace is not None:
+            kwargs["atespace"] = atespace
+        if template_atespace is not None:
+            kwargs["template_atespace"] = template_atespace
+        await client.warm_image(rootfs, nodes=1, **kwargs)
+    elif op == "start_process":
+        await env.start_process(command)
+    elif op == "exec":
+        if timeout_ms is not None:
+            fakes.processes.next_procs.append(
+                FakeProc(signal=guest_pb2.SIGNAL_KILL, timed_out=True)
+            )
+        runtime = SubstrateEnvClientRuntime(
+            env_id=id_val,
+            atespace=atespace or "ate-env",
+            env=env,
+            loop_runner=LoopRunner(),
+        )
+        h = SandboxHandle(
+            sandbox_id=id_val,
+            endpoint="",
+            task=Task(id="mock", image="mock"),
+            run_id="r1",
+            backend=None,
+            runtime=runtime,
+        )
+        h.tracer = client.tracer
+        if timeout_ms is not None:
+            with pytest.raises(CommandTimeoutError):
+                await h.exec_async(command, timeout_s=timeout_ms / 1000.0)
+        else:
+            await h.exec_async(command)
+    elif op == "read_file":
+        [chunk async for chunk in env.read_file(path)]
+    elif op == "write_file":
+        await env.write_file(path, content.encode("utf-8"))
+
+    ended: dict[str, list] = {}
+    for finished in spans.get_finished_spans():
+        ended.setdefault(finished.name, []).append(finished)
+
+    expected_name = "ate_env_client." + v["expected_span"]
+    assert expected_name in ended, (
+        f"span {expected_name} not found in {list(ended.keys())}"
+    )
+    span = ended[expected_name][-1]
+    got_attrs = dict(span.attributes)
+
+    want = dict(v.get("expected_attributes", {}))
+    py_only = v.get("python_only")
+    if py_only:
+        want.update(py_only.get("attributes", {}))
+
+    for k, wv in want.items():
+        if not (k.startswith("ate.") or k.startswith("ate_env.")):
+            continue
+        assert k in got_attrs, f"op {op}: missing {k}, got {got_attrs}"
+        gv = got_attrs[k]
+        assert type(gv) is type(wv) and gv == wv, (
+            f"op {op}: {k} = {gv!r} ({type(gv).__name__}), want {wv!r} ({type(wv).__name__})"
+        )
+
+    for k, gv in got_attrs.items():
+        if not (k.startswith("ate.") or k.startswith("ate_env.")):
+            continue
+        assert k in want, f"op {op}: unexpected {k}={gv}"

@@ -122,34 +122,6 @@ async def test_missing_extra_logs_one_error(monkeypatch, caplog):
 # --- OpenTelemetry fixtures ---------------------------------------------- #
 
 
-_PROVIDER = None
-
-
-@pytest.fixture
-def spans():
-    """An in-memory exporter on the process-wide SDK provider; returns the exporter."""
-    pytest.importorskip("opentelemetry.sdk")
-    from opentelemetry import trace
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-        InMemorySpanExporter,
-    )
-
-    global _PROVIDER
-    if _PROVIDER is None:
-        provider = TracerProvider(resource=Resource(attributes={"service.name": "ate-env-client"}))
-        exporter = InMemorySpanExporter()
-        provider.add_span_processor(SimpleSpanProcessor(exporter))
-        trace.set_tracer_provider(provider)
-        _PROVIDER = (provider, exporter)
-    provider, exporter = _PROVIDER
-    exporter.clear()
-    yield exporter
-    exporter.clear()
-
-
 def _by_name(finished):
     out: dict[str, list] = {}
     for s in finished:
