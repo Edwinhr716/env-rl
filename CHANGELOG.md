@@ -807,5 +807,68 @@ user needs to know across them.
   flight, for example by its own `timeout_s`, no longer leaks the environment
   if the create reached Substrate. The driver keeps it, and the next `reap` of
   any run deletes it; if a teardown ran during the create, the driver starts
-  its delete in a background task; a teardown that already runs does not wait
-  for it.
+  its delete in a background task, which `reap` and `close()` wait for (next
+  entry).
+- Python client: a warm claim that pauses in `get()` across its own run's
+  teardown and then creates an environment, or claims one that another run
+  pooled after the teardown, no longer leaves that environment under the torn
+  down run id: the next `reap` of any run deletes it, unless the caller
+  releases it first. `reap` and `close()` now wait, up to
+  `SubstrateBackendDriver(background_delete_timeout_s=10.0)`, for the
+  background deletes that cancelled `acquire` and `warm_pool` calls start, so
+  a teardown no longer returns, and `close()` no longer stops the event loop,
+  with such a delete in flight. A delete still running at the deadline, or
+  one that failed since the last such wait, is named in the
+  `InfrastructureError` the reap raises (and in a warning from `close()`),
+  and its environment stays tracked for the next `reap` of any run.
+  `background_delete_timeout_s` must be a finite number `>= 0`; `0` means
+  no wait. `LoopRunner.stop()` waits for the tasks a cancel handler starts
+  before it stops the loop. `close()` first cancels the calls still in flight
+  on its own event loop, so the delete of an `acquire` still in `create()`
+  lands before the channels close; that wait skips a delete whose
+  environment a `reap` already deleted. `AsyncSandboxFleet.close_async()` is
+  new, and `async with` awaits it on exit instead of blocking the event loop
+  in `close()`. `close()` and `close_async()` count as a teardown: an
+  `acquire` or `warm_pool` call they cancel, or whose create their channel
+  close cancels, deletes its environment even when no `reap` ran since the
+  call began, and a recycle or `warm_pool` that finishes during them deletes
+  instead of pooling. A `release` (recycling or not) that they cancel, and
+  the delete of a `warm_pool` call that finished after the `reap` and that
+  they cancel, start a background delete too, which they wait for the same
+  way: before, the cancelled call kept its environment tracked for a `reap`
+  that never followed. A `reap` still in flight when `close()` or
+  `close_async()` starts (a `teardown()` on another thread, say), which they
+  cancel or whose deletes their channel close cuts off, starts a background
+  delete for each environment it had not deleted, which they wait for too:
+  before, those environments stayed alive and tracked by a driver that was
+  closed. `close_async()` cancels no task of the caller's, so its channel
+  close let the part of a `reap` or `warm_pool` call that waited for one of
+  the call's 16 slots go on: it sent its delete or create on a new channel,
+  and `close_async()` returned with those environments alive, their deletes
+  not waited for and that channel open. Such a part now stops when it gets
+  its slot during a close and deletes in the background like the ones the
+  close cut off, and `close_async()` repeats its wait (4 rounds at most)
+  while a channel that a delete opened is still there. An `unwarm_pool` or
+  a shrinking `resize_pool` that is cancelled now leaves every environment
+  it took out of the pool tracked for the next `reap` of any run: before,
+  one whose delete had not started (more than 16 at once, or a cancel
+  right after the call began) kept the run id it was warmed under, so only
+  that run's `reap` deleted it. When `close()` or `close_async()` cuts such
+  a call off, each environment it had not deleted gets a background delete
+  that they wait for, as for a `reap`; the same holds for the deletes of a
+  `warm_pool` call that finished after a teardown and that `close()`
+  cancels before they start.
+  A `release` (recycling or not) that is cancelled, or whose delete
+  fails, after a `reap` of any run began since the release started now
+  deletes its environment in a background task, which a `reap` still running
+  waits for, as a cancelled `acquire` does: before, the environment stayed
+  alive and tracked until the next `reap`, which a fleet that reaps its run
+  once never ran. A background delete that fails leaves the environment
+  tracked for the next `reap` of any run, as before; with no `reap` since
+  the release started nothing changes. An `acquire` cancelled while it
+  checks a warm
+  environment (by its `timeout_s`, the caller, or `close()`) returns the
+  environment to the warm pool, or deletes it if a teardown ran since the
+  claim: before, it stayed alive outside the pool until a `reap` of the run
+  that created it, which for an environment recycled by an earlier run never
+  came.

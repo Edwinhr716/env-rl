@@ -63,9 +63,23 @@ class AsyncSandboxFleet:
         self._fleet = sync_fleet or SandboxFleet(config, driver)
 
     def close(self, *, wait: bool = True) -> None:
-        """Close fleet resources."""
+        """Close fleet resources; blocks the calling thread.
+
+        From a coroutine, await ``close_async`` instead: a Substrate backend's
+        ``close()`` waits for the deletes a cancelled ``acquire`` started, and
+        a blocked event loop cannot serve them.
+        """
         if hasattr(self.backend, "close"):
             self.backend.close()
+
+    async def close_async(self) -> None:
+        """Close fleet resources on the event loop: awaits the backend's
+        ``close_async`` (its ``close`` in a thread when it has none)."""
+        backend = self.backend
+        if hasattr(backend, "close_async"):
+            await backend.close_async()
+        elif hasattr(backend, "close"):
+            await asyncio.to_thread(backend.close)
 
     def __del__(self) -> None:
         try:
@@ -473,7 +487,7 @@ class AsyncSandboxFleet:
             try:
                 await self.teardown()
             finally:
-                self.close()
+                await self.close_async()
         except Exception:
             if exc_type is None:
                 raise

@@ -5,7 +5,7 @@ property tests here are proposed and not in the repository: `pgregory.net/rapid`
 and the Hypothesis tests named "Proposed test" do not exist. Three parts exist:
 
 - `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
-  `test_warm_pool_accounting` and 40 plain interleaving tests. `hypothesis` is in the `dev` extra
+  `test_warm_pool_accounting` and 124 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
   found in #221's first version. CI checks their results (AC-20).
@@ -351,12 +351,12 @@ own counts, never goes below zero, and `warm_reset` on one observer leaves the o
 `SubstrateBackendDriver` coroutines share one event loop and interleave at every `await`. P-9 to
 P-11 share the Hypothesis stateful test `test_warm_pool_accounting` in
 `clients/python/tests/test_warm_pool_accounting.py` (#221). Its rules are `acquire_new`,
-`acquire_warm`, `start_recycle` and `finish_recycle` (paused inside `await suspend()`),
-`start_warm_pool` and `finish_warm_pools` (paused inside `await create()`), `start_teardown` and
-`finish_teardown` (paused inside a reap's `await delete()`), `unwarm` and `idle`. A fake client
-pauses at those awaits, so Hypothesis generates the interleavings as well as the operations. The
-machine starts no `warm_pool` after a teardown and never makes `get()` fail, so bugs A and B (see
-the findings) are covered by the plain tests
+`acquire_warm`, `start_recycle`, `finish_recycle` and `cancel_recycle` (paused inside
+`await suspend()`), `start_warm_pool` and `finish_warm_pools` (paused inside `await create()`),
+`start_teardown` and `finish_teardown` (paused inside a reap's `await delete()`), `unwarm` and
+`idle`. A fake client pauses at those awaits, so Hypothesis generates the interleavings as well as
+the operations. The machine starts no `warm_pool` after a teardown and never makes `get()` fail, so
+bugs A and B (see the findings) are covered by the plain tests
 `test_warm_pool_after_teardown_ignores_the_old_reservation` and
 `test_failed_warm_claim_after_teardown_deletes_the_environment` in the same file.
 
@@ -491,67 +491,67 @@ environment `acquire` returns is alive on Substrate when `acquire` returns.
 The requirement numbers the properties validate. Each refines the criterion of the same number in
 [acceptance-criteria.md](./acceptance-criteria.md).
 
-| ID       | Requirement                                                                                                                        |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| AC-1.1   | The base install depends only on `grpcio` and `protobuf` and offers the extras `tracing` and `metrics`.                            |
-| AC-1.2   | Importing `ate_env_rl`, `ate_env_rl.observability` or `ate_env_rl.telemetry` in the base install loads neither extra.              |
-| AC-2.1   | With a layer enabled and its extra missing, the run completes and `fleet.report` exists.                                           |
-| AC-2.2   | Each enabled layer missing its extra logs exactly one `ERROR` or `WARNING` naming the extra.                                       |
-| AC-2.3   | Telemetry code raises no exception.                                                                                                |
-| AC-3.1   | One `ate_env_fleet.run` span per run, sync and async.                                                                              |
-| AC-3.2   | Every `ate_env_fleet.*` and `ate_env_client.*` span of a run descends from its `ate_env_fleet.run` span, across threads and loops. |
-| AC-3.3   | Each task's exec and file spans are children of that task's `ate_env_fleet.process` span.                                          |
-| AC-3.4   | The first exec started on an acquired sandbox, and only that one, carries `ate_env.first_command=true`.                            |
-| AC-3.5   | Only span names and attribute keys documented in [interfaces.md](./interfaces.md).                                                 |
-| AC-4.1   | With tracing on, exactly one `traceparent` matching the current span on all four call kinds.                                       |
-| AC-4.2   | Caller metadata passes through unchanged and in order; a key the caller set is not added again (case-insensitive).                 |
-| AC-4.3   | No `baggage` header the caller did not send.                                                                                       |
-| AC-4.4   | With tracing off, the caller's metadata is sent unchanged.                                                                         |
-| AC-5.1   | `ate-env-api` with `-enable-tracing` records its span under the client's trace.                                                    |
-| AC-5.2   | `ate-env-api` exports to the configured OTLP endpoint.                                                                             |
-| AC-6.1   | `ate-env-api` serves exactly the documented `ate_env_api_*` families and labels.                                                   |
-| AC-6.2   | Calls move `ate_env_api_requests_total` and `ate_env_api_create_to_ready_seconds`.                                                 |
-| AC-7.1   | `to_dict()` keys and `phases` entry keys are exactly the documented ones.                                                          |
-| AC-7.2   | `add_phase(name, d)` adds 1 to `count`, `max(d, 0)` to `total_s`, and raises `max_s` to at least `max(d, 0)`.                      |
-| AC-7.3   | Every phase keeps `0 <= max_s <= total_s <= count * max_s`, including after negative durations.                                    |
-| AC-7.4   | `add_task("ok")` counts `tasks_ok`; any other status counts `tasks_err`.                                                           |
-| AC-7.5   | `summary()` rows follow `ORDER`, then other phases first-seen, then `TOTAL`; `to_dict()` survives a JSON round trip.               |
-| AC-7.6   | A mock run records the documented phase set.                                                                                       |
-| AC-7.7   | `add_release_error()` adds 1 to `release_errors`; `summary()` prints `release_errors=N` while it is nonzero.                       |
-| AC-8.1   | Importing `ate_env_rl` or `ate_env_rl.observability` registers nothing.                                                            |
-| AC-8.2   | The first metrics-enabled `Observer` or client timing registers each documented family once, with exactly its labels.              |
-| AC-8.3   | A second `Observer` or a module reload neither raises nor registers a family twice.                                                |
-| AC-8.4   | `serve_metrics(port)` answers `/metrics`.                                                                                          |
-| AC-9.1   | At most `MAX_FAMILIES` (64) registered families and at most `MAX_FAMILIES + 2` distinct `family` values per process.               |
-| AC-9.2   | Repo families matching the reserved names (and their `_repo` forms) are escaped with `_repo`; bare reserved names never register.  |
-| AC-9.3   | `other` only when the registry is full and the family is new.                                                                      |
-| AC-9.4   | A registered family always gets the same label.                                                                                    |
-| AC-9.5   | No ids or image tags in label values; no label named `env_id`, `instance`, `image` or `run_id`.                                    |
-| AC-10.1  | With tracing off, the JSONL equals the golden file byte for byte.                                                                  |
-| AC-10.2  | The JSONL is the same with tracing on and off.                                                                                     |
-| AC-10.3  | One span per event, named `Event.Event`, from `ts - dur_ms` to `ts`, with the attribute and status rules in P-19.                  |
-| AC-11.1  | With a nil `TracerProvider`, no span and no exporter.                                                                              |
-| AC-11.2  | With a provider, one span per call named `<TraceServiceName>.<op>` with documented keys only.                                      |
-| AC-15.1  | The `ate_env_fleet_warm_replicas` gauge equals the driver's warm pool after every step of any interleaving.                        |
-| AC-15.2  | A recycle or `warm_pool` paused across teardown deletes its actor on resume; nothing from the run survives teardown.               |
-| AC-15.3  | Overlapping `warm_pool(template, replicas=R)` calls create at most `R` warm actors for one pool key.                               |
-| AC-15.4  | `unwarm_pool` and a shrinking `resize_pool` cancel the `warm_pool` calls in flight for that pool.                                  |
-| AC-15.5  | An actor whose delete fails after a teardown or a drain is deleted by the next `reap` of any run.                                  |
-| AC-15.6  | A direct `reap` leaves the gauge equal to the pool.                                                                                |
-| AC-15.7  | A warm claim returns a live environment.                                                                                           |
-| AC-15.8  | A `warm_pool` cancelled during `create()` leaves no live actor untracked.                                                          |
-| AC-15.9  | A delete cancelled after a reap, or a release's delete that fails during one, leaves the actor for any later reap.                 |
-| AC-15.10 | An `acquire` that completes after its own run's reap leaves its environment for a later reap.                                      |
-| AC-16.1  | A test collects every span name and attribute key the client and driver operations emit.                                           |
-| AC-16.2  | The collected set equals the documented table; CI fails on a difference.                                                           |
-| AC-17.1  | Shared operations have the same span `<op>` in both clients.                                                                       |
-| AC-17.2  | Same inputs give the same `ate.*` and `ate_env.*` keys and values, except the Python-only keys.                                    |
-| AC-17.3  | Same `rpc.*` and `server.*` keys and values under each semconv value.                                                              |
-| AC-17.4  | `executable` and `executable_attr` agree on one shared table.                                                                      |
-| AC-18.1  | `ate_env.command.executable` never holds an argument or an assignment value.                                                       |
-| AC-18.2  | No attribute value holds file content, a token or an image tag.                                                                    |
-| AC-19.1  | The gauge is the sum of every `Observer`'s pool.                                                                                   |
-| AC-19.2  | `warm_reset` removes only that `Observer`'s share.                                                                                 |
+| ID       | Requirement                                                                                                                         |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| AC-1.1   | The base install depends only on `grpcio` and `protobuf` and offers the extras `tracing` and `metrics`.                             |
+| AC-1.2   | Importing `ate_env_rl`, `ate_env_rl.observability` or `ate_env_rl.telemetry` in the base install loads neither extra.               |
+| AC-2.1   | With a layer enabled and its extra missing, the run completes and `fleet.report` exists.                                            |
+| AC-2.2   | Each enabled layer missing its extra logs exactly one `ERROR` or `WARNING` naming the extra.                                        |
+| AC-2.3   | Telemetry code raises no exception.                                                                                                 |
+| AC-3.1   | One `ate_env_fleet.run` span per run, sync and async.                                                                               |
+| AC-3.2   | Every `ate_env_fleet.*` and `ate_env_client.*` span of a run descends from its `ate_env_fleet.run` span, across threads and loops.  |
+| AC-3.3   | Each task's exec and file spans are children of that task's `ate_env_fleet.process` span.                                           |
+| AC-3.4   | The first exec started on an acquired sandbox, and only that one, carries `ate_env.first_command=true`.                             |
+| AC-3.5   | Only span names and attribute keys documented in [interfaces.md](./interfaces.md).                                                  |
+| AC-4.1   | With tracing on, exactly one `traceparent` matching the current span on all four call kinds.                                        |
+| AC-4.2   | Caller metadata passes through unchanged and in order; a key the caller set is not added again (case-insensitive).                  |
+| AC-4.3   | No `baggage` header the caller did not send.                                                                                        |
+| AC-4.4   | With tracing off, the caller's metadata is sent unchanged.                                                                          |
+| AC-5.1   | `ate-env-api` with `-enable-tracing` records its span under the client's trace.                                                     |
+| AC-5.2   | `ate-env-api` exports to the configured OTLP endpoint.                                                                              |
+| AC-6.1   | `ate-env-api` serves exactly the documented `ate_env_api_*` families and labels.                                                    |
+| AC-6.2   | Calls move `ate_env_api_requests_total` and `ate_env_api_create_to_ready_seconds`.                                                  |
+| AC-7.1   | `to_dict()` keys and `phases` entry keys are exactly the documented ones.                                                           |
+| AC-7.2   | `add_phase(name, d)` adds 1 to `count`, `max(d, 0)` to `total_s`, and raises `max_s` to at least `max(d, 0)`.                       |
+| AC-7.3   | Every phase keeps `0 <= max_s <= total_s <= count * max_s`, including after negative durations.                                     |
+| AC-7.4   | `add_task("ok")` counts `tasks_ok`; any other status counts `tasks_err`.                                                            |
+| AC-7.5   | `summary()` rows follow `ORDER`, then other phases first-seen, then `TOTAL`; `to_dict()` survives a JSON round trip.                |
+| AC-7.6   | A mock run records the documented phase set.                                                                                        |
+| AC-7.7   | `add_release_error()` adds 1 to `release_errors`; `summary()` prints `release_errors=N` while it is nonzero.                        |
+| AC-8.1   | Importing `ate_env_rl` or `ate_env_rl.observability` registers nothing.                                                             |
+| AC-8.2   | The first metrics-enabled `Observer` or client timing registers each documented family once, with exactly its labels.               |
+| AC-8.3   | A second `Observer` or a module reload neither raises nor registers a family twice.                                                 |
+| AC-8.4   | `serve_metrics(port)` answers `/metrics`.                                                                                           |
+| AC-9.1   | At most `MAX_FAMILIES` (64) registered families and at most `MAX_FAMILIES + 2` distinct `family` values per process.                |
+| AC-9.2   | Repo families matching the reserved names (and their `_repo` forms) are escaped with `_repo`; bare reserved names never register.   |
+| AC-9.3   | `other` only when the registry is full and the family is new.                                                                       |
+| AC-9.4   | A registered family always gets the same label.                                                                                     |
+| AC-9.5   | No ids or image tags in label values; no label named `env_id`, `instance`, `image` or `run_id`.                                     |
+| AC-10.1  | With tracing off, the JSONL equals the golden file byte for byte.                                                                   |
+| AC-10.2  | The JSONL is the same with tracing on and off.                                                                                      |
+| AC-10.3  | One span per event, named `Event.Event`, from `ts - dur_ms` to `ts`, with the attribute and status rules in P-19.                   |
+| AC-11.1  | With a nil `TracerProvider`, no span and no exporter.                                                                               |
+| AC-11.2  | With a provider, one span per call named `<TraceServiceName>.<op>` with documented keys only.                                       |
+| AC-15.1  | The `ate_env_fleet_warm_replicas` gauge equals the driver's warm pool after every step of any interleaving.                         |
+| AC-15.2  | A recycle or `warm_pool` paused across teardown deletes its actor on resume; nothing from the run survives teardown.                |
+| AC-15.3  | Overlapping `warm_pool(template, replicas=R)` calls create at most `R` warm actors for one pool key.                                |
+| AC-15.4  | `unwarm_pool` and a shrinking `resize_pool` cancel the `warm_pool` calls in flight for that pool.                                   |
+| AC-15.5  | An actor whose delete fails after a teardown or a drain is deleted by the next `reap` of any run.                                   |
+| AC-15.6  | A direct `reap` leaves the gauge equal to the pool.                                                                                 |
+| AC-15.7  | A warm claim returns a live environment.                                                                                            |
+| AC-15.8  | A `warm_pool` cancelled during `create()` leaves no live actor untracked.                                                           |
+| AC-15.9  | A delete cancelled after a reap leaves the actor for any later reap; a release lost across a teardown deletes it in the background. |
+| AC-15.10 | An `acquire` that completes after its own run's reap leaves its environment for a later reap.                                       |
+| AC-16.1  | A test collects every span name and attribute key the client and driver operations emit.                                            |
+| AC-16.2  | The collected set equals the documented table; CI fails on a difference.                                                            |
+| AC-17.1  | Shared operations have the same span `<op>` in both clients.                                                                        |
+| AC-17.2  | Same inputs give the same `ate.*` and `ate_env.*` keys and values, except the Python-only keys.                                     |
+| AC-17.3  | Same `rpc.*` and `server.*` keys and values under each semconv value.                                                               |
+| AC-17.4  | `executable` and `executable_attr` agree on one shared table.                                                                       |
+| AC-18.1  | `ate_env.command.executable` never holds an argument or an assignment value.                                                        |
+| AC-18.2  | No attribute value holds file content, a token or an image tag.                                                                     |
+| AC-19.1  | The gauge is the sum of every `Observer`'s pool.                                                                                    |
+| AC-19.2  | `warm_reset` removes only that `Observer`'s share.                                                                                  |
 
 ## Requirements without a property
 

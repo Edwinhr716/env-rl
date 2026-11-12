@@ -17,6 +17,7 @@ import asyncio
 import pytest
 
 from ate_env_rl.async_fleet import AsyncSandboxFleet
+from ate_env_rl.backend.mock import MockBackendDriver
 from ate_env_rl.config import FleetConfig
 from ate_env_rl.types import Task
 
@@ -81,6 +82,34 @@ async def test_async_context_manager():
         async with handle:
             res = handle.exec("echo in-handle-ctx")
             assert "in-handle-ctx" in res.stdout
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager_awaits_the_backends_close_async():
+    # The exit awaits close_async, not the blocking close(): a Substrate
+    # backend's close() joins the deletes a cancelled acquire started, which
+    # a blocked event loop cannot serve.
+    class ClosingBackend(MockBackendDriver):
+        def __init__(self):
+            super().__init__()
+            self.calls: list[str] = []
+
+        def reap(self, run_id):
+            self.calls.append("reap")
+            return super().reap(run_id)
+
+        def close(self):
+            self.calls.append("close")
+
+        async def close_async(self):
+            self.calls.append("close_async")
+
+    backend = ClosingBackend()
+    async with AsyncSandboxFleet(FleetConfig(backend="mock"), driver=backend) as fleet:
+        pass
+    assert backend.calls == ["reap", "close_async"]
+    fleet.close()  # the sync close, as __del__ calls it, is still the backend's close()
+    assert backend.calls == ["reap", "close_async", "close"]
 
 
 @pytest.mark.asyncio

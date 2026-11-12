@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import os
 import threading
 import time
@@ -35,7 +36,7 @@ from ..errors import (
     PreflightError,
     SandboxStartError,
 )
-from ..loop_runner import LoopRunner
+from ..loop_runner import _STOP_ROUNDS, LoopRunner
 from ..preflight import (
     _DIGEST,
     DomainCoverage,
@@ -67,6 +68,22 @@ from ..types import (
 from .base import BackendDriver
 
 logger = logging.getLogger("ate_env_rl.backend.substrate")
+
+
+# How long a reap, and close(), wait for the background deletes a cancelled
+# acquire or warm_pool call started before naming the actors still deleting.
+# A Substrate delete takes well under a second; the bound keeps a hung
+# delete from holding teardown, and the tasks run on until the loop stops.
+DEFAULT_BACKGROUND_DELETE_TIMEOUT_S = 10.0
+
+# Loop iterations _wait_background_deletes yields before each check of the
+# background deletes. The join is complete only if a task cancelled just
+# before or during the reap reaches _spawn_background_delete in its cancel
+# handler within this many iterations: the fake client needs one or two, and
+# an interceptor-wrapped grpc.aio call a few more. A handler slower than that
+# starts a delete the join does not see, and the actor stays owned under
+# WARM_POOL_RUN_ID for a later reap.
+_CANCEL_SETTLE_YIELDS = 8
 
 
 def _loop_running() -> bool:
@@ -120,6 +137,46 @@ class SubstrateBackendDriver(BackendDriver):
     tracer_config enables ``ate_env_client.ensure_template`` / ``.warm_pool`` /
     ``.acquire`` / ``.release`` / ``.reap`` spans and is handed to the Client
     the driver builds (needs the ``tracing`` extra).
+
+    background_delete_timeout_s is how long ``reap`` and ``close()`` wait for
+    the background deletes that cancelled ``acquire`` and ``warm_pool`` calls
+    started: a finite number of seconds, ``>= 0`` (a bool, NaN, infinity or a
+    negative value raises ``ValueError``), 10 by default. ``0`` means no wait:
+    the reap still lets the cancel handlers start their deletes, then names
+    every delete still running in the ``InfrastructureError`` it raises, and
+    ``close()`` logs them, as both do for a delete still running when a longer
+    wait ends. A joined delete that failed, or was cancelled, counts as a
+    failed reap delete: the reap names its environment too, and ``close()``
+    logs it; one whose environment is already gone counts as done. ``reap``
+    cancels none of those deletes, and their environments stay tracked for
+    the next ``reap`` of any run. ``close()`` first cancels the calls still
+    in flight on its own loop, so a cancelled ``create()`` starts its delete
+    while the channels are open, waits the same bound, and then closes the
+    channels it owns and stops its loop, which ends a delete still running.
+    ``close()`` and ``close_async()`` count as a teardown: that delete starts
+    even when no ``reap`` ran since the call began, and a recycle or
+    ``warm_pool`` that finishes during them deletes instead of pooling. A
+    ``release`` (recycling or not) that is cancelled, or whose delete fails,
+    after a teardown began since the call started (a ``reap`` of any run, or
+    a close) starts a background delete as well, joined the same way: that
+    reap could not see the environment. With no teardown the environment
+    stays tracked under its run id, for the run's ``reap``. The delete of a
+    ``warm_pool`` call that finished after the ``reap``, when a close
+    cancels it, starts one too. So does a ``reap`` still in flight
+    (another thread's teardown) that they cancel, or whose deletes their
+    channel close cuts off, for each environment it had not deleted.
+    ``close_async()`` on the caller's loop cancels no task: the part of a
+    ``reap`` or ``warm_pool`` call that waited for one of the call's 16
+    slots stops when the channel close frees one, and deletes in the
+    background as the parts that were cut off do. ``close_async()`` repeats
+    its join, 4 rounds at most, while a client that a delete dialed is open.
+    An ``unwarm_pool`` or a shrinking ``resize_pool`` tracks the
+    environments it takes out of the pool for the next ``reap`` of any run
+    from that moment, so one that is cancelled leaves none of them to the
+    ``reap`` of the run that warmed them alone. Cut off by a close, it
+    starts a background delete for each one it had not deleted, as a
+    ``reap`` does, and so does a ``warm_pool`` call that deletes its
+    environments after a teardown.
     """
 
     backend_name = "substrate"
@@ -142,9 +199,22 @@ class SubstrateBackendDriver(BackendDriver):
         connections: int = 1,
         worker_selector: Mapping[str, str] | None = None,
         placement: Mapping[str, Mapping[str, str]] | None = None,
+        background_delete_timeout_s: float = DEFAULT_BACKGROUND_DELETE_TIMEOUT_S,
     ):
         if not isinstance(connections, int) or connections < 1:
             raise ValueError(f"connections must be >= 1, got {connections!r}")
+        # A bool is not a timeout; NaN never satisfies the join's deadline
+        # check, so _wait_background_deletes would never time out.
+        if (
+            isinstance(background_delete_timeout_s, bool)
+            or not isinstance(background_delete_timeout_s, (int, float))
+            or not math.isfinite(background_delete_timeout_s)
+            or background_delete_timeout_s < 0
+        ):
+            raise ValueError(
+                "background_delete_timeout_s must be a finite number of seconds >= 0, "
+                f"got {background_delete_timeout_s!r}"
+            )
         target = (
             api_endpoint
             or os.environ.get("ATE_ENV_API_TARGET")
@@ -170,6 +240,10 @@ class SubstrateBackendDriver(BackendDriver):
         self.preflight_batch_images = 0
         self.acquire_timeout_s = acquire_timeout_s
         self.ready_timeout_s = ready_timeout_s
+        # How long reap and close() wait for background deletes
+        # (_wait_background_deletes) before naming the actors still deleting;
+        # 0 is no wait.
+        self.background_delete_timeout_s = background_delete_timeout_s
         self.tracer_config = tracer_config or TracerConfig()
         self.tracer = tracer_from_config(self.tracer_config)
 
@@ -191,12 +265,19 @@ class SubstrateBackendDriver(BackendDriver):
         self._lock = threading.Lock()
         self._owned_actors: dict[str, RawSandboxInstance] = {}
         self._warm_paused_pool: _WarmPoolDict = _WarmPoolDict()
-        # Bumped when a reap starts and when it ends; _reaping counts the reaps
-        # in progress. A recycle, warm_pool or warm-claim put-back that awaited
-        # across a reap, or finishes during one, deletes its actor instead of
-        # pooling it (_may_pool).
+        # Bumped when a reap starts and when it ends, and when close() starts
+        # (_count_teardown); _reaping counts the reaps in progress. A recycle,
+        # warm_pool or warm-claim put-back that awaited across a reap, or
+        # finishes during one, deletes its actor instead of pooling it
+        # (_may_pool).
         self._teardowns = 0
         self._reaping = 0
+        # Whether close() or close_async() is running. A delete of an unpooled
+        # actor, or a reap, that close cancels then starts a background delete
+        # per actor, which close joins: no reap follows to delete the actor.
+        # A release lost during a close does too (_return_popped), as after
+        # any teardown.
+        self._closing = False
         # Per run id: reaps of that run in progress, and the _teardowns
         # value when its last reap ended. An acquire whose own run was reaped
         # while it created the actor owns it under WARM_POOL_RUN_ID (AC-15.10).
@@ -212,6 +293,17 @@ class SubstrateBackendDriver(BackendDriver):
         # its generation; unwarm_pool and resize_pool start a new one.
         self._warm_inflight: dict[tuple[tuple[str, str | None], int, int], int] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        # The background deletes a cancelled acquire or warm_pool call started
+        # (AC-15.2, AC-15.8), each with the id of the actor it deletes, so a
+        # reap can join them and name the ones still running at its deadline.
+        self._background_deletes: dict[asyncio.Task[Any], str] = {}
+        # The actors whose background deletes did not land (failed, or
+        # cancelled) since the last join, in order, written by
+        # _background_delete before its task ends. The next join reports the
+        # ones still owned (_take_failed_background_deletes): a delete that
+        # fails fast would otherwise leave the task done and the reap
+        # returning as if the actor were gone.
+        self._failed_background_deletes: dict[str, None] = {}
 
     def _get_loop_runner(self) -> LoopRunner:
         with self._lock:
@@ -276,22 +368,118 @@ class SubstrateBackendDriver(BackendDriver):
     def _sync(self, coro: Any) -> Any:
         return self._get_loop_runner().run(coro)
 
+    async def _quiesce(self, cancel_calls: bool) -> None:
+        """Join the background deletes on this loop, before the clients close.
+
+        The reap's own join can miss one: a cold acquire still in create()
+        when the reap took its snapshot, and cancelled after the reap's join
+        returned (by its timeout_s, say), starts its delete between the reap
+        and close(). Late ones, and ones that failed since the reap's join,
+        are logged by actor id.
+
+        With ``cancel_calls``, every other task on this loop is cancelled and
+        waited for first. On an owned LoopRunner the tasks are all the
+        driver's (the sync facades', the runtimes'), and the cancel handler
+        of an acquire or warm_pool call still in create() starts its delete,
+        which then runs on a client that is still open. The caller's loop
+        is not quiesced that way: its tasks are the caller's.
+        """
+        if cancel_calls:
+            me = asyncio.current_task()
+            with self._lock:
+                deletes = set(self._background_deletes)
+            tasks = [t for t in asyncio.all_tasks() if t is not me and t not in deletes]
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        await self._wait_background_deletes()
+
+    def _count_teardown(self) -> None:
+        """Count a teardown before close() cancels a call or closes a channel.
+
+        The cancel handler of an acquire or warm_pool call in create() then
+        sees one (_may_pool) and starts its delete, which the shutdown joins,
+        and a recycle or warm_pool that finishes during the shutdown deletes
+        instead of pooling. Without it, a call that started after the run's
+        reap, or with no reap at all, left its environment live. It also
+        marks the driver as closing (_closing), so a release, or a delete of
+        an unpooled actor, that the shutdown cancels starts a background
+        delete too (_return_popped, _delete_unpooled), and a reap it cuts off
+        starts one for each actor it had not deleted
+        (_delete_unreaped_in_close).
+        """
+        with self._lock:
+            self._teardowns += 1
+            self._closing = True
+
+    async def _shutdown_async(self, cancel_calls: bool) -> None:
+        """close()'s work on one loop: count a teardown, join the deletes, then
+        close the owned clients."""
+        self._count_teardown()
+        await self._quiesce(cancel_calls)
+        if not self._owns_client:
+            return
+        await self._close_clients(self._take_owned_clients())
+        if not cancel_calls:
+            # Closing the channels cancelled the calls still in flight on
+            # this loop. The cancel handler of an acquire or warm_pool call
+            # in create() starts a delete, which dials a new client (the
+            # client property): join those too, then close that client.
+            # Closing it can cut off a call that was not a background delete
+            # (a caller's task that was not cancelled and went on to its next
+            # call), whose handler starts a delete on one more client, so
+            # repeat while a client is open, for as many rounds as
+            # LoopRunner.stop() takes for the tasks its cancels start.
+            for _ in range(_STOP_ROUNDS):
+                await self._quiesce(cancel_calls=False)
+                clients = self._take_owned_clients()
+                if not clients:
+                    break
+                await self._close_clients(clients)
+
     async def close_async(self) -> None:
-        if self._owns_client:
-            await self._close_clients(self._take_owned_clients())
-        if self._owns_loop_runner and self._loop_runner:
-            self._loop_runner.stop()
-            self._loop_runner = None
+        runner = self._loop_runner if self._owns_loop_runner else None
+        if runner is not None and runner.on_loop_thread():
+            # Awaited on the runner's own loop: stop() would be a no-op there,
+            # so the runner is kept for a later close().
+            runner = None
+        try:
+            if runner is not None:
+                # The sync facades' and the runtimes' tasks run on the owned
+                # runner: cancel them there and join the deletes they start,
+                # while the clients are still open. Their cancel handlers look
+                # for a teardown too.
+                self._count_teardown()
+                await asyncio.wrap_future(runner.submit(self._quiesce(cancel_calls=True)))
+            await self._shutdown_async(cancel_calls=False)
+            if runner is not None:
+                runner.stop()
+                self._loop_runner = None
+        finally:
+            with self._lock:
+                self._closing = False
 
     def close(self) -> None:
-        if self._loop_runner:
-            if self._owns_client:
-                self._loop_runner.run(self._close_clients(self._take_owned_clients()))
-            if self._owns_loop_runner:
-                self._loop_runner.stop()
+        runner = self._loop_runner
+        if runner is None:
+            if not (self._owns_client and (self._client or self._extra_clients)):
+                return
+            # Channels, but no loop of the driver's ever ran: close them on
+            # one, stopped below.
+            runner = self._get_loop_runner()
+        owns_runner = self._owns_loop_runner
+        # On an owned runner the tasks are all the driver's: cancel the calls
+        # still in flight, join the deletes they start, then close the
+        # clients. A caller's runner keeps its tasks.
+        try:
+            runner.run(self._shutdown_async(cancel_calls=owns_runner))
+            if owns_runner:
+                runner.stop()
                 self._loop_runner = None
-        elif self._owns_client and (self._client or self._extra_clients):
-            self._sync(self.close_async())
+        finally:
+            with self._lock:
+                self._closing = False
 
     async def preflight_async(self) -> None:
         """Validate ate-env-api connectivity."""
@@ -585,7 +773,9 @@ class SubstrateBackendDriver(BackendDriver):
 
         An acquire that times out or is cancelled while its create() is in
         flight leaves the environment, if the create landed, to the driver:
-        the next reap of any run deletes it (AC-15.2).
+        the next reap of any run deletes it (AC-15.2). One cancelled while
+        it checks a warm actor returns that actor to the warm pool, or
+        deletes it if a teardown ran since the claim (AC-15.7).
         """
         to_s = timeout_s or self.acquire_timeout_s
         slot_wait_s = current_slot_wait_s.get() or 0.0
@@ -638,10 +828,15 @@ class SubstrateBackendDriver(BackendDriver):
         """
         pool_key = (template_id, rootfs_image)
         claim_source = "cold_create"
+        # _teardowns as read on entry: a warm claim paused in get() across
+        # its own run's reap compares against it on every later pass.
+        entry_teardowns: int | None = None
         while True:
             actor_id: str | None = None
             with self._lock:
                 teardowns = self._teardowns
+                if entry_teardowns is None:
+                    entry_teardowns = teardowns
                 warm_list = self._warm_paused_pool.get(pool_key)
                 if warm_list:
                     actor_id = warm_list.pop()
@@ -694,6 +889,35 @@ class SubstrateBackendDriver(BackendDriver):
                         source="warm_pool",
                     )
                     raise SandboxStartError(f"Error checking warm actor {actor_id}: {e}") from e
+                except BaseException:
+                    # Cancelled in get() (by acquire's timeout_s, the caller,
+                    # or close()): the actor is out of the pool and no caller
+                    # will hold it (AC-15.7). Put it back, as above. After a
+                    # teardown the pool is gone, and the actor may carry the
+                    # run id of an earlier run (a recycled one), which no
+                    # later reap matches: own it under WARM_POOL_RUN_ID and
+                    # delete it in a background task, so the cancel is not
+                    # delayed (reap and close() join it).
+                    with self._lock:
+                        put_back = self._may_pool(teardowns)
+                        stale = None
+                        if put_back:
+                            self._warm_paused_pool.setdefault(pool_key, []).append(actor_id)
+                        else:
+                            stale = self._owned_actors.get(actor_id)
+                            if stale is not None:
+                                self._own_for_any_reap(actor_id, stale)
+                    if put_back:
+                        self._observe("warm_add", 1)
+                    elif stale is not None and _loop_running():
+                        self._spawn_background_delete(actor_id, "after a cancelled warm claim")
+                    metrics.observe_subphase(
+                        "wire_claim",
+                        time.monotonic() - claim_start,
+                        status="error",
+                        source="warm_pool",
+                    )
+                    raise
                 finally:
                     current_warm_claim.reset(wc_token)
                 instance = self._make_instance(
@@ -706,6 +930,8 @@ class SubstrateBackendDriver(BackendDriver):
                     reaped_since = not self._may_pool(teardowns)
                     if reaped_since:
                         stale = self._owned_actors.get(actor_id)
+                    elif self._run_reaped_since(run_id, entry_teardowns):
+                        self._own_for_any_reap(actor_id, instance)
                     else:
                         self._owned_actors[actor_id] = instance
                 if reaped_since:
@@ -786,7 +1012,9 @@ class SubstrateBackendDriver(BackendDriver):
                         status="error",
                         source="cold_create",
                     )
-                    self._own_abandoned_create(actor_id, template_id, rootfs_image, teardowns)
+                    self._own_abandoned_create(
+                        actor_id, template_id, rootfs_image, entry_teardowns
+                    )
                     raise
                 if last_err is not None:
                     metrics.observe_subphase(
@@ -809,12 +1037,13 @@ class SubstrateBackendDriver(BackendDriver):
         instance = self._make_instance(actor_id, template_id, run_id, rootfs_image=rootfs_image)
         instance.metadata["claim_source"] = claim_source
         with self._lock:
-            if self._run_reaped_since(run_id, teardowns):
-                # The run's own reap overlapped this create and may have
-                # missed the actor, and a fleet's last teardown reaps its run
-                # once: own it under WARM_POOL_RUN_ID, which every reap
-                # deletes. The caller's handle keeps its run_id, and its
-                # release deletes the actor as usual (AC-15.10).
+            if self._run_reaped_since(run_id, entry_teardowns):
+                # The run's own reap overlapped this acquire (during an earlier
+                # warm claim or this cold create) and may have missed the
+                # actor, and a fleet's last teardown reaps its run once: own it
+                # under WARM_POOL_RUN_ID, which every reap deletes. The
+                # caller's handle keeps its run_id, and its release deletes the
+                # actor as usual (AC-15.10).
                 self._own_for_any_reap(actor_id, instance)
             else:
                 self._owned_actors[actor_id] = instance
@@ -903,6 +1132,9 @@ class SubstrateBackendDriver(BackendDriver):
         async def _warm_one() -> str | None:
             actor_id = f"warm-{uuid.uuid4().hex[:10]}"
             async with sem:
+                # Woken by a call that close cut off, not cancelled itself:
+                # no create on a channel that close has to open for it.
+                self._stop_if_closing()
                 started.append(actor_id)
                 try:
                     drv_tok = in_driver_span.set(True)
@@ -924,6 +1156,9 @@ class SubstrateBackendDriver(BackendDriver):
                     logger.warning("Failed to provision warm actor %s: %s", actor_id, e)
                     return None
                 if wait:
+                    # Created during a close: no suspend; the call's handler
+                    # below owns the actor and deletes it.
+                    self._stop_if_closing()
                     try:
                         await self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
                     except Exception as e:
@@ -964,11 +1199,19 @@ class SubstrateBackendDriver(BackendDriver):
         tasks = [_warm_one() for _ in range(needed)]
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, BaseException) and not isinstance(res, Exception):
+                    # A create() or suspend() was cancelled under a call that
+                    # was not: the channel closed (close_async on the caller's
+                    # loop). gather hands that back as a result; treat it as
+                    # this call's own cancel, so the actors are accounted for.
+                    raise res
         except BaseException:
-            # Cancelled: the actors created so far, and any whose create() was
-            # in flight, are neither pooled nor owned. Own them under
-            # WARM_POOL_RUN_ID, so any run's reap deletes them (one that was
-            # never created is NotFound there, which counts as gone).
+            # Cancelled, or one actor's call was: the actors created so far,
+            # and any whose create() was in flight, are neither pooled nor
+            # owned. Own them under WARM_POOL_RUN_ID, so any run's reap
+            # deletes them (one that was never created is NotFound there,
+            # which counts as gone).
             with self._lock:
                 _release_reservation()
                 reaped_since = not self._may_pool(teardowns)
@@ -981,16 +1224,14 @@ class SubstrateBackendDriver(BackendDriver):
                     )
             if reaped_since and _loop_running():
                 # A reap ran or is running and may have taken its snapshot
-                # before this handler, and a fleet reaps its run once: delete
-                # them now, in background tasks so the cancel is not delayed,
-                # as the wait=False suspends do. A delete that fails or never
-                # runs leaves them for any later reap (AC-15.8).
+                # before this handler, and a fleet reaps its run once; or
+                # close() started, and no reap follows: delete them now, in
+                # background tasks so the cancel is not delayed, as the
+                # wait=False suspends do (close() joins them before its
+                # channels close). A delete that fails or never runs leaves
+                # them for any later reap (AC-15.8).
                 for aid in started:
-                    task = asyncio.create_task(
-                        self._delete_unpooled(aid, "after a cancelled warm_pool")
-                    )
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
+                    self._spawn_background_delete(aid, "after a cancelled warm_pool")
             raise
 
         created = [r for r in results if isinstance(r, str)]
@@ -1022,7 +1263,14 @@ class SubstrateBackendDriver(BackendDriver):
                     template_id,
                 )
             why = "after teardown" if torn_down else "after unwarm_pool or resize_pool"
-            await asyncio.gather(*(self._delete_unpooled(aid, why) for aid in created))
+            try:
+                await asyncio.gather(*(self._delete_unpooled(aid, why) for aid in created))
+            except BaseException:
+                # A delete that close() cancelled before its first step ran
+                # no handler of its own.
+                for aid in created:
+                    self._delete_unreaped_in_close(aid)
+                raise
         else:
             self._observe("warm_add", len(created))
 
@@ -1031,6 +1279,46 @@ class SubstrateBackendDriver(BackendDriver):
                 raise res
             if isinstance(res, Exception):
                 logger.warning("Error provisioning warm actor: %s", res)
+
+    def _spawn_background_delete(self, actor_id: str, why: str) -> None:
+        """Delete ``actor_id`` in a background task that a reap can join.
+
+        A cancel handler calls it: the delete must not delay the cancel, and
+        the reap that is running, or the next one, waits for it
+        (_wait_background_deletes). A delete that fails, or is cancelled,
+        leaves the actor owned under WARM_POOL_RUN_ID and its id in
+        _failed_background_deletes, so that join reports it; one that never
+        runs leaves the actor for any later reap.
+        """
+        task = asyncio.create_task(self._background_delete(actor_id, why))
+        with self._lock:
+            self._background_tasks.add(task)
+            self._background_deletes[task] = actor_id
+
+        def _done(t: asyncio.Task[Any]) -> None:
+            with self._lock:
+                self._background_tasks.discard(t)
+                self._background_deletes.pop(t, None)
+                if t.cancelled():
+                    # A task cancelled before its first step never entered
+                    # _background_delete, so its finally recorded nothing;
+                    # one cancelled later recorded the actor already.
+                    self._failed_background_deletes[actor_id] = None
+
+        task.add_done_callback(_done)
+
+    async def _background_delete(self, actor_id: str, why: str) -> None:
+        """One background delete. If it does not land (the delete failed, or
+        the task is cancelled), records the actor in _failed_background_deletes
+        before the task ends, so a join that finds the task done sees the
+        outcome too."""
+        gone = False
+        try:
+            gone = await self._delete_unpooled(actor_id, why, background=True)
+        finally:
+            if not gone:
+                with self._lock:
+                    self._failed_background_deletes[actor_id] = None
 
     def _own_abandoned_create(
         self, actor_id: str, template_id: str, rootfs_image: str | None, teardowns: int
@@ -1041,9 +1329,9 @@ class SubstrateBackendDriver(BackendDriver):
         WARM_POOL_RUN_ID, so any run's reap deletes it (one whose create never
         landed is NotFound there, which counts as gone). If a reap ran since
         the caller read ``teardowns``, that reap may have taken its snapshot
-        first: delete it now too, in a background task so the cancel is not
-        delayed. A delete that fails or never runs leaves it for any later
-        reap.
+        first, and if close() started, no reap follows: delete it now too, in
+        a background task so the cancel is not delayed (close() joins it). A
+        delete that fails or never runs leaves it for any later reap.
         """
         with self._lock:
             reaped_since = not self._may_pool(teardowns)
@@ -1054,23 +1342,41 @@ class SubstrateBackendDriver(BackendDriver):
                 ),
             )
         if reaped_since and _loop_running():
-            task = asyncio.create_task(self._delete_unpooled(actor_id, "after a cancelled acquire"))
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            self._spawn_background_delete(actor_id, "after a cancelled acquire")
+
+    def _stop_if_closing(self) -> None:
+        """Raise CancelledError while close() or close_async() runs.
+
+        For a call that waited on a semaphore, at the point it gets it.
+        close_async() on the caller's loop cancels no task: closing the
+        channels cuts off the calls in flight, which frees the semaphore for
+        the ones that waited, and those would send their create() or delete()
+        on a client dialed for them, as a foreground call that close does not
+        join. Stopped here, they take the same path as the calls that were
+        cut off: the cancel handler starts the background delete.
+        """
+        with self._lock:
+            closing = self._closing
+        if closing:
+            raise asyncio.CancelledError("the driver is closing")
 
     def _may_pool(self, teardowns: int) -> bool:
-        """Whether an actor may enter the pool: no reap ran since the caller
-        read ``teardowns`` and none is running. Caller holds self._lock."""
+        """Whether an actor may enter the pool: no reap ran, and no close()
+        started, since the caller read ``teardowns``, and no reap is running.
+        Caller holds self._lock."""
         return self._reaping == 0 and self._teardowns == teardowns
 
-    async def _delete_unpooled(self, actor_id: str, why: str) -> None:
+    async def _delete_unpooled(self, actor_id: str, why: str, *, background: bool = False) -> bool:
         """Delete an owned actor that is not in the pool and that this run's
         reap may already have missed (``why`` goes in the log).
 
-        The actor leaves _owned_actors only once the delete succeeds (or finds
-        it gone). A failed delete is counted as a release failure; a failed or
-        cancelled one re-tags the actor with WARM_POOL_RUN_ID, so whichever
-        run reaps next deletes it (AC-15.5, AC-15.9).
+        Returns whether the actor is gone: deleted, or not found. The actor
+        leaves _owned_actors only then. A failed delete is counted as a
+        release failure and returns False; a failed or cancelled one re-tags
+        the actor with WARM_POOL_RUN_ID, so whichever run reaps next deletes
+        it (AC-15.5, AC-15.9). One that close() or close_async() cancels has
+        no reap after it: it starts a background delete, which close joins,
+        unless it is one itself (``background``).
         """
         try:
             await self._client_for(actor_id).delete(actor_id, atespace=self.atespace)
@@ -1080,40 +1386,83 @@ class SubstrateBackendDriver(BackendDriver):
             self._observe("release_failed")
             logger.warning("Failed deleting actor %s %s: %s", actor_id, why, e)
             self._keep_for_any_reap(actor_id)
-            return
+            return False
         except BaseException:
             # Cancelled: the run's reap may already have run, so leave the
             # actor where any later reap finds it, then let the cancel through.
-            self._keep_for_any_reap(actor_id)
+            # Cancelled by close: delete it in the background, before the
+            # channels close.
+            if self._keep_for_any_reap(actor_id) and not background and _loop_running():
+                self._spawn_background_delete(actor_id, f"{why}, cancelled by close")
             raise
         with self._lock:
             self._owned_actors.pop(actor_id, None)
+        return True
 
     def _return_popped(self, actor_id: str, instance: RawSandboxInstance, teardowns: int) -> None:
         """Own again an actor that release popped and did not delete.
 
-        A reap since the pop (one read ``teardowns``) could not see the actor,
-        and a fleet reaps its run once: then own it under WARM_POOL_RUN_ID,
-        which every reap deletes; otherwise under its own run id, for the
-        run's reap. The check and the update share one lock hold, so a reap
-        that starts in between cannot miss the actor (AC-15.9). A copy, so
-        the caller's handle keeps its run_id.
+        With no teardown since the pop (one read ``teardowns``), under its
+        own run id, for the run's reap. After a reap, during one, or during
+        close() or close_async(): that reap could not see the actor, a fleet
+        reaps its run once, and no reap follows a close. Then own it under
+        WARM_POOL_RUN_ID and delete it in a background task, as a cancelled
+        acquire does (_own_abandoned_create); the reap that is running, or
+        close, joins it. A delete that fails or never runs leaves the actor
+        for any later reap (AC-15.9). The check and the update share one lock
+        hold, so a reap that starts in between cannot miss the actor. A copy,
+        so the caller's handle keeps its run_id.
         """
         with self._lock:
-            if self._may_pool(teardowns):
-                self._owned_actors.setdefault(actor_id, instance)
-            else:
+            torn_down = self._closing or not self._may_pool(teardowns)
+            if torn_down:
                 self._own_for_any_reap(actor_id, instance)
+            else:
+                self._owned_actors.setdefault(actor_id, instance)
+        if torn_down and _loop_running():
+            self._spawn_background_delete(actor_id, "after a release lost across a teardown")
 
-    def _keep_for_any_reap(self, actor_id: str) -> None:
+    def _delete_unreaped_in_close(self, actor_id: str) -> None:
+        """During close() or close_async(), delete in the background an actor
+        that a reap, or a call that deletes unpooled actors, has not deleted.
+
+        close() cancels a reap still in flight on its own runner (another
+        thread's teardown), and closing the channels cuts off the deletes of
+        one on the caller's loop; the same goes for an unwarm_pool, a
+        shrinking resize_pool, and the deletes of a warm_pool call that
+        finished after a teardown. A task cancelled while it waited on the
+        call's semaphore, or before its first step, started no delete of its
+        own. No reap follows a close, so the actor, if still owned, goes
+        under WARM_POOL_RUN_ID and to a background delete, which close joins
+        before its channels close. One delete per actor: an actor whose
+        background delete is pending gets no second one. Outside a close it
+        does nothing: a cancelled call leaves its actors owned as they were,
+        for the next reap.
+        """
+        with self._lock:
+            inst = self._owned_actors.get(actor_id)
+            if not self._closing or inst is None:
+                return
+            if any(
+                aid == actor_id and not t.done() for t, aid in self._background_deletes.items()
+            ):
+                return
+            self._own_for_any_reap(actor_id, inst)
+        if _loop_running():
+            self._spawn_background_delete(actor_id, "after a call cut off by close")
+
+    def _keep_for_any_reap(self, actor_id: str) -> bool:
         """Keep an owned actor under WARM_POOL_RUN_ID, which every reap deletes.
 
-        An actor a reap already popped is not added back.
+        An actor a reap already popped is not added back. Returns whether
+        the actor is still owned and close() or close_async() is running:
+        then no reap follows, and the caller deletes it in the background.
         """
         with self._lock:
             inst = self._owned_actors.get(actor_id)
             if inst is not None:
                 self._own_for_any_reap(actor_id, inst)
+            return inst is not None and self._closing
 
     def _own_for_any_reap(self, actor_id: str, instance: RawSandboxInstance) -> None:
         """Own ``instance`` under WARM_POOL_RUN_ID. Caller holds self._lock.
@@ -1167,6 +1516,7 @@ class SubstrateBackendDriver(BackendDriver):
             else:
                 surplus = pool[replicas:]
                 del pool[replicas:]
+                self._own_drained_for_any_reap(surplus)
         if replicas > current:
             await self.warm_pool_async(
                 template_id, replicas, wait=wait, rootfs_image=rootfs_image
@@ -1221,6 +1571,7 @@ class SubstrateBackendDriver(BackendDriver):
             to_delete = []
             for k in keys_to_pop:
                 to_delete.extend(self._warm_paused_pool.pop(k, []))
+            self._own_drained_for_any_reap(to_delete)
             self._cancel_warm_calls(keys_to_pop)
         self._observe("warm_remove", len(to_delete))
         await self._delete_drained(to_delete, "unwarming the pool")
@@ -1231,15 +1582,51 @@ class SubstrateBackendDriver(BackendDriver):
         for k in pool_keys:
             self._pool_gens[k] = self._pool_gens.get(k, 0) + 1
 
+    def _own_drained_for_any_reap(self, actor_ids: list[str]) -> None:
+        """Own under WARM_POOL_RUN_ID the actors unwarm_pool or resize_pool
+        just took out of the pool. Caller holds self._lock, since the pop.
+
+        In the pool, any run's reap deleted them. Out of it they would carry
+        the run id warm_pool or a recycle left on them, which may be an
+        earlier run's: a drain cancelled before an actor's delete started
+        (it waited on the semaphore, or its task never took a step) would
+        leave it to that run's reap alone.
+        """
+        for aid in actor_ids:
+            inst = self._owned_actors.get(aid)
+            if inst is not None:
+                self._own_for_any_reap(aid, inst)
+
     async def _delete_drained(self, actor_ids: list[str], why: str) -> None:
-        """Delete actors just taken out of the pool, 16 at a time."""
+        """Delete actors just taken out of the pool, 16 at a time.
+
+        Cut off by close() or close_async(), it starts a background delete
+        for each actor it had not deleted, as a reap does
+        (_delete_unreaped_in_close): no reap follows a close.
+        """
         sem = asyncio.Semaphore(16)
 
         async def _delete_one(actor_id: str) -> None:
-            async with sem:
-                await self._delete_unpooled(actor_id, why)
+            try:
+                async with sem:
+                    # Woken by a delete that close cut off, not cancelled
+                    # itself: to the background, as theirs go.
+                    self._stop_if_closing()
+                    await self._delete_unpooled(actor_id, why)
+            except BaseException:
+                # Cancelled while it waited for the semaphore, or stopped
+                # above; one cancelled in delete() has its delete already.
+                self._delete_unreaped_in_close(actor_id)
+                raise
 
-        await asyncio.gather(*[_delete_one(aid) for aid in actor_ids], return_exceptions=True)
+        try:
+            await asyncio.gather(*[_delete_one(aid) for aid in actor_ids], return_exceptions=True)
+        except BaseException:
+            # A _delete_one that close() cancelled before its first step ran
+            # no handler of its own.
+            for aid in actor_ids:
+                self._delete_unreaped_in_close(aid)
+            raise
 
     def unwarm_pool(self, template_id: str, rootfs_image: str | None = None) -> None:
         self._sync(self.unwarm_pool_async(template_id, rootfs_image=rootfs_image))
@@ -1303,8 +1690,8 @@ class SubstrateBackendDriver(BackendDriver):
                     "Failed to suspend actor %s for recycle, deleting: %s", instance_id, e
                 )
             except BaseException:
-                # Cancelled during suspend(): own it again, for the run's reap
-                # or, if a reap ran since the pop, for any reap.
+                # Cancelled during suspend(): own it again, for the run's
+                # reap; after a teardown since the pop, delete it.
                 self._return_popped(instance_id, instance, teardowns)
                 raise
 
@@ -1314,9 +1701,10 @@ class SubstrateBackendDriver(BackendDriver):
             logger.info("Environment %s was already deleted", instance_id)
             return
         except BaseException:
-            # Own it again, so a reap retries the delete: the run's reap, or
-            # any reap if one ran since the pop (the recycle saw it, or it ran
-            # during this delete).
+            # Own it again, so the run's reap retries the delete. After a
+            # teardown since the pop (the recycle saw it, or it ran during
+            # this delete) no reap of the run follows: a background delete
+            # retries it, and the actor stays owned for any reap.
             if instance is not None:
                 self._return_popped(instance_id, instance, teardowns)
             raise
@@ -1386,29 +1774,132 @@ class SubstrateBackendDriver(BackendDriver):
 
         async def _reap_one(aid: str) -> None:
             nonlocal reaped_count
-            async with sem:
-                try:
-                    await self._client_for(aid).delete(aid, atespace=self.atespace)
-                    async with reap_lock:
-                        reaped_count += 1
-                except NotFoundError:
-                    pass  # already gone (e.g. a release that timed out after the delete landed)
-                except Exception as e:
-                    logger.warning("Failed deleting actor %s during reap: %s", aid, e)
-                    async with reap_lock:
-                        failed_actors.append(aid)
-                with self._lock:
-                    self._owned_actors.pop(aid, None)
+            try:
+                async with sem:
+                    # Woken by a delete that close cut off, not cancelled
+                    # itself: its delete goes to the background as theirs do
+                    # (the handler below), where close joins it.
+                    self._stop_if_closing()
+                    try:
+                        await self._client_for(aid).delete(aid, atespace=self.atespace)
+                        async with reap_lock:
+                            reaped_count += 1
+                    except NotFoundError:
+                        pass  # already gone (e.g. a release that timed out after the delete landed)
+                    except Exception as e:
+                        logger.warning("Failed deleting actor %s during reap: %s", aid, e)
+                        async with reap_lock:
+                            failed_actors.append(aid)
+                    with self._lock:
+                        self._owned_actors.pop(aid, None)
+            except BaseException:
+                # Cancelled in delete(), or while it waited for the semaphore.
+                # By close(): no reap follows, so delete the actor in the
+                # background, before the channels close. By anything else:
+                # the actor stays owned as it was, for the next reap.
+                self._delete_unreaped_in_close(aid)
+                raise
 
-        await asyncio.gather(*[_reap_one(aid) for aid in to_reap], return_exceptions=True)
+        try:
+            await asyncio.gather(*[_reap_one(aid) for aid in to_reap], return_exceptions=True)
+        except BaseException:
+            # A _reap_one that close() cancelled before its first step ran no
+            # handler of its own.
+            for aid in to_reap:
+                self._delete_unreaped_in_close(aid)
+            raise
+        # A background delete that failed since the last join, or that still
+        # runs at the deadline, has the same outcome for the caller as a
+        # failed reap delete: the actor may be alive after teardown. Name it
+        # in the error, so the caller can sweep it; it stays owned under
+        # WARM_POOL_RUN_ID for a later reap.
+        failed_background, late = await self._wait_background_deletes()
+        failed_actors = list(dict.fromkeys(failed_actors + failed_background + late))
 
         if failed_actors:
+            notes = []
+            if failed_background:
+                notes.append(f"{len(failed_background)} background delete(s) failed")
+            if late:
+                notes.append(f"{len(late)} still deleting in the background")
+            detail = f" ({', '.join(notes)})" if notes else ""
             raise InfrastructureError(
-                f"Failed to delete {len(failed_actors)} environments during reap: {failed_actors}"
+                f"Failed to delete {len(failed_actors)} environments during reap: "
+                f"{failed_actors}{detail}"
             )
 
         logger.info("Reaped %d Substrate environments for run %s", reaped_count, run_id)
         return reaped_count
+
+    async def _wait_background_deletes(self) -> tuple[list[str], list[str]]:
+        """Join the background deletes started so far, up to background_delete_timeout_s.
+
+        Returns ``(failed, late)``: the ids of the actors whose background
+        deletes failed, or were cancelled, since the last join and that are
+        still owned (_take_failed_background_deletes), and the ids of those
+        whose deletes still run at the deadline, in the order the deletes
+        started. Both are logged. The late tasks are not cancelled:
+        _delete_unpooled keeps their actors under WARM_POOL_RUN_ID, as it
+        does the failed ones. With background_delete_timeout_s 0 every delete
+        still pending after the settle yields is late.
+
+        A delete whose actor is no longer owned is not waited for: a reap's
+        own delete of that actor landed (or failed, and the reap names it),
+        so a delete that hangs on it holds nothing up. Nor is a delete on
+        another loop, which cannot be awaited from this one.
+
+        Yields before each check so a task cancelled just before or during
+        reap_async (with no await in between) runs its cancel handler and
+        starts its delete tasks while _reaping is nonzero.
+        """
+        deadline = time.monotonic() + self.background_delete_timeout_s
+        loop = asyncio.get_running_loop()
+        while True:
+            for _ in range(_CANCEL_SETTLE_YIELDS):
+                await asyncio.sleep(0)
+            with self._lock:
+                pending: dict[asyncio.Task[Any], str] = {}
+                for t, aid in self._background_deletes.items():
+                    if t.done():
+                        # Its _done callback runs on the next iteration; a
+                        # task cancelled before its first step is recorded
+                        # here as well, so this join does not miss it.
+                        if t.cancelled():
+                            self._failed_background_deletes[aid] = None
+                    elif aid in self._owned_actors and t.get_loop() is loop:
+                        pending[t] = aid
+            if not pending:
+                return self._take_failed_background_deletes(), []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                late = list(pending.values())
+                logger.warning(
+                    "Timed out after %gs waiting for %d background environment delete(s); "
+                    "still deleting: %s",
+                    self.background_delete_timeout_s,
+                    len(late),
+                    late,
+                )
+                return self._take_failed_background_deletes(), late
+            await asyncio.wait(pending, timeout=remaining)
+
+    def _take_failed_background_deletes(self) -> list[str]:
+        """The actors whose background deletes failed, or were cancelled, since
+        the last join and that are still owned, in the order the deletes
+        ended; clears the record and logs them. One whose actor is no longer
+        owned is dropped: a reap's own delete of it (it was under
+        WARM_POOL_RUN_ID) landed, or failed and is already in that reap's
+        failed_actors."""
+        with self._lock:
+            failed = [aid for aid in self._failed_background_deletes if aid in self._owned_actors]
+            self._failed_background_deletes.clear()
+        if failed:
+            logger.warning(
+                "%d background environment delete(s) failed; still owned for a later reap: %s",
+                len(failed),
+                failed,
+            )
+        return failed
 
     def reap(self, run_id: str) -> int:
         return self._sync(self.reap_async(run_id))

@@ -782,9 +782,10 @@ first use of an image; with `FleetConfig(preflight=True)`, `preflight_images`,
 `preflight_golden` and `preflight_probe` when `setup()` did not run the
 pre-flight first). With `async with fleet:`, `setup()` and `teardown()`
 run outside `run()`, so their `preflight`, `plan`, `warm_pool` and `teardown`
-phases go to the Prometheus series and spans but not to the report. The sync
-`SandboxFleet.run` does setup and teardown inside the run, so its report has
-every phase.
+phases go to the Prometheus series and spans but not to the report; the exit
+awaits `teardown()` and then `close_async()`, which closes the backend on the
+event loop (`close()` blocks the calling thread). The sync `SandboxFleet.run`
+does setup and teardown inside the run, so its report has every phase.
 
 **Prometheus** (`metrics` extra; `ObservabilityConfig.enable_metrics`).
 The default, `None`, records the series whenever `prometheus_client` is

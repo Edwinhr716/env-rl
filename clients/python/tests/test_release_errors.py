@@ -201,8 +201,11 @@ def _async_fleet_with_failing_reap(monkeypatch):
     def reap(run_id):
         raise InfrastructureError("could not delete 1 environment(s)")
 
+    async def close_async():
+        closed.append(True)
+
     monkeypatch.setattr(fleet.backend, "reap", reap)
-    monkeypatch.setattr(fleet, "close", lambda *a, **kw: closed.append(True))
+    monkeypatch.setattr(fleet, "close_async", close_async)  # what the exit awaits
     return fleet, closed
 
 

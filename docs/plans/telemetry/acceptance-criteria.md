@@ -229,9 +229,13 @@ Conventions:
   deletes its actor when it resumes; after teardown no environment from the run is alive on
   Substrate or tracked by the driver. Met by #276 for a cold `acquire` cancelled while its
   `create()` is in flight (by its own `timeout_s` or by its caller): the driver owns the actor under
-  `WARM_POOL_RUN_ID`, so any run's reap deletes it, and if a reap ran since the acquire read
-  `_teardowns`, starts its delete in a background task; a teardown that already runs does not wait
-  for it. Before it, an actor whose create landed stayed alive and untracked (#273).
+  `WARM_POOL_RUN_ID`, so any run's reap deletes it, and if a reap ran since the acquire started,
+  starts its delete in a background task; `reap_async`, `close()` and `close_async()` join the
+  pending background deletes up to `background_delete_timeout_s` (`0`: no wait) without cancelling
+  any still running at the deadline, and the reap names those, and any joined delete that failed
+  since the last join (a fast `Unavailable`, say; `NotFound` counts as gone), in the
+  `InfrastructureError` it raises, while `close()` logs them. Before #276, an actor whose create
+  landed stayed alive and untracked (#273).
 - 15.3: overlapping `warm_pool(template, replicas=R)` calls create at most `R` warm actors in total
   for one pool key.
 - 15.4: `unwarm_pool`, and a `resize_pool` below what is pooled plus in flight, cancel the
@@ -240,37 +244,81 @@ Conventions:
 - 15.5: an actor whose delete fails after a teardown, or after `unwarm_pool` or `resize_pool`
   drained it, stays tracked by the driver, and the next `reap` of any run deletes it. This covers
   the deletes that start after the teardown (`warm_pool`, a failed warm claim, a recycle that saw
-  the teardown, a drain); 15.9 covers the rest.
+  the teardown, a drain); 15.9 covers the rest. A `release` first retries its failed delete once in
+  a background task (15.9).
 - 15.6: a direct `reap` (outside a fleet, with no `warm_reset`) leaves the gauge equal to the pool.
 - 15.7: a warm claim returns a live environment, and leaves no actor it popped alive and unpooled.
   Met by #239: a claim whose `get()` succeeds after an overlapping reap deletes the popped actor if
   it is still owned and claims or creates another; before it, the claim returned the deleted one
-  (`ClaimOkReturnsLive`).
+  (`ClaimOkReturnsLive`). A claim cancelled in `get()` (by `timeout_s`, the caller, or a close) puts
+  the actor back in the pool, or, if a teardown ran since the pop, owns it under `WARM_POOL_RUN_ID`
+  and deletes it in a background task that `reap` and `close()` join (#320); before it, the actor
+  stayed live and unpooled under the run id it had, which for an actor an earlier run recycled no
+  later reap matched.
 - 15.8: a `warm_pool` call cancelled during its `create()` calls, or one of whose actors fails to
   suspend, leaves no live actor untracked. Met by #240: a cancelled call owns the actors it sent a
   `create()` for under `WARM_POOL_RUN_ID`, so any run's reap deletes them, and deletes them itself
-  if a reap ran since it planned (that reap may have missed them), and an actor whose `suspend()`
-  fails is owned the same way and deleted at once; before it, those actors leaked.
-- 15.9: a delete that is cancelled after the run's reap, or a `release` whose delete fails or is
-  cancelled while a reap runs, also leaves the actor for the next `reap` of any run. Met by #238;
-  before it both kept the reaped run id, so no later reap deleted the actor (`DeleteCancelledSafe`,
-  `ReleaseDeleteFailSafe`).
-- 15.10: an `acquire` whose cold create overlaps its own run's reap leaves its environment where a
-  later `reap` finds it. Met by #242: the driver owns that environment under `WARM_POOL_RUN_ID` (the
-  caller's handle keeps its run id, and its release deletes the environment as usual); before it,
-  the environment stayed under the reaped run id, and if the caller never released it, `reap` of a
-  later run skipped it (`AcquireCommitBeforeSafe`). Found in review of #239.
+  in background tasks if a reap ran since it planned (that reap may have missed them; `reap_async`
+  and `close()` join those background deletes up to `background_delete_timeout_s`, and a reap names
+  one that failed or still runs), and an actor whose `suspend()` fails is owned the same way and
+  deleted at once; before it, those actors leaked.
+- 15.9: a delete that is cancelled after the run's reap also leaves the actor for the next `reap` of
+  any run. A `release` that is cancelled (in its `suspend()` or its `delete()`), or whose delete
+  fails, after a teardown began since it started (a reap of any run that ran or still runs, or a
+  close) deletes the actor in a background task, which a reap still running, `close()` and
+  `close_async()` join; if that delete fails too, the actor stays tracked for the next `reap` of any
+  run. With no teardown since the release started, the actor stays tracked under its run id and no
+  delete starts. Met by #238 for the tracking; before it both kept the reaped run id, so no later
+  reap deleted the actor (`DeleteCancelledSafe`, `ReleaseDeleteFailSafe`). The background delete is
+  #320's: before it, a `release` lost across a reap left the actor live until a later reap, where a
+  cancelled `acquire` in the same window deleted at once. No reap follows `close()` or
+  `close_async()`: a delete of an unpooled actor that they cancel starts a background delete too,
+  which they join before the channels close (#320). So does a `reap` still in flight that they
+  cancel, or whose deletes their channel close cuts off, for each actor it had not deleted (#320).
+  `close_async()` cancels no task of the caller's: a part of a `reap` or `warm_pool` call that
+  waited on the call's semaphore stops when the channel close frees its slot, deletes in the
+  background too, and sends no create; `close_async()` joins again while a client that a delete
+  dialed is open (#320). An `unwarm_pool` or a shrinking `resize_pool` tracks the actors it takes
+  out of the pool for the next `reap` of any run from the pop, so one that is cancelled leaves each
+  of them there, also those whose delete had not started; cut off by `close()` or `close_async()`,
+  it starts a background delete for each actor it had not deleted, and so do the deletes of a
+  `warm_pool` call that finished after a teardown (#320).
+- 15.10: an `acquire` whose cold create (including a cold fallback after a warm claim paused in
+  `get()` across its own run's reap) overlaps its own run's reap, or whose retried warm claim pops
+  an actor another run pooled after that reap, leaves its environment where a later `reap` finds it.
+  Met by #242 for direct cold creates and extended by capturing `entry_teardowns` once on entry to
+  `_acquire_internal`: the driver owns that environment under `WARM_POOL_RUN_ID` (the caller's
+  handle keeps its run id, and its release deletes the environment as usual); before it, the
+  environment stayed under the reaped run id, and if the caller never released it, `reap` of a later
+  run skipped it (`AcquireCommitBeforeSafe`). Found in review of #239 and #276 (#273).
 - Commands: in `$VENV_BASE` (the `dev` extra carries `hypothesis`):
   `python -m pytest clients/python/tests/test_warm_pool_accounting.py`; with Dafny 4.11:
   `dafny verify docs/plans/telemetry/verify/warm_pool.dfy`,
   `dafny verify docs/plans/telemetry/verify/warm_pool_generations.dfy` and
   `dafny verify docs/plans/telemetry/verify/warm_pool_drain.dfy`.
-- Expected: the pytest run passes (40 plain tests and the stateful `test_warm_pool_accounting`).
+- Expected: the pytest run passes (124 plain tests and the stateful `test_warm_pool_accounting`).
   15.2: `test_cold_acquire_cancelled_in_create_leaves_the_actor_for_any_reap` (cancelled by
   `timeout_s`, and by the caller),
-  `test_cold_acquire_cancelled_in_create_after_its_runs_reap_deletes_the_actor` and the machine's
-  `start_acquire`, `finish_acquire` and `cancel_acquire` rules. 15.4:
-  `test_unwarm_cancels_a_warm_pool_in_flight`,
+  `test_cold_acquire_cancelled_in_create_after_its_runs_reap_deletes_the_actor`,
+  `test_warm_claim_paused_across_own_runs_reap_then_cancelled_in_cold_create_deletes_actor`,
+  `test_reap_waits_for_background_delete_from_cancelled_cold_acquire` (cancelled just before reap
+  and during reap), `test_sync_reap_and_close_completes_background_delete_before_stopping_loop`,
+  `test_sync_close_joins_background_delete_from_acquire_cancelled_after_reap`,
+  `test_sync_close_cancels_an_acquire_in_create_after_reap_and_deletes_its_actor` (with
+  `tests/test_loop_runner.py` for the `LoopRunner.stop` rounds), and on an in-process `grpc.aio`
+  server with the driver owning its channel,
+  `test_sync_close_deletes_the_actor_of_an_acquire_in_create_on_an_owned_channel`,
+  `test_close_async_deletes_the_actor_of_an_acquire_in_create_on_an_owned_channel`,
+  `test_sync_close_deletes_the_actor_of_an_acquire_in_create_with_no_reap_since_it_started` and
+  `test_close_async_deletes_the_actor_of_an_acquire_in_create_with_no_reap_since_it_started` (a reap
+  before the acquire, and no reap at all),
+  `test_reap_bounds_wait_on_hung_background_delete_without_cancelling_it`,
+  `test_reap_names_the_actor_of_a_background_delete_that_fails_during_it`,
+  `test_close_logs_the_actor_of_a_background_delete_that_fails_after_the_reap`,
+  `test_background_delete_timeout_zero_names_the_pending_delete_without_waiting`,
+  `test_background_delete_timeout_must_be_a_finite_number_of_seconds` (a bool, NaN, infinity,
+  negative infinity, a negative number and a string) and the machine's `start_acquire`,
+  `finish_acquire` and `cancel_acquire` rules. 15.4: `test_unwarm_cancels_a_warm_pool_in_flight`,
   `test_shrinking_resize_cancels_a_warm_pool_in_flight`,
   `test_warm_pool_after_unwarm_ignores_the_cancelled_call` and the machine's `unwarm` rule. 15.5:
   `test_failed_delete_after_teardown_leaves_warm_actors_for_any_later_reap`,
@@ -280,22 +328,65 @@ Conventions:
   `test_warm_claim_overlapping_a_reap_returns_a_live_environment` (reap finished or still running;
   popped actor matched by the reap, `run-0`, or skipped by it, `run-1`; in the still-running cases
   the gate pauses the reap's delete of the popped actor for `run-0`, and the claim's own delete of
-  it for `run-1`, where the reap deletes nothing). 15.8:
+  it for `run-1`, where the reap deletes nothing),
+  `test_warm_claim_cancelled_in_get_returns_the_actor_to_the_pool` (cancelled by `timeout_s`, and by
+  the caller), `test_warm_claim_of_an_earlier_runs_actor_cancelled_in_get_across_a_reap_deletes_it`
+  (cancelled during the reap, and after it), and on the in-process `grpc.aio` server with the driver
+  owning its channel,
+  `test_sync_close_deletes_the_warm_actor_of_an_acquire_in_get_on_an_owned_channel` and
+  `test_close_async_deletes_the_warm_actor_of_an_acquire_in_get_on_an_owned_channel`, and the
+  machine's `no_warm_actor_is_lost_before_teardown` invariant with acquires drawn from `run-0` and
+  `run-1` (it fails on the code before the cancelled-claim fix). 15.8:
   `test_cancelled_warm_pool_leaves_its_actors_for_any_reap` (which also checks the reap counts only
   the 2 actors that exist), `test_warm_pool_cancelled_in_suspend_leaves_its_actors_for_any_reap`,
   `test_warm_pool_cancelled_just_before_the_runs_reap_deletes_its_actors`,
-  `test_warm_actor_whose_suspend_fails_is_deleted_or_left_for_any_reap` (delete succeeds, and
-  fails). 15.9: `test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap`,
-  `test_release_delete_lost_during_reap_leaves_the_actor_for_any_later_reap` (failed and cancelled),
-  `test_recycle_cancelled_in_suspend_after_a_reap_leaves_the_actor_for_any_later_reap`,
-  `test_warm_pool_cancelled_before_its_deletes_start_leaves_actors_for_any_later_reap`, and
+  `test_reap_waits_for_background_deletes_from_cancelled_warm_pool` (cancelled just before reap and
+  during reap), `test_warm_actor_whose_suspend_fails_is_deleted_or_left_for_any_reap` (delete
+  succeeds, and fails), `test_sync_close_during_a_warm_pool_on_an_owned_channel_deletes_its_actors`
+  and `test_close_async_during_a_warm_pool_on_an_owned_channel_deletes_its_actors` (2 replicas with
+  one create held in `CreateEnvironment` when the channel closes, and 18 with 16 held and one call
+  on the semaphore, which sends no create). 15.9:
+  `test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap`,
+  `test_release_lost_across_a_reap_deletes_the_actor` (cancelled in `suspend()`, cancelled in
+  `delete()`, and a failed delete; during the reap, which joins the delete, and after it),
+  `test_release_lost_across_a_reap_whose_background_delete_fails_leaves_the_actor_for_any_later_reap`
+  (cancelled and failed),
+  `test_release_cancelled_without_a_teardown_keeps_the_run_id_and_starts_no_delete` (recycling or
+  not), the machine's `cancel_recycle` rule,
+  `test_warm_pool_cancelled_before_its_deletes_start_leaves_actors_for_any_later_reap`, on the
+  in-process `grpc.aio` server with the driver owning its channel,
+  `test_sync_close_during_a_release_on_an_owned_channel_deletes_its_actor` and
+  `test_close_async_during_a_release_on_an_owned_channel_deletes_its_actor` (held in
+  `SuspendEnvironment` for a recycle, and in `DeleteEnvironment`),
+  `test_sync_close_during_a_warm_pool_delete_after_teardown_on_an_owned_channel_deletes_its_actor`
+  and
+  `test_close_async_during_a_warm_pool_delete_after_teardown_on_an_owned_channel_deletes_its_actor`,
+  `test_sync_close_during_a_reap_on_an_owned_channel_deletes_its_actors` and
+  `test_close_async_during_a_reap_on_an_owned_channel_deletes_its_actors` (1 actor, and 18, of which
+  2 wait on the reap's semaphore),
+  `test_close_async_during_a_reap_joins_the_deletes_of_the_actors_on_its_semaphore` (18 actors; the
+  2 that waited have the slow deletes),
+  `test_close_async_joins_the_delete_of_a_call_cut_off_on_a_channel_it_redialed`,
+  `test_cancelled_drain_leaves_every_actor_for_the_next_reap_of_any_run` (`unwarm_pool` and
+  `resize_pool`; 18 actors of which 2 wait on the drain's semaphore, and 2 whose delete tasks never
+  ran), `test_sync_close_during_a_drain_on_an_owned_channel_deletes_its_actors` and
+  `test_close_async_during_a_drain_on_an_owned_channel_deletes_its_actors` (18 actors, both calls),
+  `test_close_cancelling_a_drain_before_its_deletes_start_deletes_its_actors` and
+  `test_close_cancelling_a_warm_pool_before_its_deletes_after_teardown_start_deletes_its_actors`
+  (the shutdown started at each of several loop iterations of the call),
+  `test_close_cancelling_a_reap_before_its_deletes_start_deletes_its_actors`, and
   `test_release_delete_failure_without_a_reap_keeps_the_run_id` for the path that must not change.
   15.10: `test_cold_acquire_overlapping_its_runs_reap_leaves_the_actor_for_any_later_reap` (reap
-  finished, and still running), and
+  finished, and still running),
+  `test_warm_claim_paused_across_own_runs_reap_tags_cold_fallback_for_any_reap` (`get()` raising
+  `NotFoundError`, and `get()` succeeding),
+  `test_warm_claim_retried_after_own_runs_reap_owns_the_refilled_actor_for_any_reap` (the retry pops
+  an actor another run pooled after the reap), and
   `test_cold_acquire_keeps_its_run_id_without_an_overlapping_reap_of_its_run` (another run's reap
-  during the create, or the run's own reap before it) for the paths that must not change.
-  `warm_pool.dfy`: 16 verified, 3 errors, all in `WarmPoolBefore` (the code before #221).
-  `warm_pool_generations.dfy`: 32 verified, 3 errors, in `PlanFirstCovers` and
+  during the create, or the run's own reap before it) plus
+  `test_warm_claim_paused_across_another_runs_reap_keeps_own_run_id_on_cold_fallback` for the paths
+  that must not change. `warm_pool.dfy`: 16 verified, 3 errors, all in `WarmPoolBefore` (the code
+  before #221). `warm_pool_generations.dfy`: 32 verified, 3 errors, in `PlanFirstCovers` and
   `ClaimFailPutBackSafe` (#221's first version) and `ClaimOkReturnsLive` (the code before 15.7's
   fix). `warm_pool_drain.dfy`: 65 verified, 10 errors, in `CommitStaleBeforeSafe`,
   `ResizeBeforeSafe` and `DeleteFailBeforeSafe` (the code before 15.4 and 15.5),
@@ -304,9 +395,11 @@ Conventions:
   `ReleaseDeleteFailSafe` (the code before 15.9's fix) and `AcquireCommitBeforeSafe` (before 15.10's
   fix). [verify/README.md](./verify/README.md) explains each.
 - Pass rule: pytest green; Dafny output matches. CI runs both (the Dafny check is AC-20).
-- Status: 15.1 to 15.10 pass. The 15.9 tests fail on the code before #238, the 15.7 test on the code
-  before #239, the 15.8 test on the code before #240, the 15.10 test on the code before #242, the
-  15.2 cancelled-acquire tests on the code before #276.
+- Status: 15.1 to 15.10 pass. The 15.9 tests fail on the code before #238 (the release tests that
+  expect a delete, the reap-during-close tests and the machine with `cancel_recycle` on the code
+  before #320's last two fixes), the 15.7 test on the code before #239, the 15.8 test on the code
+  before #240, the 15.10 test on the code before #242, the 15.2 cancelled-acquire tests on the code
+  before #276.
 - Properties: P-9 (15.1, 15.6), P-10 (15.2, 15.5, 15.8, 15.9, 15.10), P-11 (15.3, 15.4), P-24
   (15.7).
 

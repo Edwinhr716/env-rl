@@ -328,6 +328,41 @@ Append-only. Each entry: date, who, what, why.
   leave it one float step off the 0.01 grid; `summary()` prints the same values, so the `.txt` and
   `.json` of one `write()` agree. P-8 is no longer proposed: `test_phase_stats_consistent` checks
   it, and the AC-7 command runs it.
+- 2026-11-09, orchestrator: #320 closes two windows the #276 review left in AC-15.10 and AC-15.2.
+  `_acquire_internal` re-read `_teardowns` on each pass of its loop, so a warm claim paused in
+  `get()` across its own run's reap compared against the value read after the reap: its cold
+  fallback, and a retried claim on an actor another run pooled after the reap, stayed under the
+  reaped run id, and a cancel in that fallback create started no delete. It now reads `_teardowns`
+  once on entry (`entry_teardowns`). The background deletes a cancelled acquire or `warm_pool` call
+  starts are joined: `reap` waits for them before it returns, and `close()` before it closes the
+  clients and stops the loop, each up to `background_delete_timeout_s` (10 s). The join runs while
+  `_reaping > 0`, so on a shared driver a delete that hangs extends the teardown window by up to
+  that bound, during which other runs' recycles delete instead of pooling and their `warm_pool`
+  calls delete what they create. Accepted: a delete that hangs for 10 s is already an incident, and
+  pooling into a teardown is the leak AC-15 forbids. A delete still running at the deadline is not
+  cancelled, and its actor stays owned under `WARM_POOL_RUN_ID` for a later reap; the reap adds the
+  actor id to `failed_actors`, so `teardown()` raises `InfrastructureError` naming it, as for a
+  failed reap delete, and the caller can sweep it. No new metric: the error carries the ids.
+  `close()` logs such an id and does not raise: it has no result to carry it, and the reap before it
+  has raised. A delete that outlives both deadlines is waited for twice. `LoopRunner.stop` cancels
+  the loop's tasks once and then waits, in bounded rounds, for the tasks the cancel handlers
+  started, so a delete started when `close()`'s stop cancels an acquire is awaited rather than
+  abandoned by `loop.stop()`. The Dafny models are unchanged: they have no cancelled-acquire action
+  and no notion of the join. Review of #320 added two rules: a joined delete that failed, or was
+  cancelled, since the last join counts as a failed reap delete too (a fast `Unavailable` left the
+  task done before the join looked, and the reap returned with the actor live), with `NotFound`
+  still gone and `close()` logging it; and `background_delete_timeout_s` is validated as
+  `connections` is (a bool, NaN, infinity or a negative value is a `ValueError`), with `0` meaning
+  no wait: the join still lets the cancel handlers start their deletes, then names them all. The
+  second review pass of #320 added four more: `close()` cancels the other tasks on its own
+  `LoopRunner` and waits for them before the join, because a channel closed first cancelled a
+  `create()` whose handler then dialed a new client for its delete, which `stop()` cancelled;
+  `AsyncSandboxFleet.__aexit__` awaits the new `close_async()`, because the sync `close()` blocked
+  the loop that had to serve the deletes; the join skips a delete whose actor a reap's own delete
+  removed, and one on another loop; and a delete task cancelled before its first step is recorded in
+  its done callback, because its `finally` never runs. The state machine gates the reap's own
+  deletes apart from the deletes other work starts during the teardown, so a reap that does not join
+  fails it (verified with the no-join mutant).
 - 2026-11-10, Go client parity (PR 6, D6 of `docs/plans/go-client-parity/README.md`): the Go client
   now emits `start_process` on `Env.StartProcess` (un-nested under `Run`), sets
   `ate_env.first_command=true` on the first `exec` or `start_process` of an `Env`, sets
@@ -356,6 +391,108 @@ Append-only. Each entry: date, who, what, why.
   and Go's backfill of server-resolved `ate.template.*` stay recorded differences, as does the #330
   entry's `exec` span difference (Go records `ate_env.exit_code` 137 on a timeout, Python none), and
   17.1 and 17.2 stay with per-client tests.
+- 2026-11-10, third review pass of #320 (AC-15.2, AC-15.8): `close()` and `close_async()` count a
+  teardown (`_count_teardown` bumps `_teardowns`) before they cancel a call or close a channel. The
+  cancel handler of an `acquire` or `warm_pool` call in `create()` starts its delete only when a
+  teardown ran since the call read `_teardowns` (`_may_pool`), so an acquire that started after the
+  run's reap (a worker thread's `acquire()` between `reap()` and `close()`), or with no reap at all,
+  owned its environment under `WARM_POOL_RUN_ID` and left it live after `close()`; now the delete
+  starts and the shutdown joins it. A recycle or `warm_pool` that finishes during the shutdown
+  deletes instead of pooling, as during a reap. And `_warm_pool_internal` raises the first
+  `CancelledError` (any non-`Exception`) that its `gather(return_exceptions=True)` returns: when
+  `close_async()` on the caller's loop closed the channel, one actor's `create()` or `suspend()` was
+  cancelled with the call itself not cancelled, the gather returned the cancel as a result, and the
+  call neither owned nor deleted the actors whose create was in flight; its cancel path now owns and
+  deletes every actor it started. Tests on the in-process `grpc.aio` server: `close()` and
+  `close_async()` after a reap, and with none, during an acquire held in `CreateEnvironment`, and
+  during a two-actor `warm_pool` with one create held. The state machine's `AcquireGate` gates
+  `get()` and `create()` apart, so a warm claim let through pauses again in the cold create it falls
+  back to, where a later step finishes or cancels it. The Dafny models are unchanged: they have no
+  `close()`.
+- 2026-11-11, fourth review pass of #320 (AC-15.9): a `release`, or a delete of an unpooled actor,
+  that `close()` or `close_async()` cancels starts a background delete, which the shutdown joins.
+  `_return_popped` and `_delete_unpooled` only re-tagged the actor under `WARM_POOL_RUN_ID` for the
+  next reap, and no reap follows a close: a `release` in `suspend()` or `delete()`, whose actor the
+  run's reap could not see (the release popped it), and a `warm_pool` call that finished after the
+  reap and was deleting its actors, left the environment live. `_count_teardown` sets `_closing`,
+  and both handlers start the delete while it is set. This entry first recorded that a cancel
+  outside a close kept the AC-15.9 behaviour (tracked for the next reap, no delete started behind
+  the caller's cancel). Decided by the owner the same day: `_return_popped` starts the background
+  delete after any teardown since the release popped its actor (a reap ran or runs, or a close), as
+  `_own_abandoned_create` does for a cancelled `acquire`. A `release` cancelled during or after a
+  reap only re-tagged the actor, the reap could not see it, and a fleet reaps its run once, so the
+  environment stayed live while a cancelled `acquire` in the same window deleted at once. A reap
+  still running joins the delete and names it if it fails. `_return_popped` also serves a `release`
+  whose delete failed, so that path now gets one background retry after a teardown; a retry that
+  fails leaves the actor under `WARM_POOL_RUN_ID` for the next reap of any run, which is what
+  AC-15.5 and AC-15.9 stated before. With no teardown since the pop the actor keeps its run id and
+  no delete starts. A cancelled `_delete_unpooled` outside a close still only re-tags. The state
+  machine gained a `cancel_recycle` rule; with the delete limited to a close it fails on each of
+  five seeds (`alive after teardown`). Its check after the reap now allows a pending background
+  delete whose actor is no longer owned, which is the join's own rule: a caller that releases again
+  after a cancelled release pops the actor, and that release finishes it. A cancelled background
+  delete does not start another one. Decided by the owner the same day, after this entry first
+  recorded it as not changed: a `reap` that `close()` cancels on its own runner (another thread's
+  `teardown()` still in flight) no longer leaves its actors tracked and not deleted. While
+  `_closing` is set, `_reap_one` starts a background delete for its actor when it is cancelled, in
+  `delete()` or waiting for the reap's semaphore, and `_reap_actors` does it for a `_reap_one`
+  cancelled before its first step (`_delete_unreaped_in_close`); the shutdown joins those deletes.
+  Reproduced before the fix on the in-process `grpc.aio` server with 1 and with 18 owned actors (2
+  of the 18 wait on the semaphore): no `DeleteEnvironment` reached the server after `close()`.
+  `close_async()` on the caller's loop had the same leak by another path: the channel close raises
+  `CancelledError` in the reap's deletes, `gather(return_exceptions=True)` returns them as results,
+  and the reap returned with the actors live. A reap cancelled outside a close is not changed: its
+  actors stay owned as they were, for the next reap.
+- 2026-11-12, fifth review pass of #320 (AC-15.8, AC-15.9): `close_async()` on the caller's loop
+  left environments live when a `reap` or a `warm_pool` call had more than 16 actors. It cancels no
+  task; the channel close cut off the 16 calls in flight, and the calls that waited on the semaphore
+  woke uncancelled, dialed a second owned client and sent a foreground `delete()` or `create()` on
+  it. `_shutdown_async` joined the background deletes once and closed that client once. Reproduced
+  on the in-process `grpc.aio` server: with 18 owned actors and the 2 queued deletes slower (30 ms)
+  than the others (2 ms), `close_async()` returned with 2 environments live, 2 background deletes
+  not joined and a third client open; with `warm_pool_async("tmpl", 18)` the queued call created an
+  18th environment after the close began. Two changes. A `_reap_one` or `_warm_one` that gets its
+  slot while `_closing` is set raises `CancelledError` (`_stop_if_closing`; `_warm_one` also before
+  `suspend()`), so its actor goes to a background delete as the cut-off ones do and no create is
+  sent. `_shutdown_async` repeats join-then-close while an owned client exists, bounded by
+  `LoopRunner`'s `_STOP_ROUNDS` (4), for a caller's task that was cut off and went on to another
+  call. Not chosen: cancelling the caller's tasks from `close_async()`; they are not the driver's.
+  The sync `close()` already cancels every task on its own runner, the queued ones included. Same
+  pass, the other callers that delete unpooled actors through a `gather`. `unwarm_pool_async` and a
+  shrinking `resize_pool_async` popped actors from the pool and left their run id as it was; only a
+  `_delete_unpooled` that ran and was cancelled, or failed, re-tagged one. A drain of 18 cancelled
+  with 16 deletes in flight left 2 actors, and a drain of 2 cancelled before its delete tasks ran
+  left both, under the run id `warm_pool` gave them (reproduced: `reap_async("run-2")` left them
+  live). In the pool, any run's reap deleted them. The pop now re-tags them under `WARM_POOL_RUN_ID`
+  in the same lock hold (`_own_drained_for_any_reap`). In a close the same actors got no delete at
+  all, so `_delete_drained` has the reap's two handlers and the `_stop_if_closing` check, and the
+  delete `gather` at the end of `_warm_pool_internal` has the handler around it: a `close()` that
+  lands between that `gather` and the first step of its tasks left the actors live (reproduced by
+  starting the shutdown at each loop iteration of the call; the 11th fails before the fix). A drain
+  cancelled outside a close still starts no delete: the next reap of any run deletes the actors.
+- 2026-11-11, fourth review pass of #320 (AC-15.7): a warm claim cancelled in `get()` (the acquire's
+  `timeout_s`, the caller, or a close) no longer leaves the popped actor live and unpooled.
+  `_acquire_internal` caught `NotFoundError` and `Exception` around `get()`, not a cancel. With no
+  teardown since the pop the actor goes back to the pool and the gauge, as after a failed `get()`.
+  After one, it is owned under `WARM_POOL_RUN_ID` and deleted in a background task, which `reap` and
+  `close()` join: an actor that `run-0` recycled and `run-1` claimed kept `run-0`, and neither
+  `reap("run-1")` nor a later run's reap matched it. Accepted: the put-back can take the pool above
+  what `warm_pool` was asked for, when a `warm_pool` call filled the pool while the claim held the
+  actor; the failed-`get()` put-back already could, and a recycle can.
+- 2026-11-11, fourth review pass of #320 (the AC-15 state machine): `WarmPoolMachine` passed with
+  the cancelled-claim leak above, because it checked nothing before the teardown, every acquire was
+  `run-1`'s (so every leaked actor matched the teardown's reap or `WARM_POOL_RUN_ID`), and few runs
+  reached the cancel. It now draws each acquire's run from `run-0` and `run-1` (the teardown is
+  `run-1`'s; what `run-0` still holds may outlive it and goes with a last `reap("run-0")`), tracks
+  who holds each actor, and has the invariant `no_warm_actor_is_lost_before_teardown`: before the
+  teardown starts, a live `warm-*` actor is pooled, held, in a recycle, or in the `get()` of the
+  acquire that claims it. `start_acquire` can pool one actor first, `idle` runs only with work in
+  flight or after the teardown, and an example has 16 steps, not 12. Measured over 1,500 examples
+  (two seeds each): runs that cancel a claim in `get()` went from 1.5 to 2.7% to 5.2 to 5.7%, and
+  runs that cancel the cold fallback of a claim from 0 to 0.14% to 0.27 to 0.5%; the plain test
+  `test_warm_claim_paused_across_own_runs_reap_then_cancelled_in_cold_create_deletes_actor` stays
+  the deterministic cover for the second. Without the cancelled-claim fix the machine fails on each
+  of three seeds, on the new invariant and on `nothing_survives_teardown`.
 - 2026-11-12, #361: option (a) chosen for plan question 3 (Python Env.shell attributes vs Go
   Env.Run). Added `ate_env.timed_out` to `ate_env_client.shell` to close the 17.2 attribute
   difference without a breaking span rename.

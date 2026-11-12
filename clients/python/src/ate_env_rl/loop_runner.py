@@ -22,6 +22,15 @@ from typing import Any, TypeVar
 
 T = TypeVar("T")
 
+# Rounds of stop()'s shutdown. The first cancels every task on the loop and
+# waits for it; each later round waits for the tasks that appeared since,
+# without cancelling them, because a cancel handler can start cleanup work
+# that must finish before the loop stops. A chain of tasks that keep starting
+# tasks ends here, and loop.stop() abandons what is left. One round is enough
+# for the Substrate driver (a cancelled acquire or warm_pool call starts
+# deletes, which start nothing); the rest is margin.
+_STOP_ROUNDS = 4
+
 
 class LoopRunner:
     """A dedicated, permanent background thread running an asyncio event loop.
@@ -71,16 +80,29 @@ class LoopRunner:
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def stop(self) -> None:
-        """Stop the background event loop and join the worker thread."""
+        """Stop the background event loop and join the worker thread.
+
+        Cancels the tasks on the loop and waits for them. A cancel handler can
+        start cleanup work (the Substrate driver starts a background delete
+        for an abandoned create), so the shutdown then waits for the tasks
+        that appeared, without cancelling them, until a round finds none or
+        ``_STOP_ROUNDS`` rounds have run; the whole shutdown has 2 s, after
+        which the loop is stopped with whatever is left pending.
+        """
         if threading.current_thread() is self._thread:
             # Prevent deadlock if called from a task running on this runner's loop
             return
         if self._loop.is_running():
             async def _shutdown() -> None:
-                tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-                for t in tasks:
-                    t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                me = asyncio.current_task()
+                for round_no in range(_STOP_ROUNDS):
+                    tasks = [t for t in asyncio.all_tasks() if t is not me]
+                    if not tasks:
+                        break
+                    if round_no == 0:
+                        for t in tasks:
+                            t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 await self._loop.shutdown_asyncgens()
 
             future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
