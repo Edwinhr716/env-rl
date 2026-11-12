@@ -46,8 +46,19 @@ for control-plane terms.
   storage before the call returns (`SuspendOptions{Mode: DURABILITY_MODE_SYNCHRONOUS}`), or on the
   worker's node first with the upload in the background (`DURABILITY_MODE_ASYNCHRONOUS`,
   `SuspendLocal`).
+- **Golden snapshot**: The snapshot Substrate bakes once per `ActorTemplate` after its first boot,
+  from which later actors of the template restore instead of booting from the image. A derived
+  template has its own; `GetImageStatus` reports its state (`NONE`, `PENDING`, `READY` with the
+  golden tag, `FAILED` with the reason) and `EnsureImageTemplate` starts the bake without creating
+  an environment.
 - **Worker** / **WorkerPool**: The Substrate pool of pre-started worker pods running
   `ateworker-gvisor` that execute actors inside gVisor (`runsc`).
+- **Placement domain**: A `WorkerPool` as a per-environment `worker_selector` addresses it: the
+  labels all its schedulable workers carry, with its distinct nodes, workers and slots per node
+  (`ListPlacementDomains`, `ate-env placement-domains`, `ate_env_rl.PlacementDomain`). An
+  `image-placement.json` plan names the domains each task image goes to, and a run steers each
+  create into one of its image's domains (`swebench-loader run -placement`,
+  `FleetConfig.placement`).
 - **AccessPolicy**: The Substrate authorization record granting
   `system:serviceaccount:ate-env:ate-env-api` permissions to manage templates and actors in an
   atespace.
@@ -75,6 +86,33 @@ for control-plane terms.
   traffic through `atenet`. Bounded by `DefaultWakeBudget` (5 minutes bounds the entire wait) and
   `DefaultWakeRunningBudget` (20 seconds bounds the wait once `RUNNING`).
 - **Park**: The between-step action in multi-step RL rollouts (`suspend`, `delete`, or `none`).
+- **Pre-flight**: Putting every task image's layers and golden snapshot on every node of its
+  placement domains before a run, so the run's first boot of an image on a node is a restore, not a
+  pull; distinct from the fleet's `preflight()`, which checks the connection to `ate-env-api`.
+  `swebench-loader preflight`, `swebench-loader run -placement -preflight` and
+  `ate_env_rl.PreflightWarmer` run it from an `image-placement.json` plan and
+  `python -m ate_env_harbor.warm` over a Harbor dataset, each after a wait for the image's golden,
+  while `WarmImage` (`ate-env warm-image`) covers one image and domain with no golden wait, so call
+  it after `GetImageStatus` (`ate-env image-status`) reports `READY` when the run relies on the
+  golden.
+- **Probe** / **probe environment**: A short-lived environment a pre-flight creates with a domain's
+  worker selector and holds until it runs, so the image's layers and golden snapshot are on its
+  node; its node is read (`Environment.node`) and it is deleted. `WarmImage` names its probes
+  `<run id>-<round>-<slot>`. `swebench-loader preflight` and `ate_env_rl.PreflightWarmer` make one
+  `WarmImage` call per image and domain, with the run id
+  `<run id>-<domain index>-<image index>-<attempt>` (zero-based indexes into the plan's domains and
+  images, in base 36, also when the pass warms a subset of the domains), so a probe of theirs is
+  `<run id>-<domain index>-<image index>-<attempt>-<round>-<slot>`. The probes that can be left are
+  listed as `undeleted_probes` (in the `WarmImage` coverage the ones the server could not delete;
+  per image in `preflight-coverage.json` also the ones a call streamed before it was cut off), on
+  which `swebench-loader preflight` exits non-zero and Python's `PreflightCoverage.clean` is false
+  while `complete` can still be true.
+- **`image-placement.json`** / **`preflight-coverage.json`**: The two pre-flight files
+  (`internal/benchmarking/schema`, `schema_version: v1`): the plan (`plan-placement`: domains with
+  their selector, nodes and cache budget; each image's domains) and the coverage a plan-driven
+  pre-flight writes (per image the golden's state, per domain the nodes seen and per image the nodes
+  covered, probes, rounds, failures and `undeleted_probes`), which
+  `swebench-loader report -preflight-coverage` and `bench` read for Validity Rule 1.
 - **TTFE**: Time To First Execution, measuring total initialization and run latency
   (`ready_s + first_cmd_s`) in `integrations/nemo-gym/benchmarks/driver_sim.py`.
 - **TTFI**: Time To First Interaction, emitted as `EventTTFI` by `internal/benchmarking/swebench`,

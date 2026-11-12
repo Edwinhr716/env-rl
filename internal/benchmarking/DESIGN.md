@@ -348,9 +348,12 @@ command:
   golden snapshots to settle (`-golden-wait`), without creating an environment;
   the layers reach a node only when an environment boots there, which is the
   pre-flight's job per placement domain (`swebench-loader preflight`,
-  `ate_env_rl.PreflightWarmer`, `ate-env warm-image`)—and recording the
-  baseline node cache sample `cache_before.json`; on Agent Sandbox, warming
-  `SandboxWarmPool`s—recording total prepare wall time, per-template/pool
+  `swebench-loader run -placement -preflight` or `ate_env_rl.PreflightWarmer`
+  from an `image-placement.json` plan, `python -m ate_env_harbor.warm` over a
+  Harbor dataset, or `ate-env warm-image` per image and domain; the node cache
+  sample `cache_before.prom` comes from `bench measure -sample-node-cache`);
+  on Agent Sandbox, warming `SandboxWarmPool`s—recording total prepare wall
+  time, per-template/pool
   readiness time, and per-object readiness times as
   `$ARTIFACT_DIR/events/prewarm.jsonl`.
 - `bench measure [--overlay FEATURE.yaml]`: harvests Prometheus metrics,
@@ -448,10 +451,21 @@ feature-overlay thresholds.
 
 A run counts only if all hold. The report marks invalid runs and says why.
 
-1. Warm or cold footing is declared, and both the `prewarm` events and the
-   server-side node image-cache sample (`cache_before.json` /
-   `cache_after.json`, since per-node cache state on Substrate is not visible to
-   the client) match the declaration.
+1. Warm or cold footing is declared, and the evidence matches it. On warm
+   footing: the `prewarm` events, or in their place a `preflight-coverage.json`
+   that is complete and covers the run's images (an incomplete one fails the
+   footing even next to prewarm events); when the node image-cache samples are
+   present (`cache_before.prom` / `cache_after.prom`, or the `.json` pair,
+   since per-node cache state on Substrate is not visible to the client), a
+   positive hit delta; and no `create` event with `cache_hit=false`. On cold
+   footing: no prewarm events, no pre-flight, no hit delta, and no `create`
+   event with `cache_hit=true`. The coverage file comes from the scenario's
+   `preflight.coverage` (`bench run` copies it into the bundle of a warm
+   arm), from the bundle (`bench validate -dest`, the
+   `run-r2e-swebench.sh --preflight-coverage` copy), from
+   `bench validate -preflight-coverage` in single-file mode, or from
+   `swebench-loader report -preflight-coverage`. The report's
+   `validity.evidence` names the inputs the verdict rests on.
 2. Reward rate meets the configured threshold.
 3. Task count meets the configured minimum.
 4. Failed creates stay under the configured fraction.

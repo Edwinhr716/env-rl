@@ -521,9 +521,12 @@ holds golden bakes and wakes that landed on a node without the image. A node
 whose atelet restarted between the samples, and a node the autoscaler added
 in between, count from zero; a node removed in between is left out; a node
 present only in the after sample with an atelet older than the before sample
-had a failed before scrape and is reported and left out. The report cannot
-label one environment cold or warm, because the ate-env API does not say
-which node an environment ran on.
+had a failed before scrape and is reported and left out. The report does not
+label one environment cold or warm: the ate-env API reports the node an
+environment landed on (`Environment.node`, which the pre-flight reads), but
+the report has no per-node image-cache state to pair it with;
+`preflight-coverage.json` (`report -preflight-coverage`) says which nodes ran
+each image before the run.
 
 To split the first-command window itself, harvest atelet's restore records
 for the run and give them to the report:
