@@ -58,8 +58,30 @@
 #
 #   The cost is that the saved cache never contains our latest packages, only
 #   whatever the first run after a dependency or toolchain change compiled.
-#   If only flake.lock changed, the restore falls back to the newest cache with
-#   the same go.mod and go.sum, which still saves the module downloads.
+#
+# What the restore falls back to
+#
+#   Without the exact key, the restore takes the newest cache of the scope,
+#   in this order:
+#
+#   1. one with the same go.mod and go.sum (only flake.lock changed), which
+#      still saves the module downloads;
+#   2. any cache of the scope. This is the case of a pull request that changes
+#      go.mod or go.sum: GitHub lets it read the caches of its base branch, so
+#      it gets main's. The Go caches are addressed by content, so the
+#      dependencies that did not change hit, and the ones that did are
+#      compiled. For the E2E job that covers the Substrate install, whose
+#      builds do not depend on this repository's go.sum when the pin is the
+#      same: 6m42 with main's cache against 15m24 without one (2026-11-12).
+#      Without this fallback a pull request that added dependencies ran the
+#      whole job cold, passed its tests after 30 minutes, hit the job's limit
+#      and so saved no cache for its next run either.
+#
+#   The job then saves under its own exact key, so the fallback costs one
+#   upload per go.sum change, as before. Go trims build cache entries it has
+#   not used for five days, so what an older cache carried along goes away;
+#   the module cache keeps old module versions until the next cache that
+#   starts cold.
 #
 # Why each job needs its own scope
 #
@@ -102,6 +124,7 @@ runs:
         {
           echo "key=${prefix}${gosum}-${lock}"
           echo "restore-same-gosum=${prefix}${gosum}-"
+          echo "restore-same-scope=${prefix}"
         } >>"${GITHUB_OUTPUT}"
     - name: Restore the Go caches
       if: inputs.mode == 'restore'
@@ -114,6 +137,7 @@ runs:
         key: ${{ steps.key.outputs.key }}
         restore-keys: |
           ${{ steps.key.outputs.restore-same-gosum }}
+          ${{ steps.key.outputs.restore-same-scope }}
     - name: Check whether this key is already saved
       id: exists
       if: >-

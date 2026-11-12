@@ -612,6 +612,38 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"shell","arguments":{"command":"echo hi"}}}'
 ```
 
+### 3. Optional: the fleet inventory reporter
+
+`ate-env-reporter` writes the cluster's inventory snapshot (atespaces, templates, tags, workers,
+actors, WorkerPools and `ate-env-api` Deployments) every 5 s to
+`gs://<bucket>/v1/inventory/<project>/<cluster>/latest.json`, and keeps one copy per hour under
+`v1/snapshots/`. One reporter runs per cluster. It reads the control plane and the Kubernetes API
+and writes to neither. No image is published yet: build one with
+`KO_DOCKER_REPO=<repo> ko build --bare ./cmd/ate-env-reporter`.
+
+```bash
+ate-env manifest reporter --image <image> --bucket <bucket> \
+  --gcp-service-account ate-env-reporter@<project>.iam.gserviceaccount.com | kubectl apply -f -
+```
+
+The Google service account needs `roles/storage.objectUser` on the bucket, because each write
+replaces `latest.json`, and the Workload Identity binding for the Kubernetes ServiceAccount
+`ate-env-reporter/ate-env-reporter`. On GKE the project, the cluster and the location come from the
+metadata server; elsewhere pass `--project` and `--cluster`. `--out-dir <path>` writes under an
+emptyDir instead of a bucket.
+
+The reporter lists the actors and workers of all atespaces, which takes the global `viewer` role.
+`ate-env manifest reporter --access-policy` prints that binding. The global policy is one object for
+the whole control plane, so first read it with `kubectl ate get access-policy --global -o yaml`:
+
+- It prints a policy: add the member to the `viewer` binding in that output (keep `metadata.uid` and
+  `metadata.version`) and apply it with `kubectl ate update access-policy --global -f <file>`.
+- It prints nothing (a fresh Substrate install has no global policy, and `update` fails without
+  the `uid` and `version` of one): create the policy once with
+  `ate-env manifest reporter --access-policy | kubectl ate create access-policy --global -f -`.
+
+The Deployment turns ready when the first snapshot is written.
+
 ## CLI
 
 File operations and remote command execution take the environment ID first, followed by the operation:
@@ -684,6 +716,7 @@ Usage:
 Available Commands:
   access-policy Generate the Substrate access policy that lets ate-env-api manage environments
   auth-secret   Generate the Secret with the bearer token ate-env-api requires from callers
+  reporter      Generate the manifests of ate-env-reporter, the fleet inventory reporter
   template      Generate Substrate ActorTemplate manifest
 
 Flags:

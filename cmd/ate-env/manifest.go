@@ -502,6 +502,7 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.AddCommand(newManifestTemplateCommand())
 	cmd.AddCommand(newManifestAccessPolicyCommand())
 	cmd.AddCommand(newManifestAuthSecretCommand())
+	cmd.AddCommand(newManifestReporterCommand())
 
 	return cmd
 }

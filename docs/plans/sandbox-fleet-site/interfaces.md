@@ -195,11 +195,13 @@ token with audience `api.ate-system.svc`; Workload Identity to
 restricted by an IAM condition to `v1/inventory/<project>/<cluster>/` and
 `v1/snapshots/<project>/<cluster>/` (an overwrite needs `storage.objects.delete` next to `create`);
 the principal `user:system:serviceaccount:ate-env-reporter:ate-env-reporter` merged into the global
-AccessPolicy's `viewer` binding (one object for the whole control plane: `ate-env manifest reporter`
-prints the binding and the operator merges it with `kubectl ate get access-policy --global -o yaml`
-and `kubectl ate update access-policy --global -f <file>`, as the README describes for
-`ate-env-api`'s `ListPlacementDomains`); ClusterRole with `list` on `workerpools.ate.dev` and
-`deployments.apps`, the two kinds the reporter reads.
+AccessPolicy's `viewer` binding (one object for the whole control plane:
+`ate-env manifest reporter --access-policy` prints the binding and the operator merges it with
+`kubectl ate get access-policy --global -o yaml` and
+`kubectl ate update access-policy --global -f <file>`, as the README describes for `ate-env-api`'s
+`ListPlacementDomains`, or creates the policy from that output with
+`kubectl ate create access-policy --global -f -` when the control plane has none); ClusterRole with
+`list` on `workerpools.ate.dev` and `deployments.apps`, the two kinds the reporter reads.
 
 Behavior: one `ListActors` across atespaces and one `ListWorkers` per tick, paged at 1000;
 `ListAtespaces`, `ListActorTemplates` and `ListTags` every tenth tick, or at once when an actor

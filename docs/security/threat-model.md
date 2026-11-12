@@ -194,12 +194,13 @@ the spans go nowhere.
 
 ## Fleet inventory reporter
 
-`ate-env-reporter` is a separate binary. No manifest deploys it yet: an operator who runs it writes
-its ServiceAccount, RBAC and access-policy binding.
+`ate-env-reporter` is a separate binary, one per cluster. `ate-env manifest reporter` prints its
+namespace, ServiceAccount, ClusterRole, binding and Deployment, and with `--access-policy` the
+global `viewer` binding that an operator merges into the control plane's global policy.
 
 | Item | Current state | Gap |
 |---|---|---|
-| Read access | It lists actors, workers, atespaces, templates and tags of all atespaces, which takes the global `viewer` role in the Substrate access policy, and it lists WorkerPools and Deployments of all namespaces. It calls no mutating RPC and writes no Kubernetes object. Its one write is the snapshot object in the bucket `-bucket` names, with the application default credentials, or a file under `-out-dir`. | The control-plane connection is the same as in boundary 2: `-skip-verify` defaults to `true`. |
+| Read access | It lists actors, workers, atespaces, templates and tags of all atespaces, which takes the global `viewer` role in the Substrate access policy, and it lists WorkerPools and Deployments of all namespaces; the ClusterRole grants `list` on these two kinds and nothing else. The pod mounts its Kubernetes API token, and a projected token with audience `api.ate-system.svc` for the control plane. It calls no mutating RPC and writes no Kubernetes object. Its one write is the snapshot object in the bucket `-bucket` names, with the application default credentials, or a file under `-out-dir`. | The control-plane connection is the same as in boundary 2: `-skip-verify` defaults to `true`. |
 | Snapshot content | Names and states: atespaces, actors with their uid, template, node, worker and crash message, templates with their image references, tags, workers with their labels and capacity, WorkerPools, and the image and flags-derived state of each `ate-env-api` Deployment. It carries no environment variable, no token and no file content. A label or selector key that contains `token`, `password`, `authorization`, `secret` or `credential` is left out and logged once, because the schema refuses it. | Label values and crash messages go in as they are. A reader of the bucket sees the actor names of all atespaces; there is no filter per atespace. |
 | The health listener | `-health-listen-addr` (default `:9091`) serves `GET /healthz` and `GET /readyz`, with a 5 s header read timeout. The responses carry no cluster data. | The listener has no authentication. |
 

@@ -39,6 +39,13 @@ import (
 // atespace or template the last read lacks forces a read at once.
 const catalogEvery = 10
 
+// DefaultInterval and DefaultSnapshotInterval are the defaults of
+// ate-env-reporter's -interval and -snapshot-interval.
+const (
+	DefaultInterval         = 5 * time.Second
+	DefaultSnapshotInterval = time.Hour
+)
+
 // maxBackoff caps the wait between ticks while they fail.
 const maxBackoff = time.Minute
 

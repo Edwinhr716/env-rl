@@ -97,7 +97,12 @@ jobs:
   e2e-kind:
     name: E2E Kind and Smoke Test
     runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
-    timeout-minutes: 30
+    # A run with a restored cache takes 12 to 17 minutes. A run with no cache
+    # of the scope at all (the first one, or after GitHub evicted them) took
+    # 30m13 on 2026-11-12, of which the Substrate install was 15m24, and then
+    # still has to upload the cache. The limit must leave room for that run:
+    # one that is cancelled saves no cache, so the next one is as slow.
+    timeout-minutes: 40
     steps:
       # The root disk of the hosted runner fills while `ate-setup --kind deploy`
       # builds the envoy-dataplane image (a rust:bookworm builder stage) next

@@ -20,10 +20,11 @@ What it does:
   2. Builds kubectl-ate and ate-env CLI binaries and places them in bin/.
   3. Provisions target cluster (Kind by default with local registry, or reuses existing).
   4. Deploys Agent Substrate control plane components (if provisioning fresh cluster).
-  5. Compiles container images (ateworker-gvisor, ate-env-api, ate-env-guest) using ko to target registry.
+  5. Compiles container images (ateworker-gvisor, ate-env-api, ate-env-guest, ate-env-reporter) using ko to target registry.
   6. Applies Kubernetes manifests (atespace, access policy, caller auth Secret, WorkerPool, and ate-env-api with metrics).
   7. Registers the ActorTemplate (snapshots under the cluster snapshot location) with an environment marker, and waits for its golden snapshot.
   8. Forwards a free local port and runs portable smoke test, Python SDK full-stack tests, Go SDK full-stack tests, NeMo Gym provider live test, swebench-loader Go SDK smoke test, and Harbor provider live trial test.
+  9. Grants ate-env-reporter the global viewer role, deploys it and waits for its first snapshot, then runs it on the host with -out-dir for three ticks and accepts the files with TestE2ESnapshotDir.
 
 When it runs:
   - CI: .github/workflows/ci.yaml in job `e2e-kind` on PR and push to main.
@@ -84,6 +85,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -119,6 +121,7 @@ def build_images(root: Path, sub_dir: Path, target: KindTarget) -> dict[str, str
         ("worker", sub_dir, "./cmd/ateworker-gvisor"),
         ("api", root, "./cmd/ate-env-api"),
         ("guest", root, "./cmd/ate-env-guest"),
+        ("reporter", root, "./cmd/ate-env-reporter"),
     ]:
         ko_env = dict(
             os.environ,
@@ -355,6 +358,129 @@ def deploy_manifests(
     tag = lib.wait_until(check_golden, timeout=180.0, interval=2.0, what=f"{tmpl} golden snapshot")
     lib.step(f"Golden snapshot ready: {tag}")
     return auth_token
+
+
+REPORTER_NS = "ate-env-reporter"
+
+
+def grant_reporter_viewer(target: KindTarget, ate_ctl: Path, ate_env: Path) -> None:
+    """Merges the reporter's member into the global access policy's viewer binding.
+
+    The global policy is one object: a policy that exists is read, extended and
+    updated under its uid and version; only a control plane without one gets the
+    binding as a new policy.
+    """
+    ctl = [str(ate_ctl), f"--context={target.context}"]
+    wanted = lib.run(str(ate_env), "manifest", "reporter", "--access-policy", "--namespace", REPORTER_NS).stdout
+    member = f"user:system:serviceaccount:{REPORTER_NS}:ate-env-reporter"
+    # Without a policy kubectl-ate prints nothing to stdout and exits 0.
+    got = lib.run(*ctl, "get", "access-policy", "--global", "-o", "json")
+    if not got.stdout.strip():
+        lib.run(*ctl, "create", "access-policy", "--global", "-f", "-", input=wanted)
+        return
+    policy = json.loads(got.stdout)
+    bindings = policy.setdefault("bindings", [])
+    viewer = next((b for b in bindings if b.get("role") == "viewer"), None)
+    if viewer is None:
+        viewer = {"role": "viewer", "members": []}
+        bindings.append(viewer)
+    if member in viewer.setdefault("members", []):
+        return
+    viewer["members"].append(member)
+    lib.run(*ctl, "update", "access-policy", "--global", "-f", "-", input=json.dumps(policy))
+
+
+def run_reporter(root: Path, target: KindTarget, ate_ctl: Path, ate_env: Path, image: str) -> None:
+    """FS-14 of the fleet site plan: the reporter against the Kind Substrate.
+
+    In the cluster, the Deployment of `ate-env manifest reporter` turns ready,
+    which /readyz allows only after a snapshot was written: the ServiceAccount's
+    token, the viewer binding and the ClusterRole all hold. On the host, the
+    binary runs with -out-dir under the same ServiceAccount's token, and
+    TestE2ESnapshotDir accepts the files.
+    """
+    lib.step("Granting ate-env-reporter the global viewer role...")
+    grant_reporter_viewer(target, ate_ctl, ate_env)
+
+    lib.step("Deploying ate-env-reporter and waiting for its first snapshot...")
+    lib.pipe(
+        [
+            str(ate_env), "manifest", "reporter", "--namespace", REPORTER_NS, "--image", image,
+            "--out-dir", "/snap", "--project", "kind", "--cluster", target.cluster_name,
+        ],
+        ["kubectl", f"--context={target.context}", "apply", "-f", "-"],
+        check=True,
+    )
+    rollout = lib.run(
+        "kubectl", f"--context={target.context}", "-n", REPORTER_NS, "rollout", "status",
+        "deploy/ate-env-reporter", "--timeout=120s", check=False, capture=False,
+    )
+    if rollout.returncode != 0:
+        lib.run("kubectl", f"--context={target.context}", "-n", REPORTER_NS, "logs", "deploy/ate-env-reporter", "--tail=50", check=False, capture=False)
+        raise RuntimeError("ate-env-reporter did not turn ready")
+
+    lib.step("Running ate-env-reporter with -out-dir for three ticks...")
+    ctl = [str(ate_ctl), f"--context={target.context}"]
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        binary, token_file, kubeconfig, out_dir = tmp / "ate-env-reporter", tmp / "token", tmp / "kubeconfig", tmp / "snap"
+        # ko built the reporter's image with CGO_ENABLED=0 and -trimpath. The
+        # Go build cache is keyed by both, so the same two here make this
+        # build a link of the packages ko compiled; without them it compiles
+        # all of the reporter's dependencies a second time.
+        ko_like = dict(os.environ, CGO_ENABLED="0")
+        lib.run(
+            "go", "-C", str(root), "build", "-trimpath", "-o", str(binary), "./cmd/ate-env-reporter",
+            env=ko_like, capture=False,
+        )
+        token_file.write_text(
+            lib.run(
+                "kubectl", f"--context={target.context}", "-n", REPORTER_NS, "create", "token", "ate-env-reporter",
+                "--audience", "api.ate-system.svc",
+            ).stdout.strip()
+        )
+        kubeconfig.write_text(
+            lib.run("kubectl", "config", "view", "--minify", "--flatten", f"--context={target.context}").stdout
+        )
+        port = pick_port()
+        with lib.port_forward(target.context, "ate-system", "svc/api", port, target_port=443):
+            proc = subprocess.Popen(
+                [
+                    str(binary), "-out-dir", str(out_dir), "-project", "kind", "-cluster", target.cluster_name,
+                    "-interval", "5s", "-snapshot-interval", "5s",
+                    "-ateapi", f"127.0.0.1:{port}", "-ateapi-token-file", str(token_file),
+                    "-health-listen-addr", "127.0.0.1:0",
+                ],
+                env=dict(os.environ, KUBECONFIG=str(kubeconfig)),
+            )
+            try:
+                kept = out_dir / "v1" / "snapshots" / "kind" / target.cluster_name
+
+                def three_kept():
+                    if proc.poll() is not None:
+                        raise RuntimeError(f"ate-env-reporter exited early ({proc.returncode})")
+                    return kept.is_dir() and len(list(kept.glob("*.json"))) >= 3
+
+                lib.wait_until(three_kept, timeout=60.0, interval=1.0, what="three kept snapshots")
+            finally:
+                lib.stop_process(proc)
+            # The counts are read after the reporter stopped: nothing creates
+            # or deletes actors at this point of the pipeline.
+            actors = json.loads(lib.run(*ctl, "get", "actor", "-A", "-o", "json").stdout or "{}").get("actors", [])
+            workers = json.loads(lib.run(*ctl, "get", "worker", "-o", "json").stdout or "{}").get("workers", [])
+        lib.run(
+            "go", "-C", str(root), "test", "-trimpath", "-v", "-count=1", "./internal/inventory",
+            "-run", "^TestE2ESnapshotDir$",
+            env=dict(
+                ko_like,
+                ATE_ENV_REPORTER_E2E_DIR=str(out_dir),
+                ATE_ENV_REPORTER_E2E_PROJECT="kind",
+                ATE_ENV_REPORTER_E2E_CLUSTER=target.cluster_name,
+                ATE_ENV_REPORTER_E2E_ACTORS=str(len(actors)),
+                ATE_ENV_REPORTER_E2E_WORKERS=str(len(workers)),
+            ),
+            capture=False,
+        )
 
 
 def pick_port() -> int:
@@ -605,6 +731,7 @@ def main() -> None:
         if harbor_future is not None:
             harbor_py, harbor_bin_dir = harbor_future.result()
         run_tests(root, target, ate_env, ns, tmpl, port, auth_token, harbor_py, harbor_bin_dir)
+        run_reporter(root, target, ate_ctl, ate_env, imgs["reporter"])
         lib.step("PASS: E2E Kind pipeline succeeded!")
     finally:
         try:

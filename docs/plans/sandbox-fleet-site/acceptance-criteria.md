@@ -155,4 +155,8 @@ pass, with the commit of each component.
   `/tmp/snap/v1/snapshots/kind/$KIND_CLUSTER_NAME/` decode with `DecodeSnapshot`; the actor and
   worker counts equal `kubectl ate get actor -A` and `kubectl ate get worker`; `generated_at`
   advances from one snapshot file to the next.
+- In the same case, before the run on the host: the Deployment of `ate-env manifest reporter`, with
+  `--out-dir`, turns ready in the cluster. `/readyz` allows that only after a snapshot was written,
+  so the ServiceAccount's token, the `viewer` binding and the ClusterRole hold. The run on the host
+  uses a token of the same ServiceAccount and `TestE2ESnapshotDir` checks its files.
 - Pass rule: holds in the `E2E Kind and Smoke Test` job.

@@ -32,8 +32,10 @@ user needs to know across them.
   under `v1/snapshots/`. It lists actors, workers, atespaces, templates and tags
   from the Substrate control plane (global `viewer` role) and lists WorkerPools
   and `ate-env-api` Deployments from the Kubernetes API (`list`).
-  `/healthz` and `/readyz` are on `-health-listen-addr` (default `:9091`). No
-  manifest or image is published yet. The snapshot schema v1 gains
+  `/healthz` and `/readyz` are on `-health-listen-addr` (default `:9091`).
+  `ate-env manifest reporter` prints its namespace, ServiceAccount, ClusterRole
+  and Deployment, and with `--access-policy` the global `viewer` binding to
+  merge. No image is published yet. The snapshot schema v1 gains
   `workers[].labels` and `actors[].worker_selector`, and requires `project`
   and `cluster` to be one path segment each (no `/` or `\`, not `.` or `..`);
   the reporter refuses such a `-project` or `-cluster` at start, and `-out-dir`

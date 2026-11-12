@@ -106,6 +106,20 @@ def wait_until(pred: Callable[[], Any], timeout: float = 30.0, interval: float =
     raise TimeoutError(f"Timed out waiting for {what} after {timeout}s")
 
 
+def stop_process(proc: subprocess.Popen, grace: float = 10.0) -> None:
+    """Terminates proc, and kills it when it has not exited after grace seconds.
+
+    A process that stalls in its shutdown would otherwise hold the run until
+    the job's timeout, and the teardown after it would not run.
+    """
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 @contextmanager
 def port_forward(
     context: str,
@@ -141,8 +155,7 @@ def port_forward(
         yield f"{host}:{local_port}"
     finally:
         if proc.poll() is None:
-            proc.terminate()
-            proc.wait()
+            stop_process(proc)
         try:
             os.unlink(log_path)
         except OSError:

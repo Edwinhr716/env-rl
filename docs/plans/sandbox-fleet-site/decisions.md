@@ -126,3 +126,8 @@ Append-only. Each entry: date, who, what, why.
   cache without an error, so a snapshot would carry old Kubernetes state under a new `generated_at`.
   A list that fails fails the tick, which `/readyz` and the stale badge show. The cost is two lists
   per tick from the API server's cache, and the ClusterRole needs `list` only.
+- 2026-11-10, orchestrator: FS-14 runs the reporter twice in the Kind job. In the cluster, from
+  `ate-env manifest reporter`, where readiness proves its identity end to end; the image has no
+  shell, so its files are not read. On the host, with `-out-dir` and a token of the same
+  ServiceAccount, where `TestE2ESnapshotDir` decodes the files and compares the counts. The
+  manifest's Deployment uses the `Recreate` strategy: `latest.json` has one writer.
