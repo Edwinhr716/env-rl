@@ -270,6 +270,7 @@ class RunReport:
     ORDER = (
         "preflight",
         "plan",
+        "preflight_images",
         "ensure_template",
         "preflight_golden",
         "preflight_probe",
@@ -344,13 +345,18 @@ class RunReport:
 
     @staticmethod
     def _fmt_env(info: dict[str, Any]) -> str:
+        def fmt(v: Any) -> str:
+            if isinstance(v, list):
+                return "[" + ",".join(fmt(x) for x in v) + "]"
+            if isinstance(v, dict):
+                return "{" + " ".join(f"{k}:{fmt(x)}" for k, x in v.items() if x not in (None, [], "")) + "}"
+            return str(v)
+
         parts = []
         for k, v in info.items():
-            if v in (None, [], ""):
+            if v in (None, [], "", {}):
                 continue
-            if isinstance(v, list):
-                v = "[" + ",".join(str(x) for x in v) + "]"
-            parts.append(f"{k}={v}")
+            parts.append(f"{k}={fmt(v)}")
         return "  ".join(parts)
 
     def summary(self) -> str:

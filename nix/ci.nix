@@ -316,7 +316,7 @@ let
       base_env="$(nix build --no-link --print-out-paths .#python-env-base)"
       uni_agent_env="$(nix build --no-link --print-out-paths .#python-env-uni-agent)"
       echo "--> Python ruff check..."
-      ruff check clients/python examples/verl_swebench hack/release
+      ruff check clients/python examples/verl_swebench hack/release hack/ci
       ruff check --config clients/python/pyproject.toml examples/Qwen3-1.7B-verl
       ruff check benchmarking/telemetry_report
       # The base-env suites only mean something if the base env really lacks
@@ -430,6 +430,10 @@ let
         env COVERAGE_FILE="$covdir/py/.coverage.telemetry-full" coverage run --rcfile="$cov_rc" -m pytest benchmarking/telemetry_report -q -p no:cacheprovider
       suite "benchmarking/telemetry_report (base env)" . \
         env COVERAGE_FILE="$covdir/py/.coverage.telemetry-base" "$base_env/bin/python" -m coverage run --rcfile="$cov_rc" -m pytest benchmarking/telemetry_report -q -p no:cacheprovider
+      # The Kind runner's access-policy helpers, over a scripted lib.run (no
+      # cluster; hack/ci/test_smoke.py is the one that needs one).
+      suite "hack/ci (e2e policy helpers)" . \
+        python -m pytest hack/ci/test_e2e_policy.py -q -p no:cacheprovider
       suite "clients/python (guest daemon integration)" . run_guest_daemon_suite
 
       failed=0

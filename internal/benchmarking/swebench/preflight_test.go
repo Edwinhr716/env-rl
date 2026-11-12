@@ -22,10 +22,12 @@ import (
 	"fmt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"io"
+	"log/slog"
 	"reflect"
 	"sort"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +55,13 @@ func twoDomainPlan() *schema.ImagePlacement {
 			{Image: pfImgB, Domains: []string{"d0", "d1"}, BytesCompressed: 1, BytesUnpacked: 1},
 		},
 	}
+}
+
+// probeID is the name ate-env-api gives a probe of the pass's first attempt:
+// the pass's run id, the plan indexes of the domain and the image, the
+// attempt (1), the round and the slot.
+func probeID(runID string, domain, image, round, slot int) string {
+	return fmt.Sprintf("%s-%d-%d-1-%d-%d", runID, domain, image, round, slot)
 }
 
 func newPreflightFake() *fakeAPI {
@@ -212,9 +221,9 @@ func TestPreflightCoversEveryNodeOfEveryDomain(t *testing.T) {
 func TestPreflightImageConcurrency(t *testing.T) {
 	api := newPreflightFake()
 	api.goldenReadyAfter = 0
-	// Slow probes: each first command takes a few polls, so the two images
-	// of d0 overlap when the warmer lets them.
-	api.pollsUntilExit = 3
+	// Slow probes: a round holds its probes a while, so the two images of
+	// d0 overlap when the warmer lets them.
+	api.warmHold = 20 * time.Millisecond
 	if _, err, _ := runPreflight(t, api, func(o *PreflightOptions) { o.ImageConcurrency = 2 }); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -224,7 +233,7 @@ func TestPreflightImageConcurrency(t *testing.T) {
 
 	api = newPreflightFake()
 	api.goldenReadyAfter = 0
-	api.pollsUntilExit = 3
+	api.warmHold = 20 * time.Millisecond
 	if _, err, _ := runPreflight(t, api, func(o *PreflightOptions) { o.ImageConcurrency = 1 }); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -235,7 +244,7 @@ func TestPreflightImageConcurrency(t *testing.T) {
 	// node_slots caps the concurrency and refuses too many probes per node.
 	api = newPreflightFake()
 	api.goldenReadyAfter = 0
-	api.pollsUntilExit = 3
+	api.warmHold = 20 * time.Millisecond
 	if _, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
 		o.ImageConcurrency = 4
 		o.Plan.Domains[0].NodeSlots = 1
@@ -381,6 +390,29 @@ func TestPreflightGoldenTimeout(t *testing.T) {
 	}
 }
 
+// A GoldenTimeout below GoldenPoll ends the wait at the timeout, not at the
+// first poll.
+func TestPreflightGoldenTimeoutBelowThePollInterval(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenReadyAfter = 1 << 20
+	started := time.Now()
+	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
+		o.GoldenTimeout = 100 * time.Millisecond
+		o.GoldenPoll = 10 * time.Second
+	})
+	if elapsed := time.Since(started); elapsed < 100*time.Millisecond || elapsed > 3*time.Second {
+		t.Errorf("Run took %s, want the golden timeout (100ms), not the poll interval (10s)", elapsed)
+	}
+	if err == nil || !strings.Contains(err.Error(), "2 goldens not ready") {
+		t.Fatalf("Run error = %v, want both goldens pending", err)
+	}
+	for _, g := range report.Goldens {
+		if g.State != "pending" || !strings.Contains(g.Error, "still pending") {
+			t.Errorf("golden = %+v, want pending with a timeout error", g)
+		}
+	}
+}
+
 // A round in which every probe fails ends the pair, also after a round that
 // placed some: round 1 lands both probes on one node, round 2's creates fail,
 // and no round 3 follows.
@@ -404,6 +436,8 @@ func TestPreflightStopsWhenARoundFailsEntirely(t *testing.T) {
 	if ic.Rounds != 2 || ic.Probes != 4 || ic.Failed != 2 || len(ic.Nodes) != 1 || !strings.Contains(ic.Error, "cut the create off") {
 		t.Errorf("coverage = %+v, want two rounds, the second failed entirely", ic)
 	}
+	// Every created probe was deleted; a create the server refused made
+	// nothing to delete.
 	deleted := map[string]bool{}
 	for _, id := range api.deleted {
 		deleted[id] = true
@@ -413,29 +447,8 @@ func TestPreflightStopsWhenARoundFailsEntirely(t *testing.T) {
 			t.Errorf("probe %s was created and not deleted", id)
 		}
 	}
-	if len(api.deleted) != 4 {
-		t.Errorf("deletes = %d, want 4: two probes and two cut-off creates deleted by id", len(api.deleted))
-	}
-
-	// A create the control plane refused (ResourceExhausted: no room) made
-	// nothing, and nothing is deleted for it.
-	api = newPreflightFake()
-	api.goldenReadyAfter = 0
-	api.sameNode = true
-	api.createFailAfter = 2
-	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) {
-		o.Images = []string{pfImgA}
-		o.Domains = []string{"d0"}
-		o.MaxRounds = 3
-	})
-	if err == nil || report.Complete {
-		t.Fatalf("refused creates: err=%v complete=%v, want a shortfall", err, report.Complete)
-	}
-	if ic := report.Domains[0].Images[0]; ic.Failed != 2 || !strings.Contains(ic.Error, "no worker has room") {
-		t.Errorf("coverage = %+v, want two refused probes", ic)
-	}
 	if len(api.deleted) != 2 {
-		t.Errorf("deletes = %v, want only the two probes that were created", api.deleted)
+		t.Errorf("deletes = %d, want 2: the two probes of the first round", len(api.deleted))
 	}
 }
 
@@ -495,6 +508,10 @@ func TestPreflightSubsetsAndValidation(t *testing.T) {
 		func(o *PreflightOptions) { o.RunID = "Not Valid" },
 		func(o *PreflightOptions) { o.Plan = nil },
 		func(o *PreflightOptions) { o.Backend = nil },
+		// ate-env-api's WarmImage refuses these: a refused call would only
+		// show as a short pair.
+		func(o *PreflightOptions) { o.ProbesPerNode = 9 },
+		func(o *PreflightOptions) { o.MaxRounds = 11 },
 	} {
 		opts := PreflightOptions{Plan: twoDomainPlan(), Backend: newFakeBackend(t, newPreflightFake())}
 		bad(&opts)
@@ -504,55 +521,257 @@ func TestPreflightSubsetsAndValidation(t *testing.T) {
 	}
 }
 
-func TestPreflightRetriesTransientFirstCommand(t *testing.T) {
+func TestPreflightRepeatsACutOffWarmCall(t *testing.T) {
 	api := newPreflightFake()
 	api.goldenReadyAfter = 0
-	api.unavailableStarts = 3
+	api.warmUnavailableFirst = 3
 	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
 		o.Images = []string{pfImgA}
 		o.Domains = []string{"d0"}
 		o.wakeBackoff = time.Millisecond
 	})
 	if err != nil || !report.Complete {
-		t.Fatalf("transient StartProcess Unavailable: err=%v complete=%v", err, report.Complete)
+		t.Fatalf("transient WarmImage Unavailable: err=%v complete=%v", err, report.Complete)
 	}
 	if ic := report.Domains[0].Images[0]; ic.Rounds != 1 || ic.Failed != 0 {
-		t.Errorf("coverage after transient wake retries = %+v, want 1 round and 0 failed", ic)
+		t.Errorf("coverage after the repeats = %+v, want 1 round and 0 failed", ic)
+	}
+	if api.warmCalls != 4 {
+		t.Errorf("warm calls = %d, want 3 cut off and 1 that ran", api.warmCalls)
 	}
 
-	// A non-zero exit from the probe command fails the probe instead of
-	// counting the node as covered.
+	// A call cut off after a round that covered one node of two (an api
+	// server restart): the old probes stay, the repeat sends its own run id,
+	// so no name collides.
 	api = newPreflightFake()
 	api.goldenReadyAfter = 0
-	api.exitCode = 1
+	api.domainNodes["d0"] = []string{"node-d0-1", "node-d0-1", "node-d0-2", "node-d0-2"}
+	api.warmCutAfterCreates = 1
 	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) {
 		o.Images = []string{pfImgA}
 		o.Domains = []string{"d0"}
-		o.MaxRounds = 1
+		o.wakeBackoff = time.Millisecond
+	})
+	if len(api.warmRequests) != 2 || api.warmRequests[0].GetRunId() == api.warmRequests[1].GetRunId() || !strings.HasSuffix(api.warmRequests[1].GetRunId(), "-2") {
+		t.Fatalf("warm requests = %d, want two with one run id per attempt", len(api.warmRequests))
+	}
+	if left := len(api.created) - len(api.deleted); left != 2 {
+		t.Errorf("probes left behind by the cut-off call = %d, want the round's two", left)
+	}
+	// The coverage holds; the cut-off call's probes fail the pass by name
+	// (TestPreflightListsTheProbesOfACutOffCall).
+	if !report.Complete || err == nil || !strings.Contains(err.Error(), "2 probes left undeleted") {
+		t.Errorf("cut off after the creates: complete=%v err=%v, want complete with the two leftovers named", report.Complete, err)
+	}
+
+	// The repeats stop after ProbeTimeout when the control plane stays down.
+	api = newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.warmFail = status.Error(codes.Unavailable, "down")
+	start := time.Now()
+	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) {
+		o.Images = []string{pfImgA}
+		o.Domains = []string{"d0"}
+		o.wakeBackoff = time.Millisecond
+		o.ProbeTimeout = 60 * time.Millisecond
+	})
+	if err == nil || report.Complete || time.Since(start) > 5*time.Second {
+		t.Fatalf("control plane down: err=%v complete=%v after %s, want a bounded failure", err, report.Complete, time.Since(start))
+	}
+	if api.warmCalls < 2 || api.warmCalls > maxWarmAttempts {
+		t.Errorf("warm calls = %d, want repeats within %d attempts and the probe timeout", api.warmCalls, maxWarmAttempts)
+	}
+
+	// A call the server refuses is not repeated: the pair is short with
+	// the server's reason.
+	api = newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.warmFail = status.Error(codes.InvalidArgument, "probes_per_node 4 exceeds the 2 probes per node this server runs on one worker selector at once")
+	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) {
+		o.Images = []string{pfImgA}
+		o.Domains = []string{"d0"}
+		o.wakeBackoff = time.Millisecond
 	})
 	if err == nil || report.Complete {
-		t.Fatalf("non-zero probe exit: err=%v complete=%v, want failure", err, report.Complete)
+		t.Fatalf("refused WarmImage: err=%v complete=%v, want failure", err, report.Complete)
+	}
+	if ic := report.Domains[0].Images[0]; !strings.Contains(ic.Error, "probes_per_node 4 exceeds") || len(ic.Nodes) != 0 {
+		t.Errorf("coverage = %+v, want the server's reason and no nodes", ic)
+	}
+	if api.warmCalls != 1 {
+		t.Errorf("warm calls = %d, want 1: no repeat of a refusal", api.warmCalls)
 	}
 }
 
-type cancelAfterFirstErrCtx struct {
-	context.Context
-	cancel func()
-	checks atomic.Int32
+// The repeats of a cut-off call last for ProbeTimeout from the first
+// failure: a backoff longer than what is left of it is cut to that, so a
+// short ProbeTimeout still gets its repeat.
+func TestPreflightRepeatBackoffIsCutToTheBudget(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.warmUnavailableFirst = 1
+	start := time.Now()
+	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
+		o.Images = []string{pfImgA}
+		o.Domains = []string{"d0"}
+		o.wakeBackoff = 30 * time.Second
+		o.ProbeTimeout = 50 * time.Millisecond
+	})
+	if api.warmCalls != 2 {
+		t.Fatalf("warm calls = %d, want 2: one repeat inside the 50ms budget", api.warmCalls)
+	}
+	if err != nil || !report.Complete {
+		t.Errorf("err=%v complete=%v, want the repeat to complete the pass", err, report.Complete)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("the pass took %s, want the wait cut to the 50ms budget", took)
+	}
 }
 
-func (c *cancelAfterFirstErrCtx) Err() error {
-	if c.checks.Add(1) == 1 {
-		c.cancel()
-		return nil
+// A WarmImage call that breaks after it streamed probes never says which of
+// them the server deleted (the coverage comes last, and an api server that
+// restarted deleted none). The pass lists every probe such a call streamed
+// under undeleted_probes and fails naming them; it does not repeat a call
+// whose stream showed every node.
+func TestPreflightListsTheProbesOfACutOffCall(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.warmCutAfterCreates = 1
+	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
+		o.Images = []string{pfImgA}
+		o.Domains = []string{"d0"}
+		o.wakeBackoff = time.Millisecond
+	})
+	left := []string{probeID("pf-test", 0, 0, 1, 0), probeID("pf-test", 0, 0, 1, 1)}
+	if created, deleted := len(api.created), len(api.deleted); created-deleted != 2 {
+		t.Fatalf("created %d, deleted %d: want the cut-off round's two probes left", created, deleted)
 	}
-	return c.Context.Err()
+	if err == nil || !strings.Contains(err.Error(), "2 probes left undeleted") || !strings.Contains(err.Error(), left[0]) {
+		t.Errorf("Run error = %v, want the two probes the cut-off call left named", err)
+	}
+	ic := report.Domains[0].Images[0]
+	if !ic.Complete || !reflect.DeepEqual(ic.Nodes, []string{"node-d0-1", "node-d0-2"}) || !reflect.DeepEqual(ic.UndeletedProbes, left) {
+		t.Errorf("coverage = %+v, want complete from the stream with %v undeleted", ic, left)
+	}
+	if ic.Probes != 2 || ic.Rounds != 1 || !strings.Contains(ic.Error, "api server restarted") {
+		t.Errorf("coverage = %+v, want the stream's two probes, one round and the call's error", ic)
+	}
+	if api.warmCalls != 1 {
+		t.Errorf("warm calls = %d, want 1: the stream showed every node, no repeat", api.warmCalls)
+	}
+}
+
+// The probes of a call that an api server restart cut off are named after
+// the call's run id and nothing else records them (the server holds a
+// call's probes in memory), so every log line about a cut-off call carries
+// that run id: the repeat, the give-up, and the call that is not repeated.
+func TestPreflightLogsTheRunIDOfACutOffCall(t *testing.T) {
+	run := func(api *fakeAPI, mutate func(*PreflightOptions)) string {
+		var mu sync.Mutex
+		var logs bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil))
+		runPreflight(t, api, func(o *PreflightOptions) {
+			o.Images = []string{pfImgA}
+			o.Domains = []string{"d0"}
+			o.wakeBackoff = time.Millisecond
+			o.Logger = logger
+			if mutate != nil {
+				mutate(o)
+			}
+		})
+		mu.Lock()
+		defer mu.Unlock()
+		return logs.String()
+	}
+	has := func(logs, msg, runID string) bool {
+		for _, line := range strings.Split(logs, "\n") {
+			if strings.Contains(line, msg) && strings.Contains(line, "run_id="+runID+" ") {
+				return true
+			}
+		}
+		return false
+	}
+
+	// One repeat, then a clean call.
+	api := newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.warmUnavailableFirst = 1
+	if logs := run(api, nil); !has(logs, "repeating", "pf-test-0-0-1") {
+		t.Errorf("the repeat's log line has no run_id=pf-test-0-0-1:\n%s", logs)
+	}
+
+	// The control plane stays down: the give-up names the last call.
+	api = newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.warmFail = status.Error(codes.Unavailable, "down")
+	logs := run(api, func(o *PreflightOptions) { o.ProbeTimeout = 20 * time.Millisecond })
+	last := warmRunID("pf-test", 0, 0, api.warmCalls)
+	if !has(logs, "giving up", last) {
+		t.Errorf("the give-up's log line has no run_id=%s:\n%s", last, logs)
+	}
+
+	// Cut off after the stream showed every node: no repeat, one line.
+	api = newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.warmCutAfterCreates = 1
+	if logs := run(api, nil); !has(logs, "not repeated", "pf-test-0-0-1") {
+		t.Errorf("the cut-off call's log line has no run_id=pf-test-0-0-1:\n%s", logs)
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// The coverage of a pair is the sum of its attempts: a node the cut-off call
+// showed stays covered when the repeat lands elsewhere, and the counters add
+// up.
+func TestPreflightSumsTheAttemptsOfARepeatedCall(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenReadyAfter = 0
+	// Four workers on two nodes: the first two probes of the image land on
+	// node-d0-1 (the cut-off call), the next two on node-d0-2 (the repeat).
+	api.domainNodes["d0"] = []string{"node-d0-1", "node-d0-1", "node-d0-2", "node-d0-2"}
+	api.warmCutAfterCreates = 1
+	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
+		o.Images = []string{pfImgA}
+		o.Domains = []string{"d0"}
+		o.MaxRounds = 1
+		o.wakeBackoff = time.Millisecond
+	})
+	if api.warmCalls != 2 {
+		t.Fatalf("warm calls = %d, want the cut-off call and one repeat", api.warmCalls)
+	}
+	ic := report.Domains[0].Images[0]
+	if !ic.Complete || !reflect.DeepEqual(ic.Nodes, []string{"node-d0-1", "node-d0-2"}) {
+		t.Errorf("coverage = %+v, want both nodes: one from each attempt", ic)
+	}
+	if ic.Probes != 4 || ic.Rounds != 2 || ic.Failed != 0 {
+		t.Errorf("coverage = %+v, want 4 probes and 2 rounds over the two attempts", ic)
+	}
+	left := []string{probeID("pf-test", 0, 0, 1, 0), probeID("pf-test", 0, 0, 1, 1)}
+	if !reflect.DeepEqual(ic.UndeletedProbes, left) {
+		t.Errorf("undeleted = %v, want the cut-off call's %v", ic.UndeletedProbes, left)
+	}
+	if !report.Complete || err == nil || !strings.Contains(err.Error(), "2 probes left undeleted") {
+		t.Errorf("Run: complete=%v err=%v, want complete and the leftovers named", report.Complete, err)
+	}
 }
 
 func TestPreflightCancellationSkipsUnstartedProbes(t *testing.T) {
 	api := newPreflightFake()
 	api.goldenReadyAfter = 0
 	api.domainNodes["d0"] = []string{"n0", "n1", "n2", "n3"}
+	// Four probes per node: above the server's default cap of two, so the
+	// fake's server runs with -warm-max-probes-per-node=4.
+	api.warmMaxProbesPerNode = 4
 
 	plan := twoDomainPlan()
 	plan.Domains[0].Nodes = 4
@@ -568,22 +787,42 @@ func TestPreflightCancellationSkipsUnstartedProbes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Deterministically cancel right after coverImage's round condition check
-	// so forEach stops with unstarted outcome slots (oc.id == "").
+	// A cancel during the call: the server stops at the next probe, deletes
+	// what it created, and the call ends in Canceled; the coverage carries
+	// what the stream showed, with no empty node.
 	inner, innerCancel := context.WithCancel(context.Background())
-	ic := w.coverImage(&cancelAfterFirstErrCtx{Context: inner, cancel: innerCancel}, 0, 0, plan.Domains[0], pfImgA)
+	api.mu.Lock()
+	api.onCreate = func(string) { innerCancel() }
+	api.mu.Unlock()
+	ic := w.coverImage(inner, 0, 0, plan.Domains[0], pfImgA)
 	for _, n := range ic.Nodes {
 		if n == "" {
-			t.Fatalf("empty node recorded from unstarted slot: %+v", ic)
+			t.Fatalf("empty node recorded from a cancelled call: %+v", ic)
 		}
 	}
-	if ic.Probes >= 16 {
-		t.Fatalf("unstarted probe slots counted: probes=%d, want < 16", ic.Probes)
+	if ic.Complete || ic.Probes >= 16 || ic.Error == "" {
+		t.Fatalf("cancelled call: coverage=%+v, want incomplete, fewer than 16 probes and an error", ic)
+	}
+	// The server deletes the broken call's probes once the stream is gone,
+	// on its own clock: shortly after the cancel returns.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		api.mu.Lock()
+		created, deleted := len(api.created), len(api.deleted)
+		api.mu.Unlock()
+		if created == deleted || time.Now().After(deadline) {
+			if created != deleted {
+				t.Fatalf("created %d, deleted %d after the cancel; want all deleted", created, deleted)
+			}
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	// Cancel mid-round during Run via CreateEnvironment callback.
 	ctx, cancel := context.WithCancel(context.Background())
+	api.mu.Lock()
 	api.onCreate = func(string) { cancel() }
+	api.mu.Unlock()
 	report, runErr := w.Run(ctx)
 	if !errors.Is(runErr, context.Canceled) {
 		t.Fatalf("Run err = %v, want context.Canceled", runErr)
@@ -604,7 +843,9 @@ func TestPreflightCancellationSkipsUnstartedProbes(t *testing.T) {
 
 	// Pre-cancelled context before Run starts: domain coverage still
 	// validates and can be written by WritePreflightCoverage.
+	api.mu.Lock()
 	api.onCreate = nil
+	api.mu.Unlock()
 	preCtx, preCancel := context.WithCancel(context.Background())
 	preCancel()
 	report2, runErr2 := w.Run(preCtx)
@@ -654,6 +895,138 @@ func TestPreflightLeavesACollidingNameAlone(t *testing.T) {
 	}
 }
 
+// The fake API refuses the WarmImage requests ate-env-api refuses, with the
+// server's code, so a pre-flight test cannot pass on a request a real server
+// turns down. The same table drives the Python fake
+// (test_the_fake_refuses_what_the_server_refuses).
+func TestFakeWarmImageRefusesWhatTheServerRefuses(t *testing.T) {
+	api := newPreflightFake() // d0 and d1, two nodes each
+	api.domainNodes["wide"] = make([]string, 129)
+	for i := range api.domainNodes["wide"] {
+		api.domainNodes["wide"][i] = fmt.Sprintf("n%d", i)
+	}
+	b := newFakeBackend(t, api)
+	d0 := map[string]string{"ate-env/domain": "d0"}
+	ok := WarmOptions{WorkerSelector: d0, Nodes: 2, ProbesPerNode: 2, MaxRounds: 3, ProbeTimeout: time.Second, RunID: "pf-ok-0-0-1"}
+	if _, err := b.WarmImage(context.Background(), pfImgA, ok, nil); err != nil {
+		t.Fatalf("a request within the server's bounds: %v", err)
+	}
+	for name, tc := range map[string]struct {
+		mutate func(*WarmOptions)
+		cap    int
+		want   string
+	}{
+		"probes per node above the wire bound":  {func(o *WarmOptions) { o.ProbesPerNode = 9 }, 8, "probes_per_node must be between 1 and 8"},
+		"probes per node above the server cap":  {func(o *WarmOptions) { o.ProbesPerNode = 3 }, 0, "exceeds the 2 probes per node"},
+		"probes per node above a raised cap":    {func(o *WarmOptions) { o.ProbesPerNode = 5 }, 4, "exceeds the 4 probes per node"},
+		"rounds above the wire bound":           {func(o *WarmOptions) { o.MaxRounds = 11 }, 0, "max_rounds must be between 1 and 10"},
+		"negative rounds":                       {func(o *WarmOptions) { o.MaxRounds = -1 }, 0, "max_rounds must be between 1 and 10"},
+		"a run id of 21 characters":             {func(o *WarmOptions) { o.RunID = strings.Repeat("a", 21) }, 0, "run_id must match"},
+		"a run id outside [a-z0-9-]":            {func(o *WarmOptions) { o.RunID = "PF_1" }, 0, "run_id must match"},
+		"a run id that ends in a dash":          {func(o *WarmOptions) { o.RunID = "pf-" }, 0, "run_id must match"},
+		"more nodes than the selector's":        {func(o *WarmOptions) { o.Nodes = 3 }, 0, "nodes 3 exceeds the 2 nodes"},
+		"negative nodes":                        {func(o *WarmOptions) { o.Nodes = -1 }, 0, "nodes must be >= 0"},
+		"a round of more than 256 probes":       {func(o *WarmOptions) { o.WorkerSelector = map[string]string{"ate-env/domain": "wide"}; o.Nodes = 129 }, 0, "exceed the 256 probes a round may start"},
+		"a round of more than 256, nodes unset": {func(o *WarmOptions) { o.WorkerSelector = map[string]string{"ate-env/domain": "wide"}; o.Nodes = 0 }, 0, "exceed the 256 probes a round may start"},
+	} {
+		opts := ok
+		tc.mutate(&opts)
+		api.mu.Lock()
+		api.warmMaxProbesPerNode = tc.cap
+		created := len(api.created)
+		api.mu.Unlock()
+		_, err := b.WarmImage(context.Background(), pfImgA, opts, nil)
+		// The Go client names the InvalidArgument status so.
+		if err == nil || !strings.Contains(err.Error(), "invalid argument") || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want InvalidArgument with %q", name, err, tc.want)
+			continue
+		}
+		api.mu.Lock()
+		if len(api.created) != created {
+			t.Errorf("%s: the refused call created %d probes", name, len(api.created)-created)
+		}
+		api.mu.Unlock()
+	}
+	// A raised cap takes what it allows.
+	api.mu.Lock()
+	api.warmMaxProbesPerNode = 4
+	api.mu.Unlock()
+	opts := ok
+	opts.ProbesPerNode, opts.RunID = 4, "pf-ok-0-0-2"
+	if _, err := b.WarmImage(context.Background(), pfImgA, opts, nil); err != nil {
+		t.Errorf("4 probes per node under a cap of 4: %v", err)
+	}
+}
+
+// largePlan has the given number of two-node domains and of images; image i
+// is placed in domain i modulo the domains.
+func largePlan(domains, images int) *schema.ImagePlacement {
+	p := &schema.ImagePlacement{SchemaVersion: schema.SchemaVersion, UnpackFactor: 1, Replication: 1}
+	for i := range domains {
+		name := fmt.Sprintf("d%d", i)
+		p.Domains = append(p.Domains, schema.PlacementDomain{Name: name, Selector: map[string]string{"ate-env/domain": name}, Nodes: 2, NodeCacheBytes: 100})
+	}
+	for i := range images {
+		p.Images = append(p.Images, schema.ImagePlacementEntry{
+			Image:   fmt.Sprintf("registry.example/swebench/i%d@sha256:%064x", i, i),
+			Domains: []string{fmt.Sprintf("d%d", i%domains)}, BytesCompressed: 1, BytesUnpacked: 1,
+		})
+	}
+	return p
+}
+
+// The run id of a call is <run>-<domain>-<image>-<attempt> with the indexes
+// in base 36, and it has to fit ate-env-api's 20 characters for the pairs
+// the pass warms, not for the whole plan.
+func TestPreflightWarmRunIDFitsTheServerLimit(t *testing.T) {
+	for _, tc := range []struct {
+		domain, image, attempt int
+		want                   string
+	}{
+		{0, 0, 1, "pf-abcdef-0-0-1"},
+		{9, 10, 9, "pf-abcdef-9-a-9"},
+		{35, 36, 2, "pf-abcdef-z-10-2"},
+		{350, 36840, 9, "pf-abcdef-9q-sfc-9"},
+		{46655, 1679615, 9, "pf-abcdef-zzz-zzzz-9"},
+	} {
+		got := warmRunID("pf-abcdef", tc.domain, tc.image, tc.attempt)
+		if got != tc.want || len(got) > warmRunIDLimit {
+			t.Errorf("warmRunID(pf-abcdef, %d, %d, %d) = %q (%d characters), want %q within %d", tc.domain, tc.image, tc.attempt, got, len(got), tc.want, warmRunIDLimit)
+		}
+	}
+	backend := newFakeBackend(t, newPreflightFake())
+
+	// The boundary: the two-domain, two-image plan appends at most -1-1-9.
+	for n, ok := range map[int]bool{warmRunIDLimit - 6: true, warmRunIDLimit - 5: false} {
+		_, err := NewPreflightWarmer(PreflightOptions{Plan: twoDomainPlan(), Backend: backend, RunID: strings.Repeat("a", n)})
+		if ok != (err == nil) || (err != nil && !strings.Contains(err.Error(), "indexes")) {
+			t.Errorf("run id of %d characters: err = %v, want accepted=%v", n, err, ok)
+		}
+	}
+
+	// 351 domains and 36,841 images, the default run id: the last pair's
+	// call was pf-<6>-350-36840-9 in decimal, 21 characters.
+	plan := largePlan(351, 36841)
+	w, err := NewPreflightWarmer(PreflightOptions{Plan: plan, Backend: backend})
+	if err != nil {
+		t.Fatalf("351 domains x 36,841 images with the default run id: %v", err)
+	}
+	if id := warmRunID(w.opts.RunID, 350, 36840, maxWarmAttempts); len(id) > warmRunIDLimit {
+		t.Errorf("the last pair's run id %q has %d characters, want at most %d", id, len(id), warmRunIDLimit)
+	}
+
+	// A subset is measured by its own pairs: with 37 domains a 14-character
+	// run id fits domain 0 (-0-0-9) and not domain 36 (-10-0-9).
+	plan = largePlan(37, 37)
+	long := strings.Repeat("a", warmRunIDLimit-6)
+	if _, err := NewPreflightWarmer(PreflightOptions{Plan: plan, Backend: backend, RunID: long, Domains: []string{"d0"}}); err != nil {
+		t.Errorf("domain 0 of 37 with a %d-character run id: %v", len(long), err)
+	}
+	if _, err := NewPreflightWarmer(PreflightOptions{Plan: plan, Backend: backend, RunID: long}); err == nil || !strings.Contains(err.Error(), "indexes") {
+		t.Errorf("all 37 domains with a %d-character run id: err = %v, want the indexes error", len(long), err)
+	}
+}
+
 func TestPreflightDefaultRunIDIsUniquePerPass(t *testing.T) {
 	plan := twoDomainPlan()
 	backend := newFakeBackend(t, newPreflightFake())
@@ -673,24 +1046,6 @@ func TestPreflightDefaultRunIDIsUniquePerPass(t *testing.T) {
 	if a.opts.RunID == b.opts.RunID {
 		t.Errorf("two passes got the same default run id %q", a.opts.RunID)
 	}
-	for _, err := range []error{
-		status.Error(codes.AlreadyExists, "exists"), status.Error(codes.InvalidArgument, "bad"),
-		status.Error(codes.FailedPrecondition, "no template"), status.Error(codes.PermissionDenied, "no"),
-		status.Error(codes.ResourceExhausted, "no room"),
-		fmt.Errorf("create x: %w", status.Error(codes.AlreadyExists, "exists")),
-	} {
-		if !createRefused(err) {
-			t.Errorf("createRefused(%v) = false, want true", err)
-		}
-	}
-	for _, err := range []error{
-		status.Error(codes.Unavailable, "down"), status.Error(codes.DeadlineExceeded, "slow"),
-		context.Canceled, errors.New("plain"), nil,
-	} {
-		if createRefused(err) {
-			t.Errorf("createRefused(%v) = true, want false", err)
-		}
-	}
 }
 
 // A probe whose delete fails is listed under the image's undeleted_probes,
@@ -700,18 +1055,11 @@ func TestPreflightReportsUndeletedProbes(t *testing.T) {
 	api.goldenReadyAfter = 0
 	stuck := probeID("pf-test", 0, 0, 1, 1)
 	api.deleteFail = map[string]bool{stuck: true}
-	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
-		o.Images = []string{pfImgA}
-		o.Domains = []string{"d0"}
-		// A short delete budget: the stuck probe's Internal is retried a
-		// few times within it, not for the two minutes of the default.
-		o.Backend.(*EnvBackend).deletes = deleteLimits{budget: 20 * time.Millisecond, minWait: time.Millisecond, maxWait: 2 * time.Millisecond}
-	})
+	// The server's delete retries are its own (TestWarmImageRetriesProbeDeletes
+	// in apiservice); the fake answers once and lists the probe.
+	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) { o.Images = []string{pfImgA}; o.Domains = []string{"d0"} })
 	if err == nil || !strings.Contains(err.Error(), "1 probes left undeleted") || !strings.Contains(err.Error(), stuck) {
 		t.Fatalf("Run error = %v, want the undeleted probe named", err)
-	}
-	if api.deleteCalls < 3 {
-		t.Errorf("delete calls = %d, want the other probe's one and the stuck probe's retries", api.deleteCalls)
 	}
 	ic := report.Domains[0].Images[0]
 	if !ic.Complete || !reflect.DeepEqual(ic.UndeletedProbes, []string{stuck}) {

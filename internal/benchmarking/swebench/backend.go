@@ -31,6 +31,7 @@ import (
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"sync"
 )
 
@@ -117,21 +118,67 @@ type CreateOptions struct {
 }
 
 // ImageWarmer is the optional interface the pre-flight needs from a
-// backend: the golden state of an image's derived template, creates with
-// options (a worker selector), and the node an environment landed on.
-// EnvBackend implements it; Create and CreateWith share one code path.
+// backend: the derived template per image and ate-env-api's WarmImage,
+// which puts one image on every node of one placement domain.
 type ImageWarmer interface {
 	// EnsureImageTemplate creates the derived template when it is missing,
 	// which starts its golden bake, and reports it; no environment is created.
 	EnsureImageTemplate(ctx context.Context, image string) (ImageState, error)
 	// ImageStatus reports the derived template without creating anything.
 	ImageStatus(ctx context.Context, image string) (ImageState, error)
-	// CreateWith is Create with options.
-	CreateWith(ctx context.Context, id, image string, opts CreateOptions) (Sandbox, error)
-	// Node is the node the environment is on, or "" before its placement. It
-	// is a call of its own because the create returns before the scheduler
-	// has placed the environment.
-	Node(ctx context.Context, id string) (string, error)
+	// WarmImage runs ate-env-api's WarmImage for one (image, domain): the
+	// server creates probe environments with the worker selector, holds each
+	// until it runs, reads its node, deletes the probes and repeats until
+	// every node ran the image or the rounds are spent. onProbe sees each
+	// probe as the stream reports it; the coverage comes with the stream's
+	// end. The call lasts for the rounds.
+	WarmImage(ctx context.Context, image string, opts WarmOptions, onProbe func(WarmProbe)) (WarmCoverage, error)
+}
+
+// WarmOptions shape one WarmImage call. A zero knob takes the server's
+// default (2 probes per node, 3 rounds, a 10 minute probe timeout).
+type WarmOptions struct {
+	// WorkerSelector is the domain's per-environment worker selector; Nodes
+	// is the domain's node count (0 lets the server count the matching
+	// workers' nodes, which takes the global viewer role).
+	WorkerSelector map[string]string
+	Nodes          int
+	ProbesPerNode  int
+	MaxRounds      int
+	// ProbeTimeout bounds one probe on the server: create, resume and node
+	// read. The delete has the server's own bound, 60 s.
+	ProbeTimeout time.Duration
+	// RunID prefixes the probe names, <run>-<round>-<slot>; at most 20
+	// characters of [a-z0-9-].
+	RunID string
+}
+
+// WarmProbe is one probe of a WarmImage call as the server reports it:
+// its name, the node it ran on ("" when it did not), its round, how long it
+// took, and its error when it failed.
+type WarmProbe struct {
+	ID       string
+	Node     string
+	Round    int
+	Duration time.Duration
+	Error    string
+}
+
+// WarmCoverage is what one WarmImage call covered: the nodes that ran the
+// image, the count wanted, the probes started and failed, the rounds, and
+// the probes the server could not delete (they hold a slot until swept).
+// Waited is the time the rounds waited for probe slots held by other
+// WarmImage calls on the same selector.
+type WarmCoverage struct {
+	Nodes           []string
+	Wanted          int
+	Probes          int
+	Failed          int
+	Rounds          int
+	Complete        bool
+	Error           string
+	UndeletedProbes []string
+	Waited          time.Duration
 }
 
 // Backend creates sandboxes. The loader is written against this interface so
@@ -386,7 +433,7 @@ func (b *EnvBackend) Create(ctx context.Context, id, image string) (Sandbox, err
 	return b.CreateWith(ctx, id, image, CreateOptions{WorkerSelector: b.selectorFor(image)})
 }
 
-// CreateWith implements ImageWarmer: Create with options.
+// CreateWith is Create with options.
 func (b *EnvBackend) CreateWith(ctx context.Context, id, image string, opts CreateOptions) (Sandbox, error) {
 	e, err := b.client.Create(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
 		Id:             id,
@@ -401,13 +448,41 @@ func (b *EnvBackend) CreateWith(ctx context.Context, id, image string, opts Crea
 	return envSandbox{e: e, deletes: b.deletes}, nil
 }
 
-// Node implements ImageWarmer.
-func (b *EnvBackend) Node(ctx context.Context, id string) (string, error) {
-	e, err := b.client.Get(ctx, b.atespace, id)
-	if err != nil {
-		return "", fmt.Errorf("get %s: %w", id, err)
+// WarmImage implements ImageWarmer over ate-env-api's WarmImage, with the
+// backend's base template and atespace.
+func (b *EnvBackend) WarmImage(ctx context.Context, image string, opts WarmOptions, onProbe func(WarmProbe)) (WarmCoverage, error) {
+	req := &ateenvv1alpha.WarmImageRequest{
+		RootfsImage:    image,
+		Template:       &ateenvv1alpha.Template{Name: b.baseTemplate, Atespace: b.atespace},
+		Atespace:       b.atespace,
+		WorkerSelector: opts.WorkerSelector,
+		Nodes:          int32(opts.Nodes),
+		ProbesPerNode:  int32(opts.ProbesPerNode),
+		MaxRounds:      int32(opts.MaxRounds),
+		RunId:          opts.RunID,
 	}
-	return e.GetNode(), nil
+	if opts.ProbeTimeout > 0 {
+		req.ProbeTimeout = durationpb.New(opts.ProbeTimeout)
+	}
+	cov, err := b.client.WarmImage(ctx, req, func(p *ateenvv1alpha.WarmProbe) {
+		if onProbe != nil {
+			onProbe(WarmProbe{ID: p.GetId(), Node: p.GetNode(), Round: int(p.GetRound()), Duration: p.GetDuration().AsDuration(), Error: p.GetError()})
+		}
+	})
+	if err != nil {
+		return WarmCoverage{}, fmt.Errorf("warm image %s: %w", image, err)
+	}
+	return WarmCoverage{
+		Nodes:           append([]string{}, cov.GetNodes()...),
+		Wanted:          int(cov.GetWanted()),
+		Probes:          int(cov.GetProbes()),
+		Failed:          int(cov.GetFailed()),
+		Rounds:          int(cov.GetRounds()),
+		Complete:        cov.GetComplete(),
+		Error:           cov.GetError(),
+		UndeletedProbes: append([]string{}, cov.GetUndeletedProbes()...),
+		Waited:          cov.GetWaited().AsDuration(),
+	}, nil
 }
 
 // EnsureImageTemplate implements ImageWarmer.

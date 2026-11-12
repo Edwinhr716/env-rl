@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any
 
 from ..types import EnvironmentSpec, RawSandboxInstance
@@ -40,6 +41,13 @@ class BackendDriver(ABC):
         obs = self.observer
         if obs is not None:
             getattr(obs, event)(self.backend_name, *args)
+
+    def preflight_images(self, images: Sequence[str], **kwargs: Any) -> Any:
+        """Put the images on the nodes their environments can land on before
+        a run (``FleetConfig.preflight``); returns the coverage report, or
+        None when the backend has nothing to warm. The Substrate driver
+        implements it over ate-env-api's ``WarmImage``; the mock does not."""
+        return None
 
     @abstractmethod
     def preflight(self) -> None:

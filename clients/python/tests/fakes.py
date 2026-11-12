@@ -36,6 +36,8 @@ from ate_env_rl._gen.ateenv.v1alpha import (
 )
 
 CHUNK_SIZE = 64 * 1024
+# ate-env-api's warmRunIDPattern (internal/apiservice/placement.go).
+_WARM_RUN_ID = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 
 
 async def _require_env(context: grpc.aio.ServicerContext) -> tuple[str, str]:
@@ -67,6 +69,10 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         self._domain_counter: dict[str, int] = {}
         self.node_slots: dict[str, int] = {}
         self.deny_list_workers = False
+        # How many ListPlacementDomains calls answer UNAVAILABLE first.
+        self.list_unavailable_first = 0
+        # The order of creates and warm calls, for tests of what came first.
+        self.call_log: list[str] = []
         self.warm_same_node = False
         self.warm_requests: list[env_pb2.WarmImageRequest] = []
         # Environment ids whose delete fails and leaves them in place, and
@@ -77,11 +83,31 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         # reports waited for probe slots.
         self.warm_undeleted: list[str] = []
         self.warm_waited = 0.0
+        # WarmImage: seconds a round's probes are held before their delete
+        # (so a cancel can land mid-round and concurrent calls overlap); how
+        # many calls fail with UNAVAILABLE before any event; a (code, message)
+        # every call fails with; the calls seen.
+        self.warm_hold = 0.0
+        # When set, warm_hold applies to calls for these images only; the
+        # images in warm_hold_before_images are held before a round's
+        # creates instead of after them.
+        self.warm_hold_images: set[str] = set()
+        self.warm_hold_before_images: set[str] = set()
+        self.warm_unavailable_first = 0
+        # ate-env-api's -warm-max-probes-per-node: a request's
+        # probes_per_node above it is refused (2 unless raised).
+        self.warm_max_probes_per_node = 2
+        self.warm_fail: tuple[grpc.StatusCode, str] | None = None
+        self.warm_calls = 0
+        # How many calls end with UNAVAILABLE right after their first round's
+        # creates, leaving the probes in place, as an api server restart does.
+        self.warm_cut_after_create = 0
         # An environment created without a known domain reports no node, as
         # before its placement; creates hand the domain's nodes out round-robin.
         self.first_node_creates = 0
 
     async def CreateEnvironment(self, request, context):
+        self.call_log.append("create")
         self.last_create_request = request
         atespace = request.atespace or "ate-env"
         key = (atespace, request.id)
@@ -105,23 +131,30 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
                 await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "image is not pinned by digest")
             digest = request.rootfs_image.split("@sha256:", 1)[1]
             template.name = f"{template.name}-{digest[:12]}"
+        environment = self._new_environment(key, template, request.worker_selector)
+        return env_pb2.CreateEnvironmentResponse(environment=environment)
+
+    def _new_environment(self, key, template, worker_selector) -> env_pb2.Environment:
+        """Place and store an environment, as a create and a WarmImage probe do."""
+        atespace, env_id = key
         environment = env_pb2.Environment(
-            id=request.id,
+            id=env_id,
             atespace=atespace,
             template=template,
             status=env_pb2.ENVIRONMENT_STATUS_RUNNING,
         )
-        environment.worker_selector.update(request.worker_selector)
-        domain = request.worker_selector.get("ate-env/domain", "")
+        environment.worker_selector.update(worker_selector)
+        domain = worker_selector.get("ate-env/domain", "")
         if nodes := self.domain_nodes.get(domain):
             n = self._domain_counter.get(domain, 0)
             # The first first_node_creates creates of a domain all land on its
             # first node, as a scheduler that favours a warm node does; the
-            # rest go round-robin.
-            environment.node = nodes[0 if n < self.first_node_creates else n % len(nodes)]
+            # rest go round-robin (always the first with warm_same_node).
+            first = n < self.first_node_creates or self.warm_same_node
+            environment.node = nodes[0 if first else n % len(nodes)]
             self._domain_counter[domain] = n + 1
         self.environments[key] = environment
-        return env_pb2.CreateEnvironmentResponse(environment=environment)
+        return environment
 
     async def GetEnvironment(self, request, context):
         environment = await self._lookup(request, context)
@@ -216,6 +249,9 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             selector = self.template_selectors[(atespace, name)]
         if self.deny_list_workers:
             await context.abort(grpc.StatusCode.PERMISSION_DENIED, "not allowed to list workers")
+        if self.list_unavailable_first > 0:
+            self.list_unavailable_first -= 1
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "api server restarting")
         resp = env_pb2.ListPlacementDomainsResponse()
         for name in sorted(self.domain_nodes):
             labels = {"ate-env/domain": name}
@@ -230,15 +266,64 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         return resp
 
     async def WarmImage(self, request, context):
-        # Mirror ate-env-api: rounds of nodes x probes_per_node probes placed
-        # round-robin on the domain's nodes (always the first with
-        # warm_same_node), deleted after each round; a probe event each, then
-        # the coverage.
+        # Mirror ate-env-api: rounds of nodes x probes_per_node probes named
+        # <run>-<round>-<slot>, placed as creates are (round-robin on the
+        # domain's nodes, the first node with warm_same_node), held for
+        # warm_hold, then deleted (delete_fail lists one undeleted); a probe
+        # event each, then the coverage. A name that exists already fails the
+        # probe and is left alone. A cancelled call deletes what it created.
+        self.warm_calls += 1
+        self.call_log.append("warm")
+        if self.warm_fail is not None:
+            await context.abort(*self.warm_fail)
+        if self.warm_unavailable_first > 0:
+            self.warm_unavailable_first -= 1
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "api server restarting")
         if not re.search(r"@sha256:[0-9a-f]{64}$", request.rootfs_image):
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "image is not pinned by digest")
+        # What ate-env-api refuses before it creates a probe (parseWarmOptions
+        # and the checks after it in internal/apiservice/placement.go), in the
+        # server's order: 0 means the default. warm_max_probes_per_node is the
+        # server's -warm-max-probes-per-node.
+        if request.nodes < 0:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "nodes must be >= 0")
+        if not 0 <= request.probes_per_node <= 8:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "probes_per_node must be between 1 and 8")
+        if request.probes_per_node > self.warm_max_probes_per_node:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"probes_per_node {request.probes_per_node} exceeds the {self.warm_max_probes_per_node} "
+                "probes per node this server runs on one worker selector at once "
+                "(ate-env-api -warm-max-probes-per-node)",
+            )
+        if not 0 <= request.max_rounds <= 10:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "max_rounds must be between 1 and 10")
+        if request.HasField("probe_timeout") and request.probe_timeout.ToNanoseconds() <= 0:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "probe_timeout must be positive")
+        if request.run_id and (len(request.run_id) > 20 or not _WARM_RUN_ID.match(request.run_id)):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"run_id must match {_WARM_RUN_ID.pattern} and be at most 20 characters",
+            )
         domain = request.worker_selector.get("ate-env/domain", "")
         pool = self.domain_nodes.get(domain)
         wanted = request.nodes
+        # The server counts the distinct nodes behind the selector and refuses
+        # a request for more. With no pool for the selector here, or without
+        # the permission to list workers, the request's nodes are trusted.
+        listed = 0 if self.deny_list_workers else len(set(pool or ()))
+        if listed and wanted > listed:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"nodes {wanted} exceeds the {listed} nodes the selector's workers run on",
+            )
+        width = (wanted or listed) * (request.probes_per_node or min(2, self.warm_max_probes_per_node))
+        if width > 256:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"{wanted or listed} nodes x {width // (wanted or listed)} probes per node exceed "
+                "the 256 probes a round may start",
+            )
         if wanted == 0:
             if self.deny_list_workers:
                 await context.abort(
@@ -251,36 +336,85 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
                     f"no active worker matches the selector {dict(request.worker_selector)}",
                 )
             wanted = len(set(pool))
-        per_node = request.probes_per_node or 2
+        per_node = request.probes_per_node or min(2, self.warm_max_probes_per_node)
         rounds = request.max_rounds or 3
         run_id = request.run_id or "warm"
+        atespace = request.atespace or "ate-env"
+        template = env_pb2.Template(name="default-template", atespace="ate-env")
+        if request.HasField("template"):
+            if request.template.name:
+                template.name = request.template.name
+            if request.template.atespace:
+                template.atespace = request.template.atespace
+        digest = request.rootfs_image.split("@sha256:", 1)[1]
+        template.name = f"{template.name}-{digest[:12]}"
+        self.warm_requests.append(request)
         covered: set[str] = set()
         probes = failed = 0
         error = ""
         rnd = 0
-        self.warm_requests.append(request)
-        while rnd < rounds and len(covered) < wanted:
-            rnd += 1
-            for k in range(wanted * per_node):
-                probes += 1
-                probe_id = f"{run_id}-{rnd}-{k}"
-                node = ""
-                if pool:
-                    idx = 0 if self.warm_same_node else self._domain_counter.get(domain, 0)
-                    self._domain_counter[domain] = idx + 1
-                    node = pool[idx % len(pool)]
-                    covered.add(node)
-                else:
-                    failed += 1
-                    error = "running but the control plane reports no node"
-                probe = env_pb2.WarmProbe(id=probe_id, node=node, round=rnd, error=error if not node else "")
-                probe.duration.FromMilliseconds(5)
-                yield env_pb2.WarmImageEvent(probe=probe)
-            if failed == probes:
-                break
+        undeleted = list(self.warm_undeleted)
+        created: list[str] = []
+        try:
+            while rnd < rounds and len(covered) < wanted:
+                if self.warm_hold and request.rootfs_image in self.warm_hold_before_images:
+                    await asyncio.sleep(self.warm_hold)
+                rnd += 1
+                created = []
+                started = round_failed = 0
+                # As ate-env-api: the round's probes are all created before
+                # any event goes out, so two concurrent calls on one pool do
+                # not take turns at the node counter probe by probe.
+                events: list[env_pb2.WarmImageEvent] = []
+                for k in range(wanted * per_node):
+                    probe_id = f"{run_id}-{rnd}-{k}"
+                    key = (atespace, probe_id)
+                    probes += 1
+                    started += 1
+                    probe = env_pb2.WarmProbe(id=probe_id, round=rnd)
+                    probe.duration.FromMilliseconds(5)
+                    if key in self.environments:
+                        probe.error = f'environment "{probe_id}" already exists'
+                    else:
+                        environment = self._new_environment(key, template, request.worker_selector)
+                        created.append(probe_id)
+                        probe.node = environment.node
+                        if not probe.node:
+                            probe.error = "running but the control plane reports no node"
+                    if probe.error:
+                        failed += 1
+                        round_failed += 1
+                        error = probe.error
+                    else:
+                        covered.add(probe.node)
+                    events.append(env_pb2.WarmImageEvent(probe=probe))
+                for ev in events:
+                    yield ev
+                if self.warm_cut_after_create > 0:
+                    self.warm_cut_after_create -= 1
+                    created = []  # the probes stay
+                    await context.abort(grpc.StatusCode.UNAVAILABLE, "api server restarted; its probes stay")
+                if self.warm_hold and (
+                    not self.warm_hold_images or request.rootfs_image in self.warm_hold_images
+                ):
+                    await asyncio.sleep(self.warm_hold)
+                for probe_id in created:
+                    if probe_id in self.delete_fail:
+                        undeleted.append(probe_id)
+                    else:
+                        # A delete that answers NotFound is gone all the same.
+                        self.environments.pop((atespace, probe_id), None)
+                created = []
+                if started and round_failed == started:
+                    break
+        finally:
+            # A cancelled call: the server deletes the round's probes.
+            for probe_id in created:
+                if probe_id not in self.delete_fail:
+                    self.environments.pop((atespace, probe_id), None)
         coverage = env_pb2.WarmImageCoverage(
             nodes=sorted(covered), wanted=wanted, probes=probes, failed=failed, rounds=rnd,
-            complete=len(covered) >= wanted, error=error, undeleted_probes=list(self.warm_undeleted),
+            complete=len(covered) >= wanted, error=error, undeleted_probes=undeleted,
         )
         if self.warm_waited:
             coverage.waited.FromTimedelta(timedelta(seconds=self.warm_waited))

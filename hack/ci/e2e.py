@@ -131,6 +131,78 @@ def build_images(root: Path, sub_dir: Path, target: KindTarget) -> dict[str, str
     return imgs
 
 
+def merge_viewer_binding(policy: dict, member: str) -> dict | None:
+    """The global access policy with member in its viewer binding, or None
+    when it is there already. A policy read back with "bindings": null is a
+    policy with no binding."""
+    bindings = policy.get("bindings") or []
+    policy["bindings"] = bindings
+    viewer = next((b for b in bindings if b.get("role") == "viewer"), None)
+    if viewer is None:
+        bindings.append({"role": "viewer", "members": [member]})
+        return policy
+    members = viewer.get("members") or []
+    viewer["members"] = members
+    if member in members:
+        return None
+    members.append(member)
+    return policy
+
+
+def read_global_policy(target: KindTarget, ctl_str: str) -> dict | None:
+    """The control plane's global access policy, or None when it has none.
+    Any other failure of the read is an error, not a missing policy."""
+    got = lib.run(
+        ctl_str, f"--context={target.context}", "get", "access-policy", "--global", "-o", "json",
+        check=False, capture=True,
+    )
+    stderr = got.stderr or ""
+    if got.returncode != 0:
+        if "no access policy" in stderr or "not found" in stderr.lower():
+            return None
+        raise RuntimeError(f"reading the global access-policy failed: {stderr}")
+    if not got.stdout.strip():
+        return None
+    try:
+        return json.loads(got.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"the global access-policy is not JSON: {e}: {got.stdout[:200]}") from e
+
+
+def ensure_global_viewer_binding(target: KindTarget, ctl_str: str, env_str: str, ns: str) -> None:
+    """Merge ate-env-api's global viewer binding (ListPlacementDomains, the
+    pre-flight's pool listing) into the control plane's global access policy,
+    as the README says: read it, add the member, update it; create it from
+    the manifest only when there is none, and when that create says the
+    policy exists after all, read and update it."""
+    lib.step("Ensuring the global viewer binding for ate-env-api in Substrate...")
+    manifest = lib.run(env_str, "manifest", "access-policy", "--global", "--namespace", ns, capture=True).stdout
+    found = re.search(r"-\s*(user:\S+)", manifest)
+    if not found:
+        raise RuntimeError(f"no member in the global access-policy manifest:\n{manifest}")
+    member = found.group(1)
+    policy = read_global_policy(target, ctl_str)
+    if policy is None:
+        res = lib.run(
+            ctl_str, f"--context={target.context}", "create", "access-policy", "--global", "-f", "-",
+            input=manifest, check=False, capture=True,
+        )
+        if res.returncode == 0:
+            return
+        if "AlreadyExists" not in (res.stderr or ""):
+            raise RuntimeError(f"Failed to create the global access-policy: {res.stderr}")
+        policy = read_global_policy(target, ctl_str)
+        if policy is None:
+            raise RuntimeError("the global access-policy exists but cannot be read")
+    merged = merge_viewer_binding(policy, member)
+    if merged is None:
+        return
+    lib.run(
+        ctl_str, f"--context={target.context}", "update", "access-policy", "--global", "-f", "-",
+        input=json.dumps(merged), capture=True,
+    )
+
+
 def deploy_manifests(
     target: KindTarget,
     ate_ctl: Path,
@@ -157,6 +229,8 @@ def deploy_manifests(
         )
         if res.returncode != 0 and "AlreadyExists" not in (res.stderr or ""):
             raise RuntimeError(f"Failed to create access-policy: {res.stderr}")
+
+    ensure_global_viewer_binding(target, ctl_str, env_str, ns)
 
     lib.step(f"Ensuring ate-env-api-token secret in namespace {ns}...")
     lib.pipe(

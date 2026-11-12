@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 import zlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..client import DEFAULT_ATESPACE, Client
@@ -31,10 +31,20 @@ from ..errors import (
     FailedPreconditionError,
     InfrastructureError,
     NotFoundError,
+    PermissionDeniedError,
     PreflightError,
     SandboxStartError,
 )
 from ..loop_runner import LoopRunner
+from ..preflight import (
+    _DIGEST,
+    DomainCoverage,
+    ImagePlacement,
+    PlacementEntry,
+    PreflightCoverage,
+    PreflightWarmer,
+    _transient,
+)
 from ..telemetry import metrics
 from ..telemetry.trace_recorder import (
     current_slot_wait_s,
@@ -48,7 +58,12 @@ from ..telemetry.tracing import (
     start_span,
     tracer_from_config,
 )
-from ..types import DataPlaneEndpoint, EnvironmentSpec, RawSandboxInstance
+from ..types import (
+    DataPlaneEndpoint,
+    EnvironmentSpec,
+    PlacementDomain,
+    RawSandboxInstance,
+)
 from .base import BackendDriver
 
 logger = logging.getLogger("ate_env_rl.backend.substrate")
@@ -148,6 +163,11 @@ class SubstrateBackendDriver(BackendDriver):
         # FleetConfig.placement).
         self.worker_selector = dict(worker_selector or {})
         self.placement = {img: dict(sel) for img, sel in (placement or {}).items()}
+        # Backoff, seconds, between repeats of the pre-flight's pool listing;
+        # and the images one pre-flight pass takes at most (0: by the run id
+        # budget, preflight_batch_size), which tests shrink.
+        self.preflight_list_backoff = 1.0
+        self.preflight_batch_images = 0
         self.acquire_timeout_s = acquire_timeout_s
         self.ready_timeout_s = ready_timeout_s
         self.tracer_config = tracer_config or TracerConfig()
@@ -294,6 +314,198 @@ class SubstrateBackendDriver(BackendDriver):
 
     def preflight(self) -> None:
         self._sync(self.preflight_async())
+
+    async def preflight_images_async(
+        self,
+        images: Sequence[str],
+        *,
+        observer: Any = None,
+        run_id: str = "",
+        probes_per_node: int = 2,
+        image_concurrency: int = 4,
+        max_rounds: int = 3,
+        golden_timeout_s: float = 30 * 60,
+        probe_timeout_s: float = 10 * 60,
+        golden: str = "wait",
+    ) -> PreflightCoverage | None:
+        """Put the images on every node of the pools their creates can land
+        on, through ate-env-api's ``WarmImage`` (``FleetConfig.preflight``).
+
+        The pools are the ones ``ListPlacementDomains`` reports for the base
+        template (ate-env-api needs the global viewer binding for that:
+        ``ate-env manifest access-policy --global``), narrowed per image to
+        the ones its worker selector (``worker_selector_for``: the fleet's
+        ``node_selector`` with the image's ``placement`` labels over it)
+        matches. An image routed to a fixed template (``image_templates``)
+        or not pinned by digest carries no rootfs image to warm and is
+        skipped with a log line (the fleet leaves out tasks with
+        ``Task.template`` before calling). Each matching pool bounds its own
+        probes per node by its ``node_slots``: a pool with one slot per node
+        gets one probe per node and does not lower another pool's. Returns the
+        ``PreflightCoverage``, or None when nothing was left to warm; raises
+        ``PreflightError`` when the pools cannot be listed (a transient
+        failure is repeated twice first).
+
+        ``golden`` is ``FleetConfig.preflight_golden``: ``wait`` waits for
+        each image's golden snapshot and probes the image whether or not
+        it got ready; ``skip`` probes at once and leaves the goldens
+        baking; ``fail`` waits, does not probe an image whose golden is not
+        ready, and raises ``PreflightError`` naming those images once the
+        pass is over (the other images are on their nodes by then); the
+        error's ``coverage`` attribute is the pass's ``PreflightCoverage``.
+        A large image list goes in batches, each with its own golden wait
+        of ``golden_timeout_s`` without progress; with ``fail`` the pass
+        stops at the first batch that has an unready golden.
+        """
+        if golden not in ("wait", "skip", "fail"):
+            raise ValueError(f"golden must be wait, skip or fail, got {golden!r}")
+        pinned: list[str] = []
+        skipped: list[str] = []
+        for image in dict.fromkeys(images):
+            if image in self.image_templates or not _DIGEST.search(image):
+                skipped.append(image)
+            else:
+                pinned.append(image)
+        if skipped:
+            logger.info(
+                "image pre-flight: %d images are not digest-pinned rootfs images and are not warmed: %s",
+                len(skipped), ", ".join(skipped[:5]) + (", ..." if len(skipped) > 5 else ""),
+            )
+        if not pinned:
+            return None
+        template = self.default_template or "default-template"
+        # The pool listing is repeated on the failures a control plane under
+        # load hands out for a while (an api server restarting); a missing
+        # binding or any other refusal is final.
+        for attempt in range(1, 4):
+            try:
+                pools = await self.client.list_placement_domains(
+                    template_name=template, atespace=self.atespace
+                )
+                break
+            except PermissionDeniedError as e:
+                raise PreflightError(
+                    "image pre-flight (FleetConfig.preflight) needs ate-env-api's global viewer "
+                    "binding to list the worker pools: apply `ate-env manifest access-policy "
+                    f"--global` or run the pre-flight yourself with PreflightWarmer: {e}"
+                ) from e
+            except Exception as e:
+                if attempt == 3 or not _transient(e):
+                    raise PreflightError(
+                        f"image pre-flight: listing the worker pools failed: {e}"
+                    ) from e
+                logger.warning("image pre-flight: listing the worker pools failed, repeating: %s", e)
+                await asyncio.sleep(self.preflight_list_backoff * attempt)
+        # The plan's domain names must be unique; ate-env-api keys a pool by
+        # its namespace and name, so a name two namespaces share is prefixed.
+        names: dict[tuple[str, str], str] = {}
+        seen_names: dict[str, int] = {}
+        for p in pools:
+            seen_names[p.name] = seen_names.get(p.name, 0) + 1
+        for p in pools:
+            names[(p.worker_namespace, p.name)] = (
+                p.name if seen_names[p.name] == 1 else f"{p.worker_namespace}/{p.name}"
+            )
+        by_key: dict[tuple[str, str], PlacementDomain] = {}
+        entries: list[PlacementEntry] = []
+        for image in pinned:
+            selector = self.worker_selector_for(image) or {}
+            hit = [
+                p for p in pools
+                if p.nodes > 0 and all(p.selector.get(k) == v for k, v in selector.items())
+            ]
+            if not hit:
+                logger.warning(
+                    "image pre-flight: no pool of template %s with active nodes matches the "
+                    "selector %s of %s; its creates would not place either",
+                    template, selector, image,
+                )
+                continue
+            for p in hit:
+                key = (p.worker_namespace, p.name)
+                if key not in by_key:
+                    by_key[key] = PlacementDomain(
+                        name=names[key],
+                        worker_namespace=p.worker_namespace,
+                        selector=p.selector,
+                        nodes=p.nodes,
+                        workers=p.workers,
+                        node_slots=p.node_slots,
+                    )
+            entries.append(
+                PlacementEntry(image, tuple(names[(p.worker_namespace, p.name)] for p in hit))
+            )
+        if not entries:
+            return None
+        domains = tuple(by_key.values())
+        # The warmer's run id carries the domain and image indexes within
+        # ate-env-api's 20 characters, so a large image list goes in batches
+        # whose index fits; the batches' coverages are merged into one.
+        try:
+            batch, batch_ids = preflight_batches(
+                len(domains), len(entries), run_id, self.preflight_batch_images
+            )
+        except ValueError as e:
+            raise PreflightError(f"image pre-flight: {e}") from e
+        coverages: list[PreflightCoverage] = []
+        left_out = 0
+        for b, start in enumerate(range(0, len(entries), batch)):
+            plan = ImagePlacement(domains, tuple(entries[start : start + batch]))
+            try:
+                # The warmer bounds the probes per domain by its node_slots.
+                warmer = PreflightWarmer(
+                    self.client,
+                    plan,
+                    atespace=self.atespace,
+                    template_name=template,
+                    run_id=batch_ids[b],
+                    probes_per_node=probes_per_node,
+                    image_concurrency=image_concurrency,
+                    max_rounds=max_rounds,
+                    golden_timeout=golden_timeout_s,
+                    golden_wait=golden != "skip",
+                    probe_without_golden=golden != "fail",
+                    probe_timeout=probe_timeout_s,
+                    observer=observer,
+                    backend=self.backend_name,
+                )
+            except ValueError as e:
+                raise PreflightError(f"image pre-flight: {e}") from e
+            coverages.append(await warmer.run())
+            if golden == "fail" and any(not g.settled for g in coverages[-1].goldens):
+                # The run is refused already. Each batch has its own golden
+                # wait, so the later batches would only add theirs.
+                left_out = len(entries) - (start + len(plan.images))
+                break
+        coverage = merge_preflight_coverages(coverages)
+        if run_id:
+            # The caller's name for the pass, not the first batch's.
+            coverage.run_id = run_id
+        if golden == "fail" and coverage is not None:
+            unready = [g for g in coverage.goldens if not g.settled]
+            if unready:
+                first = "; ".join(
+                    f"{g.image}: {g.state or 'unknown'}{' (' + g.error + ')' if g.error else ''}"
+                    for g in unready[:3]
+                )
+                raise PreflightError(
+                    f"image pre-flight: {len(unready)} of {len(coverage.goldens)} golden snapshots "
+                    f"are not ready and preflight_golden is \"fail\": {first}"
+                    + ("; ..." if len(unready) > 3 else "")
+                    + (
+                        f"; {left_out} more images were not warmed, the pass stopped at the "
+                        "first batch with an unready golden"
+                        if left_out
+                        else ""
+                    ),
+                    # The whole report, for a caller that wants every image.
+                    coverage=coverage,
+                )
+        return coverage
+
+    def preflight_images(self, images: Sequence[str], **kwargs: Any) -> PreflightCoverage | None:
+        return self._sync(self.preflight_images_async(images, **kwargs))
+
 
     def worker_selector_for(self, rootfs_image: str | None) -> dict[str, str] | None:
         """The worker selector a create for rootfs_image sends: the fleet-wide
@@ -1214,3 +1426,83 @@ class SubstrateBackendDriver(BackendDriver):
             client=self._client_for(instance.instance_id),
             loop_runner=self._get_loop_runner(),
         ), ep
+
+
+def preflight_batch_size(domains: int, run_id_len: int = 9) -> int:
+    """How many images one PreflightWarmer pass takes at most, so that the
+    run id of a call, ``<run id>-<domain>-<image>-<attempt>``, fits
+    ate-env-api's 20 characters: the run id (9 for the warmer's own
+    ``pf-<6>``), 4 for the three separators and the attempt digit, the
+    domain index's digits, and what is left for the image index's digits.
+    0 when the run id leaves no digit for the image index. The bound counts
+    decimal digits; the warmer writes the indexes in base 36, which is never
+    longer, so a batch of this size always fits."""
+    left = 20 - run_id_len - 4 - len(str(max(domains - 1, 0)))
+    return 10**left if left >= 1 else 0
+
+
+def preflight_batches(
+    domains: int, images: int, run_id: str = "", batch_images: int = 0
+) -> tuple[int, list[str]]:
+    """The batch size and each batch's run id for a pass over ``images``
+    images in ``domains`` domains.
+
+    Every batch numbers its images from 0, so two batches must not share a
+    run id: their probe names would collide, and a probe one batch left
+    behind would fail the next one's create. Without a ``run_id`` each batch
+    gets the warmer's own random ``pf-<6>`` (an empty id here). A caller's
+    ``run_id`` is used as it is when one batch takes every image, and gets
+    the batch index appended (``<run_id>-<batch>``) otherwise, with the
+    batch size computed for the longer id. ``batch_images`` overrides the
+    size (tests). Raises ``ValueError`` when the run id is too long for the
+    indexes to fit ate-env-api's 20 characters.
+    """
+    if not run_id:
+        size = batch_images or preflight_batch_size(domains)
+        return size, [""] * -(-images // size)
+    size = batch_images or preflight_batch_size(domains, len(run_id))
+    if size and images <= size:
+        return size, [run_id]
+    # More than one batch: find the batch-index width whose batches fit it.
+    for digits in range(1, 8):
+        size = preflight_batch_size(domains, len(run_id) + 1 + digits)
+        if batch_images:
+            size = min(size, batch_images)
+        if not size:
+            break
+        count = -(-images // size)
+        if len(str(count - 1)) <= digits:
+            return size, [f"{run_id}-{b}" for b in range(count)]
+    raise ValueError(
+        f"run_id {run_id!r} is too long for {images} images in {domains} domains: with the "
+        "domain, image and attempt indexes (and a batch index when the images need more than "
+        "one batch) it must fit ate-env-api's 20 characters; use a shorter run_id or none"
+    )
+
+
+def merge_preflight_coverages(coverages: list[PreflightCoverage]) -> PreflightCoverage:
+    """One coverage for the batches of one pass: the goldens of all, the
+    domains merged by name (images appended, nodes seen joined), complete
+    when every batch was; the first batch's run id names the pass."""
+    if len(coverages) == 1:
+        return coverages[0]
+    first = coverages[0]
+    merged = PreflightCoverage(
+        run_id=first.run_id,
+        started_at=min(c.started_at for c in coverages),
+        finished_at=max((c.finished_at for c in coverages if c.finished_at), default=None),
+        plan=first.plan,
+    )
+    by_name: dict[str, DomainCoverage] = {}
+    for c in coverages:
+        merged.goldens.extend(c.goldens)
+        for d in c.domains:
+            if d.name not in by_name:
+                by_name[d.name] = DomainCoverage(name=d.name, nodes=d.nodes)
+            m = by_name[d.name]
+            m.images.extend(d.images)
+            m.nodes_seen = sorted(set(m.nodes_seen) | set(d.nodes_seen))
+            m.complete = m.complete and d.complete
+    merged.domains = list(by_name.values())
+    merged.complete = all(c.complete for c in coverages)
+    return merged

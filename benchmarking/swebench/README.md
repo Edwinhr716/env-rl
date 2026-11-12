@@ -330,16 +330,31 @@ staying the source of truth so a run does not depend on a collector.
    large image set), then warms every domain in parallel: as soon as an
    image's golden has settled (ready; `none` when the base template disables
    goldens; failed or given up on, which still fills the layers by cold
-   boots) it creates probe environments with the domain's
-   worker selector, round after round, until every node of the domain has
-   run the image once. A domain warms `-image-concurrency` images at once
-   (default 4; `node_slots` in `domains.json` caps it at
-   `node_slots / -probes-per-node`), so the bakes and the node warming
-   overlap and the slots stay busy; the probes of concurrent images share
-   the nodes, so an image can need a second round. Each probe's first
-   command returns when
-   the layers and the golden snapshot are on its node; the node is read back
-   from `ate-env-api` and the probe is deleted:
+   boots) it runs one `ate-env-api` `WarmImage` call for the image in the
+   domain: the server creates probe environments with the domain's worker
+   selector, round after round, until every node of the domain has run the
+   image once, holding each probe until it runs (the layers and the golden
+   snapshot are on its node by then), reading its node and deleting it. A
+   domain warms `-image-concurrency` images at once (default 4; `node_slots`
+   in `domains.json` caps it at `node_slots / -probes-per-node`), so the
+   bakes and the node warming overlap and the slots stay busy; the probes
+   of concurrent images share the nodes, so an image can need a second
+   round. Across calls `ate-env-api` caps the probes in flight per node of
+   one worker selector (`-warm-max-probes-per-node`, default 2, also the
+   most it takes for `-probes-per-node`): calls beyond the cap wait for
+   slots on the server, and the coverage's `waited_ms` sums the wait. A
+   call the control plane cuts off is repeated with its own run id, for
+   up to `-probe-timeout` and nine attempts, unless its stream showed
+   every node already; a pair's coverage is the sum of its attempts. The
+   server deletes the probes of a call that broke when it can, but it holds
+   a call's probes in memory only: an `ate-env-api` that restarted under
+   the call leaves them. The pass cannot tell, so it lists every probe a
+   broken call streamed under `undeleted_probes`, and each log line about a
+   cut-off call carries the call's `run_id` (its probes are
+   `<run_id>-<round>-<slot>`; the ones not yet streamed are in no list).
+   The pass's `-run-id` is at most 20 characters with the
+   `-<domain>-<image>-<attempt>` indexes it appends per call (the plan
+   indexes of the pairs the pass warms, in base 36):
 
    ```bash
    swebench-loader preflight -plan image-placement.json -events-dir runs/pf-$(date +%s) \
@@ -354,7 +369,8 @@ staying the source of truth so a run does not depend on a collector.
    per domain the nodes seen and per image the nodes covered, probes, rounds
    and failures. It exits non-zero when a golden is not ready, a pair is
    short of its nodes or a probe could not be deleted, and says which; the
-   probes left behind are listed per image under `undeleted_probes` and hold
+   probes left behind (a failed delete, or a call that broke before it
+   reported its deletes) are listed per image under `undeleted_probes` and hold
    a node slot each until swept with `ate-env delete`. `-golden-timeout` (default 30 min)
    gives up on the goldens still baking once none became ready for that
    long. The probes are deleted: the planner keeps each node's assigned

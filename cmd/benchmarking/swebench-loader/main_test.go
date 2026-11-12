@@ -31,6 +31,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -854,48 +855,47 @@ func (f *fakeWarmer) ImageStatus(ctx context.Context, image string) (swebench.Im
 	return f.EnsureImageTemplate(ctx, image)
 }
 
-func (f *fakeWarmer) CreateWith(_ context.Context, id, _ string, opts swebench.CreateOptions) (swebench.Sandbox, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+// WarmImage covers the domain's two nodes in one round, as ate-env-api's
+// does, and reports the probes it "deleted".
+func (f *fakeWarmer) WarmImage(_ context.Context, _ string, opts swebench.WarmOptions, onProbe func(swebench.WarmProbe)) (swebench.WarmCoverage, error) {
 	domain := opts.WorkerSelector["ate-env/domain"]
-	f.nodes[id] = fmt.Sprintf("node-%s-%d", domain, f.counter[domain]%2)
-	if f.short {
-		f.nodes[id] = fmt.Sprintf("node-%s-0", domain)
+	cov := swebench.WarmCoverage{Wanted: opts.Nodes, Rounds: 1}
+	seen := map[string]bool{}
+	for k := 0; k < opts.Nodes*opts.ProbesPerNode; k++ {
+		id := fmt.Sprintf("%s-1-%d", opts.RunID, k)
+		f.mu.Lock()
+		node := fmt.Sprintf("node-%s-%d", domain, f.counter[domain]%2)
+		if f.short {
+			node = fmt.Sprintf("node-%s-0", domain)
+		}
+		f.counter[domain]++
+		f.nodes[id] = node
+		f.mu.Unlock()
+		seen[node] = true
+		cov.Probes++
+		if onProbe != nil {
+			onProbe(swebench.WarmProbe{ID: id, Node: node, Round: 1, Duration: time.Millisecond})
+		}
+		f.mu.Lock()
+		if f.failDeletes > 0 {
+			f.failDeletes--
+			f.mu.Unlock()
+			cov.UndeletedProbes = append(cov.UndeletedProbes, id)
+			continue
+		}
+		f.deleted = append(f.deleted, id)
+		n, hook, pass := len(f.deleted), f.onDelete, f.pass
+		f.mu.Unlock()
+		if hook != nil {
+			hook(n, pass)
+		}
 	}
-	f.counter[domain]++
-	return &fakeWarmerSandbox{w: f, id: id}, nil
-}
-
-func (f *fakeWarmer) Node(_ context.Context, id string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.nodes[id], nil
-}
-
-type fakeWarmerSandbox struct {
-	w  *fakeWarmer
-	id string
-}
-
-func (s *fakeWarmerSandbox) Run(context.Context, string, time.Duration) (swebench.Result, error) {
-	return swebench.Result{}, nil
-}
-func (s *fakeWarmerSandbox) WriteFile(context.Context, string, []byte, fs.FileMode) error { return nil }
-func (s *fakeWarmerSandbox) Suspend(context.Context) error                                { return nil }
-func (s *fakeWarmerSandbox) Delete(context.Context) error {
-	s.w.mu.Lock()
-	if s.w.failDeletes > 0 {
-		s.w.failDeletes--
-		s.w.mu.Unlock()
-		return errors.New("delete refused")
+	for n := range seen {
+		cov.Nodes = append(cov.Nodes, n)
 	}
-	s.w.deleted = append(s.w.deleted, s.id)
-	n, hook, pass := len(s.w.deleted), s.w.onDelete, s.w.pass
-	s.w.mu.Unlock()
-	if hook != nil {
-		hook(n, pass)
-	}
-	return nil
+	sort.Strings(cov.Nodes)
+	cov.Complete = len(cov.Nodes) >= opts.Nodes
+	return cov, nil
 }
 
 func TestPreflightCmd(t *testing.T) {

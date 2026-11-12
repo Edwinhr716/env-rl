@@ -123,10 +123,9 @@ func (noWarmer) EnsureImageTemplate(context.Context, string) (swebench.ImageStat
 func (noWarmer) ImageStatus(context.Context, string) (swebench.ImageState, error) {
 	return swebench.ImageState{}, errors.New("no backend")
 }
-func (noWarmer) CreateWith(context.Context, string, string, swebench.CreateOptions) (swebench.Sandbox, error) {
-	return nil, errors.New("no backend")
+func (noWarmer) WarmImage(context.Context, string, swebench.WarmOptions, func(swebench.WarmProbe)) (swebench.WarmCoverage, error) {
+	return swebench.WarmCoverage{}, errors.New("no backend")
 }
-func (noWarmer) Node(context.Context, string) (string, error) { return "", errors.New("no backend") }
 
 // resolveAuthToken returns the token from file when file is set, otherwise
 // from authTokenEnv, otherwise "" (no token sent). A file that holds only
@@ -557,16 +556,16 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 		baseTemplate  = fs.String("base-template", "default-template", "Base ActorTemplate the derived templates come from.")
 		connections   = fs.Int("connections", 1, "gRPC connections to ate-env-api.")
 		authTokenFile = fs.String("auth-token-file", "", "File with the ate-env-api bearer token; SUBSTRATE_ENV_AUTH_TOKEN otherwise.")
-		runID         = fs.String("run-id", "", "Prefix of the probe environment names (at most 20 characters; default pf-<6 random characters>, unique per pass).")
+		runID         = fs.String("run-id", "", "Prefix of the probe environment names; with the -<domain>-<image>-<attempt> indexes the pass appends (the plan indexes of the pairs it warms, in base 36) it is at most 20 characters (default pf-<6 random characters>, unique per pass).")
 		eventsDir     = fs.String("events-dir", "", "Directory for preflight-events.jsonl and preflight-coverage.json (the directory above, when this one is named events: a run's shards directory); required unless -out is given.")
 		out           = fs.String("out", "", "Events file to write instead of -events-dir.")
 		coverageOut   = fs.String("coverage-out", "", "Where to write preflight-coverage.json; default <events-dir>/preflight-coverage.json.")
-		probesPerNode = fs.Int("probes-per-node", 2, "Probes a round starts per node of a domain; the round holds them until all are placed.")
-		imageConc     = fs.Int("image-concurrency", 4, "Images a domain warms at once; node_slots in the plan caps it at node_slots / probes-per-node.")
+		probesPerNode = fs.Int("probes-per-node", 2, "Probes a round starts per node of a domain; the round holds them until all are placed. ate-env-api refuses more than its -warm-max-probes-per-node (2 unless raised).")
+		imageConc     = fs.Int("image-concurrency", 4, "Images a domain warms at once, each one WarmImage call; node_slots in the plan caps it at node_slots / probes-per-node, and ate-env-api's per-node cap makes calls beyond it wait for slots.")
 		maxRounds     = fs.Int("max-rounds", 3, "Rounds per (image, domain) before the pair is reported short.")
 		goldenTimeout = fs.Duration("golden-timeout", 30*time.Minute, "Give up on the goldens still baking once none became ready for this long.")
 		goldenPoll    = fs.Duration("golden-poll", 10*time.Second, "How often to poll a baking golden.")
-		probeTimeout  = fs.Duration("probe-timeout", 10*time.Minute, "Bound on one probe's create and first command.")
+		probeTimeout  = fs.Duration("probe-timeout", 10*time.Minute, "Bound on one probe on the server: create, resume and node read (the server deletes a probe within its own 60s).")
 		images        = fs.String("images", "", "Comma-separated images to restrict the pass to; default every image of the plan.")
 		domains       = fs.String("domains", "", "Comma-separated domains to restrict the pass to; default every domain of the plan.")
 	)

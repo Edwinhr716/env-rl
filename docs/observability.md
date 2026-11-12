@@ -216,6 +216,7 @@ NeMo Gym rollout benchmark (`integrations/nemo-gym/benchmarks/rollout_bench.py`,
 |---|---|
 | `preflight` | the backend's connectivity, permission and capacity checks |
 | `plan` | sizing the run: one entry per image, resolving its template |
+| `preflight_images` | `FleetConfig(preflight=True)`: the whole image pre-flight, from `setup()` or `run()`, before the pools |
 | `ensure_template` | resolving or creating the template for an image, once per image |
 | `preflight_template` | `PreflightWarmer` (the Go loader's event): ensuring an image's derived template, which starts its golden bake |
 | `preflight_golden` | `PreflightWarmer`: from an image's template being ensured to its golden snapshot settling (ready, none, failed, or given up) |

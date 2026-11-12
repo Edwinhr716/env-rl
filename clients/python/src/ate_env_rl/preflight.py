@@ -29,12 +29,14 @@ first boot of an image on a node is a restore, not a pull::
 
 It ensures each image's derived template, which starts the golden bake, then
 warms every domain in parallel: as soon as an image's golden has settled it
-creates probe environments with the domain's worker selector, round after
-round, until every node of the domain has run the image once. A probe's first
-command returns when the layers and the golden snapshot are on its node; the
-node is read back and the probe deleted. The coverage report has the same
-shape as the Go loader's ``preflight-coverage.json`` (``schema_version: v1``),
-so ``swebench-loader report -preflight-coverage`` reads it.
+runs one ate-env-api ``WarmImage`` call for the image in the domain
+(``Client.warm_image``), in which the server creates probe environments with
+the domain's worker selector, round after round, until every node of the
+domain has run the image once; a probe is held until it runs, so the layers
+and the golden snapshot are on its node, its node is read and it is deleted.
+The coverage report has the same shape as the Go loader's
+``preflight-coverage.json`` (``schema_version: v1``), so ``swebench-loader
+report -preflight-coverage`` reads it.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import pathlib
 import re
 import secrets
@@ -54,25 +57,33 @@ from typing import Any
 import grpc
 
 from .client import DEFAULT_ATESPACE, Client
-from .errors import (
-    FailedPreconditionError,
-    InvalidArgumentError,
-    NotFoundError,
-    PermissionDeniedError,
-)
+from .config import warm_knob_error
+from .errors import SandboxUnavailableError
 from .observability import Observer
-from .types import GoldenSnapshotState, ImageStatus, PlacementDomain
+from .types import GoldenSnapshotState, ImageStatus, PlacementDomain, WarmProbe
 
 logger = logging.getLogger("ate_env_rl.preflight")
 
 SCHEMA_VERSION = "v1"
 
 _RUN_ID = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+# ate-env-api's limit on a WarmImage run id: the pass's run id plus the
+# -<domain>-<image>-<attempt> indexes it appends must fit. _MAX_WARM_ATTEMPTS
+# bounds the repeats of a cut-off call (and the attempt index to one digit).
 _MAX_RUN_ID = 20
+_MAX_WARM_ATTEMPTS = 9
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
-# A probe delete on a loaded node can take minutes; the Go loader gives a
-# cleanup ten minutes (run.go cleanupTimeout), and so does this.
-_DELETE_TIMEOUT = 600.0
+# The gRPC codes a control plane under load hands out for a while; a warm
+# call that ends in one is repeated.
+_TRANSIENT = frozenset(
+    (
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.UNKNOWN,
+        grpc.StatusCode.INTERNAL,
+        grpc.StatusCode.ABORTED,
+    )
+)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +224,9 @@ class ImageCoverage:
     rounds: int = 0
     complete: bool = False
     error: str = ""
-    # Probe environments whose delete failed; they hold a slot until swept.
+    # Probe environments whose delete failed, and the probes a warm call
+    # streamed before it broke off (their delete is the server's and was
+    # never confirmed); they hold a slot until swept.
     undeleted_probes: list[str] = field(default_factory=list)
     # Time the image's rounds waited for probe slots held by other passes,
     # when the warmer reports it (ate-env-api's WarmImage does).
@@ -342,34 +355,59 @@ class PreflightWarmer:
     """Fills the node caches an image placement plan describes.
 
     Args:
-        client: the ``Client`` to drive; the probes are created, run and
-            deleted through it.
+        client: the ``Client`` to drive: the warmer calls its
+            ``image_status`` and ``warm_image``; ate-env-api creates, runs
+            and deletes the probes.
         plan: the ``ImagePlacement`` (or its ``image-placement.json`` as a
             dict) to fill.
         atespace: the atespace of the probes and the derived templates.
         template_name, template_atespace: the base template the derived
             templates come from; the server's defaults when None.
-        run_id: the prefix of the probe environment names (at most 20
-            characters, ``[a-z0-9-]``). Empty gives ``pf-<6 random characters>``,
-            unique per pass, so two passes in one atespace never share a
-            probe name.
+        run_id: the prefix of the probe environment names: the pass appends
+            the domain and image indexes in the plan, in base 36, and the
+            attempt (``-<domain>-<image>-<attempt>``), the server the round and the
+            slot, and a call's whole run id is at most 20 characters of
+            ``[a-z0-9-]``. Empty gives ``pf-<6 random
+            characters>``, unique per pass, so two passes in one atespace
+            never share a probe name.
         probes_per_node: how many probes a round starts per node of a
             domain; a round holds its probes until all are placed, so the
-            scheduler spreads them.
-        image_concurrency: how many images a domain warms at once, each with
-            its own rounds; a domain's ``node_slots`` caps it at
-            ``node_slots // probes_per_node``.
+            scheduler spreads them. A domain whose ``node_slots`` is below
+            it gets ``node_slots`` probes per node. 1 to 8; ate-env-api
+            also refuses more than its ``-warm-max-probes-per-node`` (2
+            unless raised), which shows as short pairs with that reason.
+        image_concurrency: how many images a domain warms at once, each its
+            own ``warm_image`` call with its own rounds; a domain's
+            ``node_slots`` caps it at ``node_slots // probes_per_node``.
+            Across calls ate-env-api caps the probes in flight per node of
+            one worker selector, so calls beyond that cap wait for slots on
+            the server; the coverage's ``waited_ms`` sums the wait.
         max_rounds: the rounds per (image, domain) before the pair is
-            reported short.
+            reported short; 1 to 10, the most ate-env-api takes.
         golden_timeout: seconds; give up on the goldens still baking once
             none became ready or failed for that long.
         golden_poll: seconds between polls of the baking goldens.
-        probe_timeout: seconds; bounds one probe's create, first command and
-            node read together.
+        golden_wait: False does not wait for a golden that is still baking
+            once its template is ensured: the image is probed at once (its
+            probes boot cold and fill the nodes' layer caches; the golden
+            keeps baking on the server) and its golden is recorded as
+            ``pending``, so the coverage is not ``complete``.
+        probe_without_golden: False leaves out the probes of an image whose
+            golden is not ready (failed, or still pending after the wait):
+            its pairs are reported short with the error ``golden not
+            ready``. True, the default, probes it anyway, for the layer
+            caches.
+        probe_timeout: seconds; bounds one probe on the server: create,
+            resume and node read (the delete has the server's own bound,
+            60 s). A call the control plane cuts off
+            is repeated, with its own run id, for as long again (at most
+            nine attempts). At least a microsecond, the wire's unit.
         ensure_width: how many templates are ensured, and later polled, at once.
         images, domains: restrict the pass to those of the plan.
         observer: records the phases ``ensure_template``, ``preflight_golden``
             and ``preflight_probe``; None records nothing.
+        backend: the ``backend`` label those phases carry (``substrate`` when
+            a fleet runs the pass; ``-`` for a pass of its own).
     """
 
     def __init__(
@@ -386,12 +424,15 @@ class PreflightWarmer:
         max_rounds: int = 3,
         golden_timeout: float = 30 * 60,
         golden_poll: float = 10.0,
+        golden_wait: bool = True,
+        probe_without_golden: bool = True,
         probe_timeout: float = 10 * 60,
         ensure_width: int = 8,
         images: Sequence[str] | None = None,
         domains: Sequence[str] | None = None,
         observer: Observer | None = None,
         plan_path: str = "",
+        backend: str = "-",
     ):
         self.client = client
         self.plan = plan if isinstance(plan, ImagePlacement) else ImagePlacement.from_dict(plan)
@@ -406,10 +447,18 @@ class PreflightWarmer:
                 f"run_id {run_id!r} must match {_RUN_ID.pattern} and be at most {_MAX_RUN_ID} characters"
             )
         self.run_id = run_id
+        # Backoff of a repeated warm call, seconds; tests shorten it.
+        self._retry_backoff = 2.0
+        # What ate-env-api refuses is refused here: a refused warm call only
+        # shows as a short pair, after the goldens were waited for.
+        bad = warm_knob_error(
+            probes_per_node, max_rounds, probe_timeout,
+            names=("probes_per_node", "max_rounds", "probe_timeout"),
+        )
+        if bad:
+            raise ValueError(bad)
         for name, value in (
-            ("probes_per_node", probes_per_node),
             ("image_concurrency", image_concurrency),
-            ("max_rounds", max_rounds),
             ("ensure_width", ensure_width),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -417,23 +466,34 @@ class PreflightWarmer:
         for name, value in (
             ("golden_timeout", golden_timeout),
             ("golden_poll", golden_poll),
-            ("probe_timeout", probe_timeout),
         ):
-            if value <= 0:
-                raise ValueError(f"{name} must be > 0, got {value!r}")
+            # As FleetConfig: a bool is not a number of seconds, and a string
+            # is a ValueError here, not a TypeError from the comparison.
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a finite number > 0, got {value!r}")
+        for name, value in (
+            ("golden_wait", golden_wait),
+            ("probe_without_golden", probe_without_golden),
+        ):
+            # No bool(): that turns "false" into True.
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a bool, got {value!r}")
         self.probes_per_node = probes_per_node
         self.image_concurrency = image_concurrency
         self.max_rounds = max_rounds
         self.golden_timeout = golden_timeout
         self.golden_poll = golden_poll
+        self.golden_wait = golden_wait
+        self.probe_without_golden = probe_without_golden
         self.probe_timeout = probe_timeout
         self.ensure_width = ensure_width
         self.observer = observer
-        for d in self.plan.domains:
-            if d.node_slots and probes_per_node > d.node_slots:
-                raise ValueError(
-                    f"{probes_per_node} probes per node exceed the {d.node_slots} node slots of domain {d.name}"
-                )
+        self.backend = backend
         for name in domains or ():
             if self.plan.domain(name) is None:
                 raise ValueError(f"the plan has no domain {name!r}")
@@ -452,6 +512,21 @@ class PreflightWarmer:
         ]
         if not self._images:
             raise ValueError("no image of the pass is placed in its domains")
+        # The longest run id a call of this pass sends: the highest plan
+        # indexes among the pass's own domains and images, not the plan's, so
+        # a subset of a large plan is not refused for pairs it never warms.
+        in_pass = set(self._images)
+        longest = _warm_run_id(
+            run_id,
+            max(i for i, d in enumerate(self.plan.domains) if d.name in held),
+            max(i for i, e in enumerate(self.plan.images) if e.image in in_pass),
+            _MAX_WARM_ATTEMPTS,
+        )
+        if len(longest) > _MAX_RUN_ID:
+            raise ValueError(
+                f"run_id {run_id!r} with the domain, image and attempt indexes the pass appends "
+                f"({longest}) exceeds the {_MAX_RUN_ID} characters ate-env-api takes; use a shorter one"
+            )
         self._goldens: dict[str, _Golden] = {}
         self._changed = asyncio.Event()
         self._progress = 0.0
@@ -479,12 +554,14 @@ class PreflightWarmer:
         probe the pass could not delete does not raise either: check
         ``clean`` (``complete`` and no ``undeleted_probes``) and
         ``shortfall()``. A cancelled run stops its golden
-        poller, deletes the probes in flight, and re-raises; what it covered
-        until then stays in ``coverage``: the domains that finished, the
-        domains cut part-way with the images they covered and the ones in
-        flight marked ``cancelled``, the probes a cancelled round could not
-        delete under ``undeleted_probes``, and the goldens it was still
-        waiting for recorded as ``pending`` with the error ``cancelled``.
+        poller, ends the ``warm_image`` calls in flight (the server deletes
+        their probes) and re-raises; what it covered until then stays in
+        ``coverage``: the domains that finished, the domains cut part-way
+        with the images they covered and the ones in flight marked
+        ``cancelled`` (with the probes the stream had reported), and the
+        goldens it was still waiting for recorded as ``pending`` with the
+        error ``cancelled``. A cancelled call reports no coverage, so the
+        probes it could not delete are not listed; the server sweeps them.
         """
         now = time.monotonic()
         coverage = PreflightCoverage(
@@ -498,6 +575,16 @@ class PreflightWarmer:
         domain_tasks: list[asyncio.Task[DomainCoverage]] = []
         try:
             await self._ensure_templates()
+            if not self.golden_wait:
+                # No wait: what the ensure left baking is settled as pending
+                # here, so its probes start at once and the poller has
+                # nothing to do.
+                for img in self._pending():
+                    self._settle(
+                        img,
+                        GoldenRecord(image=img, state="pending", error="golden not waited for"),
+                        False,
+                    )
             poller = asyncio.create_task(self._poll_goldens())
             domain_tasks = [asyncio.create_task(self._cover_domain(d)) for d in self._domains]
             try:
@@ -567,6 +654,10 @@ class PreflightWarmer:
         rec = GoldenRecord(
             image=img, template=st.template.name, tag=st.golden_tag, error=st.golden_error
         )
+        # Kept for a golden that settles later without a status (not waited
+        # for, given up on, cancelled): its record still names the template.
+        known = self._goldens[img].record
+        known.template, known.tag = st.template.name or known.template, st.golden_tag or known.tag
         if st.golden == GoldenSnapshotState.READY:
             rec.state = "ready"
             self._settle(img, rec, True)
@@ -588,6 +679,8 @@ class PreflightWarmer:
         if golden.settled:
             return
         now = time.monotonic()
+        rec.template = rec.template or golden.record.template
+        rec.tag = rec.tag or golden.record.tag
         rec.wait_ms = max(0.0, (now - golden.ensured) * 1000.0)
         golden.settled, golden.ok, golden.record = True, ok, rec
         self._progress = now
@@ -596,7 +689,10 @@ class PreflightWarmer:
         self._changed = asyncio.Event()
         if self.observer is not None:
             self.observer.record_phase(
-                "preflight_golden", rec.wait_ms / 1000.0, status="ok" if ok else "error"
+                "preflight_golden",
+                rec.wait_ms / 1000.0,
+                backend=self.backend,
+                status="ok" if ok else "error",
             )
         if not ok:
             logger.warning("preflight: golden of %s not ready: %s %s", img, rec.state, rec.error)
@@ -626,9 +722,12 @@ class PreflightWarmer:
 
         try:
             while pending := self._pending():
-                await asyncio.sleep(self.golden_poll)
+                # No sleep beyond the deadline: with golden_timeout below
+                # golden_poll the wait ends at the timeout, after one last poll.
+                left = self._progress + self.golden_timeout - time.monotonic()
+                await asyncio.sleep(max(0.0, min(self.golden_poll, left)))
                 await asyncio.gather(*(poll(img) for img in pending))
-                if time.monotonic() - self._progress > self.golden_timeout:
+                if time.monotonic() - self._progress >= self.golden_timeout:
                     for img in self._pending():
                         self._settle(
                             img,
@@ -647,10 +746,18 @@ class PreflightWarmer:
 
     # -- coverage ----------------------------------------------------------
 
+    def _probes_for(self, d: PlacementDomain) -> int:
+        """The probes per node for the domain: ``probes_per_node``, bounded by
+        the domain's ``node_slots`` when the plan has it, so a small pool
+        bounds its own probes and no other domain's."""
+        if d.node_slots:
+            return max(1, min(self.probes_per_node, d.node_slots))
+        return self.probes_per_node
+
     def _image_width(self, d: PlacementDomain) -> int:
         k = self.image_concurrency
         if d.node_slots:
-            k = min(k, d.node_slots // self.probes_per_node)
+            k = min(k, d.node_slots // self._probes_for(d))
         return max(k, 1)
 
     async def _cover_domain(self, d: PlacementDomain) -> DomainCoverage:
@@ -668,10 +775,13 @@ class PreflightWarmer:
 
         async def cover(k: int, ii: int, image: str) -> None:
             async with sem:
-                # The coverage object is registered before the rounds, so a
+                # The coverage object is registered before the call, so a
                 # cancel leaves what the image covered until then in place.
                 ic = ImageCoverage(image=image, wanted=d.nodes)
                 covs[k] = ic
+                if not self.probe_without_golden and not self._goldens[image].ok:
+                    ic.error = "golden not ready"
+                    return
                 await self._cover_image(d, ii, image, ic)
 
         try:
@@ -695,10 +805,10 @@ class PreflightWarmer:
                 if isinstance(r, BaseException):
                     raise r
         except asyncio.CancelledError:
-            # The images still running finish their probes' deletes before
-            # this re-raises; a task that was already cancelled through the
-            # gather above is not cancelled again. What the domain covered
-            # until then is kept for the report.
+            # The calls still running end before this re-raises (the server
+            # deletes their probes); a task that was already cancelled
+            # through the gather above is not cancelled again. What the
+            # domain covered until then is kept for the report.
             for t in tasks:
                 if not t.done():
                     t.cancel()
@@ -742,148 +852,148 @@ class PreflightWarmer:
     async def _cover_image(
         self, d: PlacementDomain, ii: int, image: str, ic: ImageCoverage
     ) -> None:
-        """Rounds of probes for one image in one domain until every node of
-        the domain has run it or the rounds run out, filling ``ic`` as it
-        goes, so a cancel leaves the nodes covered and the probes a round
-        could not delete in it."""
-        nodes: set[str] = set()
-        width = d.nodes * self.probes_per_node
-        di = self._domains.index(d)
-        try:
-            for rnd in range(1, self.max_rounds + 1):
-                if len(nodes) >= d.nodes:
-                    break
-                ic.rounds = rnd
-                # Create and wait for every probe of the round before deleting
-                # any, so they occupy distinct slots while the scheduler places
-                # the rest. A probe whose delete fails lands in
-                # ic.undeleted_probes, also when the round is cancelled.
-                outcomes = await asyncio.gather(
-                    *(
-                        self._probe(
-                            f"{self.run_id}-{di}-{ii}-{rnd}-{k}", image, d, ic.undeleted_probes
-                        )
-                        for k in range(width)
-                    ),
-                    return_exceptions=True,
-                )
-                for outcome in outcomes:
-                    if isinstance(outcome, BaseException):
-                        # _probe reports its own errors; this is a cancel or
-                        # a bug, and the round cannot be scored.
-                        raise outcome
-                    node, err = outcome
-                    ic.probes += 1
-                    if err:
-                        ic.failed += 1
-                        ic.error = err
-                    else:
-                        nodes.add(node)
-                if ic.failed == ic.probes:
-                    # Nothing of this round came up: the image, the domain or
-                    # the cluster is the problem, and more rounds would not
-                    # change it.
-                    logger.warning(
-                        "preflight: every probe of %s in %s failed: %s", image, d.name, ic.error
-                    )
-                    break
-        finally:
-            ic.nodes = sorted(nodes)
+        """One ``warm_image`` call for the image in the domain, filling ``ic``:
+        the server runs the rounds of probes until every node of the domain
+        has run the image or the rounds run out, and reports the coverage. A
+        call the control plane cuts off (Unavailable, DeadlineExceeded,
+        Unknown, Internal, Aborted) is repeated with a backoff for up to
+        ``probe_timeout`` and ``_MAX_WARM_ATTEMPTS`` attempts, unless its
+        stream showed every node already; each attempt sends its own run id,
+        so the probes of a broken call that an api server restart left
+        behind never share a name with the repeat's. The pair's coverage
+        sums its attempts. A call that ends in an error, or a cancel, counts
+        with what its stream showed (the server sends its coverage only at
+        the end), and the probes a call streamed before an error are listed
+        in ``undeleted_probes``: the server deletes them when it can, and
+        the call that would have said so never ended."""
+        di = self.plan.domains.index(d)
+        # The pair's coverage is the sum of its attempts: the nodes are the
+        # union, the counters add up. An attempt that ended in an error
+        # counts with what its stream showed, a clean one with the server's
+        # coverage. ``done`` holds the attempts that ended, ``att`` the one
+        # in flight as its stream shows it.
+        seen: set[str] = set()
+        done = {"probes": 0, "failed": 0, "rounds": 0}
+        att: dict[str, Any] = {}
+        undeleted: list[str] = []
+        waited = 0.0
+
+        def fill() -> None:
+            ic.nodes = sorted(seen)
+            ic.probes = done["probes"] + att["probes"]
+            ic.failed = done["failed"] + att["failed"]
+            ic.rounds = done["rounds"] + att["rounds"]
             ic.complete = len(ic.nodes) >= d.nodes
-            ic.undeleted_probes.sort()
+            ic.undeleted_probes = sorted(undeleted)
+            ic.waited_ms = waited * 1000.0
 
-    async def _probe(
-        self, env_id: str, image: str, d: PlacementDomain, stuck: list[str]
-    ) -> tuple[str, str]:
-        """One probe: create in the domain, run the first command, read the
-        node, delete; ``probe_timeout`` bounds the three steps together.
-        Returns (node, error); a probe whose delete failed and is still there
-        is appended to ``stuck``, also when the probe was cancelled."""
-        holder: list[Any] = []  # the handle once created, for the delete
-        node = ""
-        error = ""
-        try:
-            with self._phase("preflight_probe"):
-                node = await asyncio.wait_for(
-                    self._probe_steps(env_id, image, d, holder), self.probe_timeout
+        def on_probe(p: WarmProbe) -> None:
+            if self.observer is not None:
+                self.observer.record_phase(
+                    "preflight_probe",
+                    p.duration,
+                    backend=self.backend,
+                    status="error" if p.error else "ok",
                 )
-        except asyncio.CancelledError:
-            await self._delete_through_cancel(env_id, holder[0] if holder else None, stuck)
-            raise
-        except asyncio.TimeoutError:
-            error = f"probe not ready after {self.probe_timeout:g}s"
-        except Exception as e:
-            error = str(e)
-            if not holder and _create_refused(e):
-                # The server made nothing: the name belongs to another pass or
-                # to a user (AlreadyExists), or the request was bad. Deleting
-                # by id here would take someone else's environment.
-                return node, error
-        await self._delete_through_cancel(env_id, holder[0] if holder else None, stuck)
-        return node, error
+            att["ids"].append(p.id)
+            att["probes"] += 1
+            att["rounds"] = max(att["rounds"], p.round)
+            if p.error:
+                att["failed"] += 1
+                ic.error = p.error
+            elif p.node:
+                seen.add(p.node)
+            # Kept current, so a cancel leaves what the stream showed.
+            ic.probes = done["probes"] + att["probes"]
+            ic.failed = done["failed"] + att["failed"]
+            ic.rounds = done["rounds"] + att["rounds"]
 
-    async def _probe_steps(
-        self, env_id: str, image: str, d: PlacementDomain, holder: list[Any]
-    ) -> str:
-        env = await self.client.create(
-            env_id,
-            atespace=self.atespace,
-            template_name=self.template_name,
-            template_atespace=self.template_atespace,
-            rootfs_image=image,
-            worker_selector=d.selector,
-        )
-        holder.append(env)
-        # The first command returns once the restore finished: the layers and
-        # the golden snapshot are on the node by then.
-        result = await env.shell("true", timeout=self.probe_timeout)
-        if result.exit_code != 0:
-            raise RuntimeError(f"first command exited {result.exit_code}")
-        info = await self.client.get(env_id, atespace=self.atespace)
-        if not info.node:
-            raise RuntimeError("the environment reports no node")
-        return info.node
-
-    async def _delete_through_cancel(self, env_id: str, env: Any, stuck: list[str]) -> bool:
-        """Delete the probe and wait for it even if this task is cancelled
-        again meanwhile, so a cancel mid-round strands nothing; the delete's
-        own timeout bounds the wait. True when the probe is gone. A probe
-        whose delete failed is appended to ``stuck`` by the delete itself,
-        so a cancel that lands as the delete ends (re-raised here, with no
-        return value) does not lose it."""
-        delete = asyncio.ensure_future(self._delete(env_id, env, stuck))
+        wait = self._retry_backoff
+        give_up: float | None = None
+        attempt = 0
         while True:
+            attempt += 1
+            att.update(ids=[], probes=0, failed=0, rounds=0)
             try:
-                return await asyncio.shield(delete)
+                cov = await self.client.warm_image(
+                    image,
+                    worker_selector=d.selector,
+                    nodes=d.nodes,
+                    probes_per_node=self._probes_for(d),
+                    max_rounds=self.max_rounds,
+                    probe_timeout=self.probe_timeout,
+                    run_id=_warm_run_id(self.run_id, di, ii, attempt),
+                    atespace=self.atespace,
+                    template_name=self.template_name,
+                    template_atespace=self.template_atespace,
+                    on_probe=on_probe,
+                )
             except asyncio.CancelledError:
-                if delete.done():
-                    raise
-                # Keep waiting for the delete; the cancel is re-raised by the
-                # caller once the probe is gone.
+                # The server is there and deletes the call's probes.
+                fill()
+                raise
+            except Exception as e:
+                # The server deletes a round's probes after it streamed them
+                # and names the ones it could not delete in the coverage this
+                # call never sent; an api server that restarted left them
+                # all. The pass cannot tell, so every probe the call streamed
+                # is listed.
+                undeleted.extend(att["ids"])
+                fill()
+                ic.error = str(e)
+                # The stream can have shown every node before the call broke:
+                # the pair is covered, and a repeat would only boot the image
+                # again.
+                # Every line about a cut-off call names the call's run id:
+                # its probes are <run id>-<round>-<slot>, and when the api
+                # server restarted nothing else records them.
+                call = (image, d.name, _warm_run_id(self.run_id, di, ii, attempt), attempt)
+                if ic.complete:
+                    logger.warning(
+                        "preflight: warm call for %s in %s (run id %s, attempt %d) cut off after "
+                        "its stream showed every node, not repeated; its probes may be left: %s",
+                        *call, e,
+                    )
+                    return
+                if not _transient(e):
+                    return
+                now = time.monotonic()
+                if give_up is None:
+                    give_up = now + self.probe_timeout
+                # The repeats last until give_up, not until a whole backoff
+                # no longer fits before it: the wait is cut to what is left.
+                if attempt >= _MAX_WARM_ATTEMPTS or now >= give_up:
+                    logger.warning(
+                        "preflight: warm call for %s in %s (run id %s, attempt %d) cut off, giving "
+                        "up; the probes of the cut-off calls may be left: %s",
+                        *call, e,
+                    )
+                    return
+                for key in done:
+                    done[key] += att[key]
+                att.update(ids=[], probes=0, failed=0, rounds=0)
+                logger.warning(
+                    "preflight: warm call for %s in %s (run id %s, attempt %d) cut off, repeating: %s",
+                    *call, e,
+                )
+                await asyncio.sleep(min(wait, give_up - now))
+                wait = min(wait * 2, 5 * self._retry_backoff)
                 continue
-
-    async def _delete(self, env_id: str, env: Any, stuck: list[str]) -> bool:
-        """Delete the probe; True when it is gone (deleted, or never there).
-        A probe the delete left in place is appended to ``stuck``."""
-        try:
-            # A create that failed client-side may exist server-side, so the
-            # delete goes by id when there is no handle.
-            await asyncio.wait_for(
-                env.delete() if env is not None else self.client.delete(env_id, atespace=self.atespace),
-                _DELETE_TIMEOUT,
-            )
-            return True
-        except NotFoundError:
-            return True
-        except Exception as e:
-            logger.warning("preflight: delete of %s failed: %s", env_id, e)
-            stuck.append(env_id)
-            return False
+            seen.update(cov.nodes)
+            att.update(probes=cov.probes, failed=cov.failed, rounds=cov.rounds)
+            undeleted.extend(cov.undeleted_probes)
+            waited += cov.waited
+            fill()
+            if attempt == 1:
+                # A clean call alone is complete when the server says so.
+                ic.complete = cov.complete and ic.complete
+            ic.error = cov.error
+            return
 
     def _phase(self, name: str) -> Any:
         if self.observer is None:
             return _NoPhase()
-        return self.observer.phase(name)
+        return self.observer.phase(name, backend=self.backend)
 
 
 async def _await_all(tasks: list[asyncio.Task[Any]]) -> None:
@@ -899,36 +1009,42 @@ async def _await_all(tasks: list[asyncio.Task[Any]]) -> None:
             continue
 
 
+def _base36(n: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while True:
+        n, r = divmod(n, 36)
+        out = digits[r] + out
+        if n == 0:
+            return out
+
+
+def _warm_run_id(run_id: str, domain: int, image: int, attempt: int) -> str:
+    """The run id of one ``warm_image`` call: the pass's run id with the plan
+    indexes of the domain and the image and the attempt. The indexes are in
+    base 36 (0-9, a-z): with the default ``pf-<6>`` run id that leaves seven
+    characters for the two, enough for 46,656 domains with 1,679,616 images
+    (decimal ran out at 351 domains with 36,841 images). ``warmRunID`` in the
+    Go loader writes the same names."""
+    return f"{run_id}-{_base36(domain)}-{_base36(image)}-{attempt}"
+
+
 def _new_run_id() -> str:
     """``pf-`` and six random characters, as ate-env-api's ``WarmImage`` does."""
     alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
     return "pf-" + "".join(secrets.choice(alphabet) for _ in range(6))
 
 
-_REFUSED = frozenset(
-    (
-        grpc.StatusCode.ALREADY_EXISTS,
-        grpc.StatusCode.INVALID_ARGUMENT,
-        grpc.StatusCode.FAILED_PRECONDITION,
-        grpc.StatusCode.PERMISSION_DENIED,
-        grpc.StatusCode.UNAUTHENTICATED,
-        # No room: ate-env-api's create is one CreateActor call, and the
-        # control plane says no before anything exists.
-        grpc.StatusCode.RESOURCE_EXHAUSTED,
-    )
-)
-
-
-def _create_refused(e: BaseException) -> bool:
-    """True when a failed create made no environment: the server refused it
-    (the name exists, a bad argument, a missing or conflicting template, no
-    permission, no room). A create that was cut off may still have landed."""
-    if isinstance(e, (InvalidArgumentError, PermissionDeniedError, FailedPreconditionError)):
+def _transient(e: BaseException) -> bool:
+    """True when a warm call ended in a failure a control plane under load
+    hands out for a while (the api server restarting, a deadline, an
+    internal or aborted call): the call is repeated."""
+    if isinstance(e, SandboxUnavailableError):
         return True
     # The SDK's RpcError carries the status as an attribute; a raw grpc error
     # has it as a method.
     code = e.code() if isinstance(e, grpc.RpcError) else getattr(e, "code", None)
-    return code in _REFUSED
+    return code in _TRANSIENT
 
 
 class _NoPhase:

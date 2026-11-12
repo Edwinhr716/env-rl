@@ -82,8 +82,10 @@ type ImageCoverage struct {
 	Complete bool `json:"complete"`
 	// Error is the last probe error when the image could not be covered.
 	Error string `json:"error,omitempty"`
-	// UndeletedProbes lists the probe environments whose delete failed; they
-	// hold a slot until someone sweeps them. Absent when none.
+	// UndeletedProbes lists the probe environments whose delete failed, and
+	// the probes a WarmImage call streamed before it broke off (their delete
+	// is the server's and was never confirmed); they hold a slot until
+	// someone sweeps them. Absent when none.
 	UndeletedProbes []string `json:"undeleted_probes,omitempty"`
 	// WaitedMS is how long the image's rounds waited for probe slots held by
 	// other passes. Only ate-env-api's WarmImage reports a wait, so the

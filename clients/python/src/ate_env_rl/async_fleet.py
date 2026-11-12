@@ -28,6 +28,7 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from .config import FleetConfig
+from .errors import PreflightError
 from .fleet import SandboxFleet
 from .handle import SandboxHandle
 from .observability import Observer, RunReport, repo_family
@@ -115,6 +116,11 @@ class AsyncSandboxFleet:
     def image_counts(self) -> dict[str, int]:
         return self._fleet.image_counts()
 
+    @property
+    def preflight_coverage(self) -> Any:
+        """The image pre-flight's coverage (``FleetConfig.preflight``), set by ``setup()`` or ``run()``."""
+        return self._fleet.preflight_coverage
+
     # --- Awaitable Lifecycle Methods ---
     async def preflight(self) -> None:
         if hasattr(self.backend, "preflight_async"):
@@ -126,10 +132,40 @@ class AsyncSandboxFleet:
     async def plan(self) -> FleetPlan:
         return await asyncio.to_thread(self._fleet.plan)
 
+    async def _preflight_images(self, report: Any) -> None:
+        """``FleetConfig.preflight`` for the async fleet (see
+        ``SandboxFleet._preflight_images``), on this loop when the backend
+        has ``preflight_images_async``; a pass ``setup()`` made for the same
+        images is not repeated by ``run()``."""
+        if not hasattr(self.backend, "preflight_images_async"):
+            await asyncio.to_thread(self._fleet._preflight_images, report)
+            return
+        fleet = self._fleet
+        images = fleet._preflight_image_list()
+        if fleet._preflight_reused(images, report):
+            return
+        fleet.preflight_coverage = None
+        fleet._preflight_for = None
+        try:
+            with self.observer.phase("preflight_images", backend=self._backend_label):
+                coverage = await self.backend.preflight_images_async(
+                    images, observer=self.observer, **fleet._preflight_knobs()
+                )
+        except PreflightError as e:
+            # As SandboxFleet._preflight_images: record the refused pass.
+            fleet._record_preflight(report, e.coverage)
+            raise
+        fleet._preflight_for = frozenset(images)
+        fleet._record_preflight(report, coverage)
+
     async def setup(self, tasks: list[Any] | None = None) -> AsyncSandboxFleet:
         if tasks is not None:
             self._fleet.load_tasks(tasks)
         await self.preflight()
+        # The image pre-flight comes before the pools: a pool filled first
+        # would boot on cold nodes.
+        if self.config.preflight and self._fleet.tasks:
+            await self._preflight_images(None)
         plan = await self.plan()
         await self._warm_many(
             [(e.image, e.template_id, e.rootfs_image, e.replicas) for e in plan.entries],
@@ -421,6 +457,8 @@ class AsyncSandboxFleet:
                     await asyncio.to_thread(self.backend.reap, self._fleet.run_id)
         finally:
             self.observer.warm_reset()
+            # The next setup() or run() warms again.
+            self._fleet._preflight_for = None
 
     # --- Async Context Manager ---
     async def __aenter__(self) -> AsyncSandboxFleet:
@@ -464,7 +502,10 @@ class AsyncSandboxFleet:
         The run's RunReport is available as ``fleet.report`` afterwards;
         ``fleet.report.summary()`` gives the table (logged only at DEBUG). It
         holds the phases that run inside ``run()`` (``acquire``, ``process``,
-        ``release``, and ``ensure_template`` on first use of an image).
+        ``release``, ``ensure_template`` on first use of an image, and with
+        ``FleetConfig(preflight=True)`` the image pre-flight's
+        ``preflight_images``, ``preflight_golden`` and ``preflight_probe``
+        when ``setup()`` did not run it first).
         ``setup()`` and ``teardown()`` (``async with fleet:``) run outside
         it: their phases go to the Prometheus series and spans, not to the
         report.
@@ -528,6 +569,13 @@ class AsyncSandboxFleet:
         with obs.run(strategy, backend=backend) as report:
             self._fleet.report = report
             report.environment = self._fleet.describe_environment(concurrency=max(1, c))
-            await asyncio.gather(*(_worker(i, t) for i, t in enumerate(tasks)))
+            try:
+                if self.config.preflight:
+                    await self._preflight_images(report)
+                await asyncio.gather(*(_worker(i, t) for i, t in enumerate(tasks)))
+            finally:
+                # As in SandboxFleet.run(): the pass is spent when the run ends.
+                if self.config.preflight:
+                    self._fleet._preflight_spent()
         logger.debug("\n%s", report.summary())
         return results

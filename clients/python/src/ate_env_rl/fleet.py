@@ -28,8 +28,10 @@ from .backend.base import BackendDriver
 from .backend.mock import MockBackendDriver
 from .backend.substrate import SubstrateBackendDriver
 from .config import ALLOWED_BACKENDS, FleetConfig, TracerConfig
+from .errors import PreflightError
 from .handle import SandboxHandle
 from .observability import Observer, RunReport, repo_family
+from .preflight import PreflightCoverage
 from .runtime.base import RuntimeGuestHook
 from .sizing import plan_replicas
 from .sources import FieldSpec, TaskSource, to_tasks
@@ -99,6 +101,14 @@ class SandboxFleet:
         # tracer (None when tracing is off) is the fleet's; no second tracer.
         self._tracer = self._obs.tracer
         self.report: RunReport | None = None  # set by run()
+        # The image pre-flight's coverage (FleetConfig.preflight), set by
+        # setup() or run(); None when the backend had nothing to warm.
+        # _preflight_for is the image set the last pass covered, so run()
+        # does not repeat a pass setup() made for the same tasks, whatever
+        # the pass returned. A run() keeps it for the next run() only when
+        # the coverage is complete, and teardown() clears it.
+        self.preflight_coverage: PreflightCoverage | None = None
+        self._preflight_for: frozenset[str] | None = None
 
         # Initialize Backend Driver
         if driver is not None:
@@ -343,6 +353,10 @@ class SandboxFleet:
         if tasks is not None:
             self.load_tasks(tasks)
         self.preflight()
+        # The image pre-flight comes before the pools: a pool filled first
+        # would boot on cold nodes.
+        if self.config.preflight and self._tasks:
+            self._preflight_images(None)
         plan = self.plan()
         self._warm_many(
             [(e.image, e.template_id, e.rootfs_image, e.replicas) for e in plan.entries],
@@ -609,6 +623,8 @@ class SandboxFleet:
                 self.backend.reap(self.run_id)
         finally:
             self._obs.warm_reset()
+            # The next setup() or run() warms again.
+            self._preflight_for = None
 
     def run(self, process_fn: Callable[[Task, SandboxHandle], Any],
             concurrency: int | None = None) -> list[Any]:
@@ -624,9 +640,126 @@ class SandboxFleet:
         with self._obs.run(self.config.strategy, backend=self.backend_label) as report:
             self.report = report
             report.environment = self.describe_environment(concurrency=max(1, c))
-            results = strat_fn(self, process_fn, max(1, c))
+            try:
+                if self.config.preflight:
+                    self._preflight_images(report)
+                # The strategy can call setup() (naive does): the pass stays
+                # reusable until the strategy ends, so setup() does not make
+                # a second one when this one was short or had nothing to warm.
+                results = strat_fn(self, process_fn, max(1, c))
+            finally:
+                if self.config.preflight:
+                    self._preflight_spent()
         logger.debug("\n%s", report.summary())
         return results
+
+    def _preflight_images(self, report: RunReport | None) -> PreflightCoverage | None:
+        """``FleetConfig.preflight``: put the loaded tasks' images on the nodes
+        their environments can land on, before the pools and the strategy,
+        through the backend's ``preflight_images`` (the Substrate driver's
+        goes through ate-env-api's ``WarmImage``; the mock has nothing to
+        warm). The coverage lands in ``preflight_coverage`` and, from
+        ``run()``, in the run report; an incomplete one is logged, and the run
+        goes on with cold first boots where it is short. A pass ``setup()``
+        made for the same images is not repeated by ``run()``."""
+        images = self._preflight_image_list()
+        if self._preflight_reused(images, report):
+            return self.preflight_coverage
+        self.preflight_coverage = None
+        self._preflight_for = None
+        try:
+            with self._obs.phase("preflight_images", backend=self.backend_label):
+                coverage = self.backend.preflight_images(
+                    images, observer=self._obs, **self._preflight_knobs()
+                )
+        except PreflightError as e:
+            # A pass that refuses the run (preflight_golden="fail") still
+            # warmed nodes and can have left probes: record what it did.
+            self._record_preflight(report, e.coverage)
+            raise
+        self._preflight_for = frozenset(images)
+        self._record_preflight(report, coverage)
+        return coverage
+
+    def _preflight_knobs(self) -> dict[str, Any]:
+        """The ``FleetConfig.preflight_*`` knobs as the keyword arguments of
+        the backend's ``preflight_images``."""
+        c = self.config
+        return {
+            "probes_per_node": c.preflight_probes_per_node,
+            "max_rounds": c.preflight_rounds,
+            "probe_timeout_s": c.preflight_probe_timeout_s,
+            "golden_timeout_s": c.preflight_golden_timeout_s,
+            "golden": c.preflight_golden,
+        }
+
+    def _preflight_reused(self, images: list[str], report: RunReport | None) -> bool:
+        """True when the last pass was for these images, so this one is not
+        made: also when that pass had nothing to warm (no coverage). The
+        coverage it left, if any, goes into the report."""
+        if self._preflight_for != frozenset(images):
+            return False
+        if report is not None and self.preflight_coverage is not None:
+            self._record_preflight(report, self.preflight_coverage, log=False)
+        return True
+
+    def _preflight_spent(self) -> None:
+        """After run() used a pass: only a complete coverage is kept for the
+        next run(). A short pass, or one with nothing to warm, is made again
+        then, since the cluster can have changed (pools back, goldens
+        ready)."""
+        coverage = self.preflight_coverage
+        if coverage is None or not coverage.complete:
+            self._preflight_for = None
+
+    def _preflight_image_list(self) -> list[str]:
+        """The images the pre-flight warms: those of the loaded tasks whose
+        creates send a rootfs image. A task with ``Task.template`` creates
+        from that template and sends no image, so its image is left out;
+        the backend drops the ones routed through ``image_templates`` and
+        the unpinned ones."""
+        with self._lock:
+            tasks = list(self._tasks)
+        return list(dict.fromkeys(t.image for t in tasks if not t.template))
+
+    def _record_preflight(
+        self, report: RunReport | None, coverage: PreflightCoverage | None, *, log: bool = True
+    ) -> None:
+        self.preflight_coverage = coverage
+        if coverage is None:
+            return
+        summary = {
+            "run_id": coverage.run_id,
+            "complete": coverage.complete,
+            "clean": coverage.clean,
+            "shortfall": coverage.shortfall(),
+            "images": sum(len(d.images) for d in coverage.domains),
+            "domains": len(coverage.domains),
+            "undeleted_probes": list(coverage.undeleted_probes),
+            # Time the pass's calls waited for probe slots other passes held.
+            "waited_ms": sum(ic.waited_ms for d in coverage.domains for ic in d.images),
+            "goldens_not_ready": sum(1 for g in coverage.goldens if not g.settled),
+        }
+        if report is not None:
+            report.environment.setdefault(self.backend_label, {})["preflight"] = summary
+        if not log:
+            return
+        if coverage.clean:
+            logger.info(
+                "image pre-flight complete: %d (image, domain) pairs over %d domains",
+                summary["images"], summary["domains"],
+            )
+        elif coverage.complete:
+            logger.warning(
+                "image pre-flight complete, but %d probes were left undeleted and hold a node "
+                "slot each until swept with ate-env delete: %s",
+                len(coverage.undeleted_probes), ", ".join(coverage.undeleted_probes),
+            )
+        else:
+            logger.warning(
+                "image pre-flight incomplete; the run pays cold first boots where it is short: %s",
+                coverage.shortfall(),
+            )
 
     def describe_environment(self, concurrency: int | None = None) -> dict[str, dict[str, Any]]:
         """The run's environment block for the RunReport, keyed by backend."""

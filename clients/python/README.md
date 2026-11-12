@@ -563,7 +563,65 @@ routed through `image_templates` or `Task.template` sends no image, thus only
 `node_selector` applies to it. `client.get(id).node` reports the node an
 environment landed on.
 
+`FleetConfig(preflight=True)` warms those pools before the run: `run()` puts
+every loaded task's digest-pinned image on every node of the pools its creates
+can land on (the base template's pools, narrowed by `node_selector` and the
+image's `placement` labels), through ate-env-api's `WarmImage`, before the
+strategy starts, so the run's first boot of an image on a node is a restore,
+not a pull. It is the `PreflightWarmer` below with the plan built from the
+fleet's own configuration; a task with `Task.template`, an image routed
+through `image_templates` and an image not pinned by digest send no rootfs
+image and are skipped. A pool whose nodes run fewer environments than the
+two probes per node bounds the probes. ate-env-api needs the global viewer
+binding (`ate-env manifest access-policy --global`) to list the pools;
+without it, or when the listing fails after two repeats of a transient
+failure, `run()` raises `PreflightError` before any task runs.
+A pass that `setup()` made is not made again by the `run()` that follows it
+for the same images, whatever it returned. `teardown()` ends that, and so
+does a `run()` whose coverage is not complete: the next `run()` warms again.
+A `run()` makes one pass at most: the `setup()` that the `naive` strategy
+calls inside `run()` uses the pass of that `run()`, also a short one.
+An incomplete pre-flight is logged and the run goes on with cold first boots
+where it is short: the coverage is `fleet.preflight_coverage`, and the run
+report carries its summary under `environment.substrate.preflight` and the
+phases `preflight_images`, `ensure_template`, `preflight_golden` and
+`preflight_probe`. The summary also has `waited_ms`, the time the pass's
+calls waited for probe slots that other passes held, and
+`goldens_not_ready`.
+
+The pre-flight waits for each image's golden snapshot (up to 30 minutes
+without progress), so a run over many new images starts late. Five knobs on
+`FleetConfig` change the pass; they do nothing without `preflight=True`:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `preflight_probes_per_node` | `2` | Probes one round starts per node of a pool, 1 to 8. A pool's `node_slots` bounds it. ate-env-api refuses a value above its `-warm-max-probes-per-node` (2 unless raised): each warm call then fails, and the pairs are reported short with that reason. |
+| `preflight_rounds` | `3` | Rounds per (image, pool) before the pair is reported short, 1 to 10. |
+| `preflight_probe_timeout_s` | `600` | Budget of one probe on the server: create, resume, node read (the delete has the server's own 60 s). At least a microsecond, at most 315,576,000,000 (the range of a protobuf `Duration`). |
+| `preflight_golden_timeout_s` | `1800` | How long the pass waits for the goldens while none becomes ready or fails. The wait ends at this time, also when it is shorter than the 10 s between polls. |
+| `preflight_golden` | `"wait"` | `"wait"`: wait for each golden, then probe the image whether or not the golden is ready. `"skip"`: do not wait; probe at once, so the layers are on the nodes and the goldens keep baking (the coverage is not `complete`). `"fail"`: wait; do not probe an image whose golden is not ready, and raise `PreflightError` before any task runs when one is not. |
+
+With `"fail"` the error comes at the end of the pass, so the images whose
+goldens are ready are on their nodes by then; the error's `coverage`
+attribute is the pass's `PreflightCoverage` (None on a `PreflightError`
+that no pass made, such as a missing viewer binding). The fleet records that
+coverage as it does for a pass that returns: in `fleet.preflight_coverage`,
+in the run report, and as a warning that names the probes left undeleted.
+An image list too large for one pass (10,000 images with the default run
+id) is warmed in batches, and each batch has its own golden wait. With
+`"fail"` the pass stops at the first batch that has an unready golden, and
+the error says how many images it left out.
+
+```python
+FleetConfig(strategy="sliding", preflight=True, node_selector={"ate-env/workerpool": "c4"})
+FleetConfig(strategy="sliding", preflight=True, preflight_golden="skip", preflight_rounds=5)
+```
+
 ### Warm the nodes before a run with `PreflightWarmer`
+
+`FleetConfig(preflight=True)` (above) runs this from `SandboxFleet.run()`; use
+the class directly for a plan from `swebench-loader plan-placement`, a pass
+ahead of the job, or a caller that drives `acquire` and `release` itself.
 
 An image's first boot on a node pulls and unpacks the image and fetches the
 golden snapshot; the boots after it restore in seconds. `PreflightWarmer` pays
@@ -592,20 +650,36 @@ asyncio.run(main())
 
 It ensures each image's derived template (`client.image_status(ensure=True)`),
 which starts the golden bake, then warms every domain in parallel: as soon as
-an image's golden is ready it creates probe environments with the domain's
-worker selector, round after round, until every node of the domain has run
-the image once. A domain warms `image_concurrency` (4) images at once; a
-domain's `node_slots`, when the plan has it, caps that at `node_slots //
-probes_per_node`. Each probe's first command returns when the layers and the
-golden snapshot are on its node; the node is read back with `client.get()` and
-the probe deleted. `golden_timeout` (30 min) gives up on the goldens still
+an image's golden is ready it runs one `client.warm_image()` call for the
+image in the domain, in which ate-env-api creates probe environments with the
+domain's worker selector, round after round, until every node of the domain
+has run the image once, holding each probe until it runs (the layers and the
+golden snapshot are on its node by then), reading its node and deleting it. A
+domain warms `image_concurrency` (4) images at once; a domain's `node_slots`,
+when the plan has it, caps that at `node_slots // probes_per_node`; across
+calls ate-env-api caps the probes in flight per node of one worker selector
+(`-warm-max-probes-per-node`, 2 unless raised, also the most it takes for
+`probes_per_node`), so calls beyond the cap wait for slots on the server and
+the coverage's `waited_ms` sums the wait. A call the control plane cuts off
+is repeated with its own run id, for up to `probe_timeout` and nine attempts,
+unless its stream showed every node already; a pair's coverage is the sum of
+its attempts. The server deletes the probes of a call that broke when it can,
+but it holds a call's probes in memory only: an `ate-env-api` that restarted
+under the call leaves them. The pass cannot tell, so it lists every probe a
+broken call streamed under `undeleted_probes`, and each warning about a
+cut-off call carries the call's run id (its probes are
+`<run id>-<round>-<slot>`; the ones not yet streamed are in no list). `run_id`
+with the `-<domain>-<image>-<attempt>` indexes the pass appends (the plan
+indexes of the pairs the pass warms, in base 36) is at most 20
+characters. `golden_timeout` (30 min) gives up on the goldens still
 baking once none became ready or failed for that long; a template with goldens disabled
 is recorded as `none` and warmed by cold boots.
 
 `PreflightCoverage` is the result: per image the golden's state, per domain
 the nodes seen and per image the nodes covered, probes, rounds and failures;
 `complete` says whether the run can expect warm first boots everywhere. A
-probe whose delete failed is listed under its image's `undeleted_probes` (and
+probe whose delete failed, or that a call streamed before it broke off, is
+listed under its image's `undeleted_probes` (and
 in `coverage.undeleted_probes`, which `shortfall()` names): it holds a node
 slot until swept with `ate-env delete`. `run()` returns normally then and
 `complete` stays `True`; gate on `coverage.clean`, which is `complete` with
@@ -675,7 +749,7 @@ pip install './clients/python[tracing,metrics]'
 
 **Run report** (always on, no dependency). After `fleet.run(...)`,
 `fleet.report` is a `RunReport` with per-phase count, total and max
-(`preflight`, `plan`, `ensure_template`, `preflight_golden`, `preflight_probe`, `warm_pool`, `acquire`,
+(`preflight`, `plan`, `preflight_images`, `ensure_template`, `preflight_golden`, `preflight_probe`, `warm_pool`, `acquire`,
 `process`, `recycle`, `release`, `teardown`), claims, task outcomes and
 warm replicas:
 
@@ -704,7 +778,9 @@ while one is in progress raises `RuntimeError`.
 
 `AsyncSandboxFleet.run` also fills `fleet.report`, but only with the phases
 inside `run()`: `acquire`, `process`, `release` (and `ensure_template` on the
-first use of an image). With `async with fleet:`, `setup()` and `teardown()`
+first use of an image; with `FleetConfig(preflight=True)`, `preflight_images`,
+`preflight_golden` and `preflight_probe` when `setup()` did not run the
+pre-flight first). With `async with fleet:`, `setup()` and `teardown()`
 run outside `run()`, so their `preflight`, `plan`, `warm_pool` and `teardown`
 phases go to the Prometheus series and spans but not to the report. The sync
 `SandboxFleet.run` does setup and teardown inside the run, so its report has

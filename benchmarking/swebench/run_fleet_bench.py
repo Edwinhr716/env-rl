@@ -30,6 +30,7 @@ import dataclasses
 import datetime
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -110,11 +111,16 @@ def parse_duration_s(raw: str) -> float:
         raise ValueError("empty duration")
     try:
         val = float(s)
+    except ValueError:
+        val = None
+    if val is not None:
+        # float() takes "nan", "inf" and "1e999"; a duration is finite, and
+        # nan passes every "<= 0" check made later.
+        if not math.isfinite(val):
+            raise ValueError(f"invalid duration {raw!r}")
         if val < 0:
             raise ValueError(f"negative duration: {raw!r}")
         return val
-    except ValueError:
-        pass
 
     pos = 0
     total_s = 0.0
@@ -132,7 +138,7 @@ def parse_duration_s(raw: str) -> float:
             raise ValueError(f"invalid duration {raw!r}")
         pos = m.end()
         total_s += float(m.group(1)) * units[m.group(2)]
-    if pos != len(s):
+    if pos != len(s) or not math.isfinite(total_s):
         raise ValueError(f"invalid duration {raw!r}")
     return total_s
 
@@ -1039,6 +1045,27 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Path to write v1 TraceEvent JSONL lines (implies --enable-tracing).",
     )
+    p.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Put every task image on every node of the base template's pools before the run "
+        "(FleetConfig.preflight, through ate-env-api's WarmImage; needs the global viewer binding). "
+        "The coverage summary is in the fleet report (--fleet-report-out).",
+    )
+    p.add_argument(
+        "--preflight-probes-per-node", type=int, default=2,
+        help="Pre-flight: probes started per node in one round (1 to 8; ate-env-api refuses more than its -warm-max-probes-per-node).",
+    )
+    p.add_argument("--preflight-rounds", type=int, default=3, help="Pre-flight: rounds per (image, pool) before the pair is short (1 to 10).")
+    p.add_argument("--preflight-probe-timeout", default="10m", help="Pre-flight: budget of one probe on the server (e.g. 10m).")
+    p.add_argument("--preflight-golden-timeout", default="30m", help="Pre-flight: wait for the golden snapshots while none settles (e.g. 30m).")
+    p.add_argument(
+        "--preflight-golden",
+        default="wait",
+        choices=("wait", "skip", "fail"),
+        help="Pre-flight: wait for each golden snapshot, then probe; skip the wait and probe at once; "
+        "or fail the run before any task when a golden is not ready.",
+    )
     p.add_argument("--dry-run", action="store_true", help="Validate plan and flags, print JSON summary, and exit.")
     return p
 
@@ -1134,6 +1161,11 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
         )
     if args.connections < 1:
         raise ValueError(f"--connections must be >= 1, got {args.connections}")
+    # ate-env-api's WarmImage bounds: checked here, so --dry-run refuses them.
+    if not 1 <= args.preflight_probes_per_node <= 8:
+        raise ValueError(f"--preflight-probes-per-node must be between 1 and 8, got {args.preflight_probes_per_node}")
+    if not 1 <= args.preflight_rounds <= 10:
+        raise ValueError(f"--preflight-rounds must be between 1 and 10, got {args.preflight_rounds}")
 
     op_labels = parse_kv_flags(args.label, "--label")
     for k in op_labels:
@@ -1144,6 +1176,19 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
     set_vars = parse_kv_flags(args.set_vars, "--set")
 
     create_timeout_s = parse_duration_s(args.create_timeout)
+    preflight_probe_timeout_s = parse_duration_s(args.preflight_probe_timeout)
+    preflight_golden_timeout_s = parse_duration_s(args.preflight_golden_timeout)
+    if preflight_probe_timeout_s <= 0 or preflight_golden_timeout_s <= 0:
+        raise ValueError("--preflight-probe-timeout and --preflight-golden-timeout must be above zero")
+    if preflight_probe_timeout_s < 1e-6:
+        # The wire carries whole microseconds: less is zero, which ate-env-api refuses.
+        raise ValueError(f"--preflight-probe-timeout must be at least 1us, got {args.preflight_probe_timeout}")
+    if preflight_probe_timeout_s > 315_576_000_000:
+        # The range of a protobuf Duration. FleetConfig refuses more, but only
+        # after --out is open (and truncated).
+        raise ValueError(
+            f"--preflight-probe-timeout must be at most 315576000000s, got {args.preflight_probe_timeout}"
+        )
     step_timeout_s = parse_duration_s(args.step_timeout)
     wake_budget_s = parse_duration_s(args.wake_budget)
     wake_backoff_s = parse_duration_s(args.wake_backoff)
@@ -1235,6 +1280,7 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
         "trajectory": plan.get("trajectory_names", args.trajectory),
         "out": str(out_path),
         "tracing": tracing_enabled,
+        "preflight": bool(args.preflight),
     }
     if trace_out_path is not None:
         plan_summary["trace_out"] = str(trace_out_path)
@@ -1322,6 +1368,12 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
             ready_timeout_s=create_timeout_s,
             step_timeout_s=step_timeout_s,
             run_id=run_id,
+            preflight=args.preflight,
+            preflight_probes_per_node=args.preflight_probes_per_node,
+            preflight_rounds=args.preflight_rounds,
+            preflight_probe_timeout_s=preflight_probe_timeout_s,
+            preflight_golden_timeout_s=preflight_golden_timeout_s,
+            preflight_golden=args.preflight_golden,
             observability=sdk.ObservabilityConfig(
                 enable_metrics=False, enable_tracing=tracing_enabled
             ),

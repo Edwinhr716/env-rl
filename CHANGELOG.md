@@ -25,6 +25,49 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- Pre-flight knobs on `FleetConfig` (they apply with `preflight=True`):
+  `preflight_probes_per_node` (2, at most 8), `preflight_rounds` (3, at most
+  10), `preflight_probe_timeout_s` (600, at least a microsecond and at most
+  315,576,000,000),
+  `preflight_golden_timeout_s` (1800) and
+  `preflight_golden`: `"wait"` (the default, as before), `"skip"` (no golden
+  wait: the images are probed at once and the goldens keep baking) or
+  `"fail"` (an image whose golden is not ready is not probed and `run()`
+  raises `PreflightError` before any task; the error's `coverage` is the
+  pass's `PreflightCoverage`, which the fleet also records in
+  `fleet.preflight_coverage` and the run report). `PreflightError` has a
+  `coverage` attribute (None unless a pass set it) that survives pickling.
+  `FleetConfig` and `PreflightWarmer` refuse the values that ate-env-api's
+  `WarmImage` refuses (more than 8 probes per node, more than 10 rounds, a
+  probe timeout below a microsecond), which until now showed only as a short
+  coverage, and `PreflightWarmer` refuses a bool or a string for
+  `golden_timeout` and `golden_poll` and a value that is not a bool for
+  `golden_wait` and `probe_without_golden`; `swebench-loader preflight` refuses the same `-probes-per-node`
+  and `-max-rounds`. `PreflightWarmer` gains
+  `golden_wait` and `probe_without_golden`. The golden wait of both warmers
+  ends at its timeout also when that is shorter than the poll interval (it
+  ended at the next poll, 10 s by default). The run report's pre-flight
+  summary gains `waited_ms` (time spent waiting for probe slots other passes
+  held) and `goldens_not_ready`. `benchmarking/swebench/run_fleet_bench.py`
+  gains `--preflight` and `--preflight-probes-per-node`, `--preflight-rounds`,
+  `--preflight-probe-timeout`, `--preflight-golden-timeout`,
+  `--preflight-golden`.
+- `FleetConfig(preflight=True)`: `SandboxFleet.run()` and
+  `AsyncSandboxFleet.run()` put every loaded task's digest-pinned image on
+  every node of the pools their environments can land on (the base template's pools,
+  narrowed by `node_selector` and the image's `placement` labels) through
+  ate-env-api's `WarmImage`, before the strategy starts. The coverage is
+  `fleet.preflight_coverage`; the run report carries its summary under the
+  backend's `environment` block and the phases `preflight_images`,
+  `ensure_template`, `preflight_golden` and `preflight_probe`. An incomplete
+  pre-flight is logged and the run goes on; without the global viewer
+  binding (`ate-env manifest access-policy --global`) `run()` raises
+  `PreflightError` up front (a transient failure of the pool listing is
+  repeated twice first). Tasks with `Task.template`, images routed through
+  `image_templates` and images not pinned by digest are skipped; a pool's
+  `node_slots` bounds the probes per node. `BackendDriver.preflight_images()` is the
+  hook (the mock backend has nothing to warm). The Kind E2E grants the
+  binding and runs a `sliding` fleet with the flag on.
 - `swebench-loader plan-placement` takes the output of
   `ate-env placement-domains --template <base> --json` as its `-domains`
   file: `workers` and `worker_namespace` are kept in the plan (and read by
@@ -253,11 +296,12 @@ user needs to know across them.
 - `swebench-loader preflight`, the PreflightWarmer: from an image placement
   plan, ensures each image's derived template, then per domain, as each
   golden becomes ready, probes every node of the domain with the image
-  (creates placed by the domain's worker selector, node read back) until
+  (one `WarmImage` call per image and domain, see Changed) until
   each node has run it, `-image-concurrency` images at once;
   `preflight-events.jsonl` and `preflight-coverage.json`. `EnvBackend` gains
-  `CreateWith(CreateOptions{WorkerSelector})`, `Node`, `ImageStatus` and
-  `EnsureImageTemplate` (the `ImageWarmer` interface); `domains.json` takes
+  `CreateWith(CreateOptions{WorkerSelector})`, `Node`, `ImageStatus`,
+  `EnsureImageTemplate` and `WarmImage` (the last three are the
+  `ImageWarmer` interface); `domains.json` takes
   an optional `node_slots` per domain.
 - ate-env-api: `GetImageStatus` and `EnsureImageTemplate`, the ActorTemplate
   derived for a `rootfs_image` and the state of its golden snapshot (`NONE`,
@@ -284,7 +328,8 @@ user needs to know across them.
 - Python client: `ate_env_rl.PreflightWarmer` fills the node caches an image
   placement plan (`ImagePlacement`, from `image-placement.json`) describes:
   ensures each image's derived template, then per domain, as each golden
-  becomes ready, probes every node with the image and deletes the probes;
+  becomes ready, probes every node with the image through `warm_image()`
+  (see Changed);
   `PreflightCoverage` writes `preflight-coverage.json` in the loader's schema.
   `Observer.record_phase()` and the phases `preflight_golden`,
   `preflight_probe`.
@@ -367,6 +412,30 @@ user needs to know across them.
   installed from its checkout and imported on first use.
 
 ### Changed
+- `swebench-loader preflight` and `ate_env_rl.PreflightWarmer` warm the nodes
+  through `ate-env-api`'s `WarmImage`, one call per (image, domain), instead
+  of creating, running and deleting the probes themselves. The server's
+  retries, per-node cap across calls (`-warm-max-probes-per-node`, which
+  also bounds `-probes-per-node` / `probes_per_node`) and `undeleted_probes`
+  now apply to both, the coverage's `waited_ms` is filled, and a call the
+  control plane cuts off is repeated with its own run id, for up to the
+  probe timeout from the first failure and nine attempts, unless its stream
+  showed every node already. A pair's coverage is the sum of its attempts
+  (the nodes of all, the counters added up). The server holds a call's
+  probes in memory only, so an api server that restarts under a call leaves
+  them: every probe a broken call streamed is listed in `undeleted_probes`
+  (the loader's pass then exits non-zero and the Python coverage is not
+  `clean`), and each log line about a cut-off call carries the call's run
+  id, which prefixes its probes' names. The golden wait, the fan-out over
+  domains and images (`-image-concurrency`, `node_slots`), the events file
+  and the coverage file are unchanged. The pass's run id plus the
+  `-<domain>-<image>-<attempt>` indexes it appends per call (the plan
+  indexes of the pairs the pass warms, in base 36) must fit
+  ate-env-api's 20 characters; a longer one is refused up front: the default
+  run id fits 46,656 domains with 1,679,616 images. The probe timeout bounds
+  a probe's create, resume and node read; the delete has the server's own
+  60 s. The pre-flight needs an
+  `ate-env-api` with the `warm_image` feature (every release since #235).
 
 - Python client: `server.address` drops a `dns:///` or `passthrough:///`
   scheme, as the Go client does.
@@ -488,17 +557,18 @@ user needs to know across them.
 - `preflight-coverage.json` (schema v1) gains two optional fields per image,
   `undeleted_probes` and `waited_ms`, the ones `WarmImage`'s coverage already
   carries. `swebench-loader preflight` and `ate_env_rl.PreflightWarmer` list
-  the probes whose delete failed there instead of only logging them, so an
+  the probes whose delete failed there (and the probes of a call that broke
+  before it reported its deletes) instead of only logging them, so an
   operator has the list to sweep. The loader's pass exits non-zero naming
   them even when the coverage is complete; the Python `run()` returns
   normally with `complete` still `True`, and `PreflightCoverage.clean`
   (`complete` and no `undeleted_probes`) is the flag to gate a run on;
   `shortfall()` names the leftovers in both.
 - `swebench-loader preflight` and `ate_env_rl.PreflightWarmer` no longer delete an
-  environment whose name a probe collided with: a create the server refused
-  (`AlreadyExists`, a bad argument, a missing template, no permission, no
-  room) made nothing and is left alone; only a create that was cut off is
-  deleted by id. The default run id is `pf-<6 random characters>`, unique per
+  environment whose name a probe collided with: the probes are `WarmImage`'s,
+  which reports a name that exists as a failed probe and leaves it alone
+  (the warmers create and delete nothing themselves).
+  The default run id is `pf-<6 random characters>`, unique per
   pass, as `WarmImage`'s is, instead of the fixed `pf`.
 
 - `bench run -overlay`: every behavioral overlay field now takes effect.

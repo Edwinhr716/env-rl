@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"io"
 	"maps"
 	"net"
@@ -27,7 +28,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +38,7 @@ import (
 
 	env "github.com/agent-substrate/env/clients/go"
 	"github.com/agent-substrate/env/guest"
+	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
@@ -127,6 +131,200 @@ type fakeAPI struct {
 	// inflight and maxInflight count the environments alive per domain.
 	inflight, maxInflight map[string]int
 	onCreate              func(id string)
+
+	// WarmImage: warmHold keeps a round's probes alive that long before the
+	// fake deletes them (so concurrent calls overlap); warmUnavailableFirst
+	// is how many calls fail with Unavailable before any event; warmFail,
+	// when set, fails every call with it; warmCalls counts the calls and
+	// warmRequests keeps the ones that ran.
+	warmHold             time.Duration
+	warmUnavailableFirst int
+	warmFail             error
+	warmCalls            int
+	warmRequests         []*ateenvv1alpha.WarmImageRequest
+	// warmCutAfterCreates is how many calls end with Unavailable right after
+	// their first round's creates, leaving the probes in place, as an api
+	// server restart does.
+	warmCutAfterCreates int
+	// warmMaxProbesPerNode is the fake's -warm-max-probes-per-node: a
+	// request's probes_per_node above it is refused. 0 is the server's
+	// default, 2.
+	warmMaxProbesPerNode int
+}
+
+// fakeWarmRunID is ate-env-api's warmRunIDPattern.
+var fakeWarmRunID = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// warmRefusal is what ate-env-api's WarmImage refuses before it creates a
+// probe (parseWarmOptions and the checks after it in
+// internal/apiservice/placement.go), in the server's order and with its
+// messages; nil for a request the server takes. listed is the distinct nodes
+// behind the request's selector, 0 when the fake has none for it: the nodes
+// are then trusted, as when the server may not list workers.
+func (f *fakeAPI) warmRefusal(req *ateenvv1alpha.WarmImageRequest, listed int) error {
+	maxPerNode := f.warmMaxProbesPerNode
+	if maxPerNode <= 0 {
+		maxPerNode = apiservice.DefaultWarmMaxProbesPerNode
+	}
+	perNode := int(req.GetProbesPerNode())
+	switch {
+	case req.GetRootfsImage() == "":
+		return status.Error(codes.InvalidArgument, "rootfs_image is required")
+	case req.GetNodes() < 0:
+		return status.Error(codes.InvalidArgument, "nodes must be >= 0")
+	case perNode < 0 || perNode > apiservice.MaxWarmProbesPerNode:
+		return status.Errorf(codes.InvalidArgument, "probes_per_node must be between 1 and %d", apiservice.MaxWarmProbesPerNode)
+	case perNode > maxPerNode:
+		return status.Errorf(codes.InvalidArgument, "probes_per_node %d exceeds the %d probes per node this server runs on one worker selector at once (ate-env-api -warm-max-probes-per-node)", perNode, maxPerNode)
+	case req.GetMaxRounds() < 0 || req.GetMaxRounds() > apiservice.MaxWarmRounds:
+		return status.Errorf(codes.InvalidArgument, "max_rounds must be between 1 and %d", apiservice.MaxWarmRounds)
+	case req.GetProbeTimeout() != nil && req.GetProbeTimeout().AsDuration() <= 0:
+		return status.Error(codes.InvalidArgument, "probe_timeout must be positive")
+	case req.GetRunId() != "" && (len(req.GetRunId()) > 20 || !fakeWarmRunID.MatchString(req.GetRunId())):
+		return status.Errorf(codes.InvalidArgument, "run_id must match %s and be at most 20 characters", fakeWarmRunID)
+	}
+	if perNode == 0 {
+		perNode = min(apiservice.DefaultWarmProbesPerNode, maxPerNode)
+	}
+	wanted := int(req.GetNodes())
+	if listed > 0 {
+		if wanted > listed {
+			return status.Errorf(codes.InvalidArgument, "nodes %d exceeds the %d nodes the selector's workers run on", wanted, listed)
+		}
+		if wanted == 0 {
+			wanted = listed
+		}
+	}
+	if wanted*perNode > apiservice.MaxWarmProbes {
+		return status.Errorf(codes.InvalidArgument, "%d nodes x %d probes per node exceed the %d probes a round may start", wanted, perNode, apiservice.MaxWarmProbes)
+	}
+	return nil
+}
+
+// WarmImage mirrors ate-env-api's: a request the server refuses is refused
+// (warmRefusal), then rounds of nodes x probes_per_node probes
+// named <run>-<round>-<slot>, created through CreateEnvironment (so the
+// fake's create knobs apply), held for warmHold, deleted through
+// DeleteEnvironment (so deleteFail lists them undeleted); a probe event per
+// probe, then the coverage. A name that exists already fails the probe and
+// is not deleted. A cancelled call deletes what it created and ends in
+// Canceled.
+func (f *fakeAPI) WarmImage(req *ateenvv1alpha.WarmImageRequest, stream grpc.ServerStreamingServer[ateenvv1alpha.WarmImageEvent]) error {
+	f.mu.Lock()
+	f.warmCalls++
+	if f.warmFail != nil {
+		f.mu.Unlock()
+		return f.warmFail
+	}
+	if f.warmUnavailableFirst > 0 {
+		f.warmUnavailableFirst--
+		f.mu.Unlock()
+		return status.Error(codes.Unavailable, "api server restarting")
+	}
+	domain := req.GetWorkerSelector()["ate-env/domain"]
+	distinct := map[string]bool{}
+	for _, n := range f.domainNodes[domain] {
+		distinct[n] = true
+	}
+	if err := f.warmRefusal(req, len(distinct)); err != nil {
+		f.mu.Unlock()
+		return err
+	}
+	f.warmRequests = append(f.warmRequests, req)
+	wanted := int(req.GetNodes())
+	if wanted == 0 {
+		wanted = len(distinct)
+	}
+	maxPerNode := f.warmMaxProbesPerNode
+	hold := f.warmHold
+	f.mu.Unlock()
+	if wanted == 0 {
+		return status.Errorf(codes.FailedPrecondition, "no active worker matches the selector %v", req.GetWorkerSelector())
+	}
+	perNode := int(req.GetProbesPerNode())
+	if perNode == 0 {
+		perNode = apiservice.DefaultWarmProbesPerNode
+		if maxPerNode > 0 {
+			perNode = min(perNode, maxPerNode)
+		}
+	}
+	rounds := int(req.GetMaxRounds())
+	if rounds == 0 {
+		rounds = 3
+	}
+	runID := req.GetRunId()
+	if runID == "" {
+		runID = "warm-fake"
+	}
+	ctx := stream.Context()
+	covered := map[string]bool{}
+	cov := &ateenvv1alpha.WarmImageCoverage{Wanted: int32(wanted)}
+	for round := 1; round <= rounds && len(covered) < wanted && ctx.Err() == nil; round++ {
+		cov.Rounds = int32(round)
+		var created []string
+		started, failed := 0, 0
+		for k := 0; k < wanted*perNode && ctx.Err() == nil; k++ {
+			id := fmt.Sprintf("%s-%d-%d", runID, round, k)
+			started++
+			cov.Probes++
+			probe := &ateenvv1alpha.WarmProbe{Id: id, Round: int32(round), Duration: durationpb.New(5 * time.Millisecond)}
+			_, err := f.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
+				Id: id, Atespace: req.GetAtespace(), Template: req.GetTemplate(), RootfsImage: req.GetRootfsImage(), WorkerSelector: req.GetWorkerSelector(),
+			})
+			if err != nil {
+				probe.Error = err.Error()
+			} else {
+				created = append(created, id)
+				f.mu.Lock()
+				probe.Node = f.nodes[id]
+				f.mu.Unlock()
+				if probe.Node == "" {
+					probe.Error = "running but the control plane reports no node"
+				}
+			}
+			if probe.Error != "" {
+				failed++
+				cov.Failed++
+				cov.Error = probe.Error
+			} else {
+				covered[probe.Node] = true
+			}
+			_ = stream.Send(&ateenvv1alpha.WarmImageEvent{Event: &ateenvv1alpha.WarmImageEvent_Probe{Probe: probe}})
+		}
+		f.mu.Lock()
+		cut := f.warmCutAfterCreates > 0
+		if cut {
+			f.warmCutAfterCreates--
+		}
+		f.mu.Unlock()
+		if cut {
+			return status.Error(codes.Unavailable, "api server restarted; its probes stay")
+		}
+		if hold > 0 {
+			select {
+			case <-time.After(hold):
+			case <-ctx.Done():
+			}
+		}
+		for _, id := range created {
+			// As the server does: a delete that answers NotFound is gone.
+			if _, err := f.DeleteEnvironment(context.Background(), &ateenvv1alpha.DeleteEnvironmentRequest{Id: id, Atespace: req.GetAtespace()}); err != nil && status.Code(err) != codes.NotFound {
+				cov.UndeletedProbes = append(cov.UndeletedProbes, id)
+			}
+		}
+		if started > 0 && failed == started {
+			break
+		}
+	}
+	if ctx.Err() != nil {
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	for n := range covered {
+		cov.Nodes = append(cov.Nodes, n)
+	}
+	sort.Strings(cov.Nodes)
+	cov.Complete = len(covered) >= wanted
+	return stream.Send(&ateenvv1alpha.WarmImageEvent{Event: &ateenvv1alpha.WarmImageEvent_Coverage{Coverage: cov}})
 }
 
 func (f *fakeAPI) GetServerInfo(context.Context, *ateenvv1alpha.GetServerInfoRequest) (*ateenvv1alpha.GetServerInfoResponse, error) {

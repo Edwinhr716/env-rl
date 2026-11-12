@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import grpc
 
 __all__ = [
@@ -249,9 +251,44 @@ def _rebuild_start_error(
 
 
 class PreflightError(InfrastructureError):
-    """Raised when cluster or API connectivity verification fails."""
+    """Raised when cluster or API connectivity verification fails.
+
+    Attributes:
+        coverage: The ``PreflightCoverage`` of the image pre-flight pass that
+            raised (``FleetConfig.preflight_golden="fail"``); None otherwise.
+    """
 
     default_retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str | None = None,
+        status: str | None = None,
+        retryable: bool | None = None,
+        coverage: Any = None,
+    ):
+        super().__init__(message, sandbox_id=sandbox_id, status=status, retryable=retryable)
+        self.coverage = coverage
+
+    def __reduce__(self):
+        return (
+            _rebuild_preflight_error,
+            (str(self), self.sandbox_id, self.status, self.retryable, self.coverage),
+        )
+
+
+def _rebuild_preflight_error(
+    message: str,
+    sandbox_id: str | None,
+    status: str | None,
+    retryable: bool,
+    coverage: Any,
+) -> PreflightError:
+    return PreflightError(
+        message, sandbox_id=sandbox_id, status=status, retryable=retryable, coverage=coverage
+    )
 
 
 class CommandExecutionError(EnvError):

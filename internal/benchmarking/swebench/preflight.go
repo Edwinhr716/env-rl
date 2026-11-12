@@ -19,16 +19,15 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	env "github.com/agent-substrate/env/clients/go"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 )
 
@@ -49,25 +48,32 @@ type PreflightOptions struct {
 	// Recorder receives the events; nil records nothing.
 	Recorder *Recorder
 	Logger   *slog.Logger
-	// RunID prefixes the probe environment names (at most 20 characters).
+	// RunID prefixes the probe environment names: the pass appends the
+	// domain and image indexes in the plan (base 36) and the attempt, ate-env-api the round and
+	// the slot, and the whole run id of a call is at most 20 characters.
+	// Empty gives pf-<6 random characters>, unique per pass.
 	RunID string
 	// ProbesPerNode is how many probes a round starts per node of a domain;
 	// a round holds its probes alive until all are placed, so the scheduler
-	// spreads them. Default 2.
+	// spreads them. Default 2, at most 8; ate-env-api also refuses more
+	// than its -warm-max-probes-per-node (2 unless raised).
 	ProbesPerNode int
-	// ImageConcurrency is how many images a domain warms at once, each with
-	// its own rounds, so a domain keeps ImageConcurrency x nodes x
-	// ProbesPerNode slots busy. A domain whose plan entry has node_slots
-	// caps it at node_slots / ProbesPerNode. Default 4.
+	// ImageConcurrency is how many images a domain warms at once, each its
+	// own WarmImage call with its own rounds. A domain whose plan entry has
+	// node_slots caps it at node_slots / ProbesPerNode. Default 4. Across
+	// calls ate-env-api caps the probes in flight per node of one worker
+	// selector at -warm-max-probes-per-node, so calls beyond that cap wait
+	// for slots on the server (the coverage's waited_ms sums the wait).
 	ImageConcurrency int
-	// MaxRounds caps the rounds per (image, domain); default 3.
+	// MaxRounds caps the rounds per (image, domain); default 3, at most 10.
 	MaxRounds int
 	// GoldenTimeout gives up on the goldens still baking once none became
 	// ready or failed for that long; default 30 min. GoldenPoll is how often
 	// the baking goldens are polled; default 10 s.
 	GoldenTimeout time.Duration
 	GoldenPoll    time.Duration
-	// ProbeTimeout bounds one probe's create and first command; default 10 min.
+	// ProbeTimeout bounds one probe on the server: create, resume and node
+	// read; default 10 min. The delete has the server's own bound, 60 s.
 	ProbeTimeout time.Duration
 	// Images and Domains, when set, restrict the pass to those.
 	Images  []string
@@ -82,10 +88,11 @@ type PreflightOptions struct {
 
 // PreflightWarmer fills the node caches an image placement plan describes.
 // It ensures each image's derived template, which starts the golden bake,
-// then per domain warms images as their goldens become ready: for each
-// (image, domain) it creates probe environments with the domain's worker
-// selector, round after round, until every node of the domain has run the
-// image once, reading the node each probe landed on, and deletes them.
+// then per domain warms images as their goldens become ready: one
+// ate-env-api WarmImage call per (image, domain), in which the server
+// creates probe environments with the domain's worker selector, round after
+// round, until every node of the domain has run the image once, reading
+// the node each probe landed on, and deletes them.
 type PreflightWarmer struct {
 	opts PreflightOptions
 }
@@ -133,6 +140,14 @@ func NewPreflightWarmer(opts PreflightOptions) (*PreflightWarmer, error) {
 	if opts.EnsureWidth <= 0 {
 		opts.EnsureWidth = 8
 	}
+	// What ate-env-api's WarmImage refuses is refused here: a refused call
+	// only shows as a short pair, after the goldens were waited for.
+	if opts.ProbesPerNode > apiservice.MaxWarmProbesPerNode {
+		return nil, fmt.Errorf("preflight: %d probes per node exceed the %d ate-env-api takes", opts.ProbesPerNode, apiservice.MaxWarmProbesPerNode)
+	}
+	if opts.MaxRounds > apiservice.MaxWarmRounds {
+		return nil, fmt.Errorf("preflight: %d rounds exceed the %d ate-env-api takes", opts.MaxRounds, apiservice.MaxWarmRounds)
+	}
 	if opts.now == nil {
 		opts.now = time.Now
 	}
@@ -159,7 +174,32 @@ func NewPreflightWarmer(opts PreflightOptions) (*PreflightWarmer, error) {
 	if len(w.images()) == 0 {
 		return nil, errors.New("preflight: no image of the pass is placed in its domains")
 	}
+	// The longest run id a call of this pass sends: the highest plan indexes
+	// among the pass's own domains and images, not the plan's, so a subset
+	// of a large plan is not refused for pairs it never warms.
+	di, ii := w.highestIndexes()
+	if longest := warmRunID(opts.RunID, di, ii, maxWarmAttempts); len(longest) > warmRunIDLimit {
+		return nil, fmt.Errorf("preflight: run id %q with the domain, image and attempt indexes the pass appends (%s) exceeds the %d characters ate-env-api takes; use a shorter one", opts.RunID, longest, warmRunIDLimit)
+	}
 	return w, nil
+}
+
+// highestIndexes is the highest plan index of a domain and of an image of
+// the pass.
+func (w *PreflightWarmer) highestIndexes() (domain, image int) {
+	for _, d := range w.domains() {
+		domain = max(domain, w.domainIndex(d.Name))
+	}
+	inPass := map[string]bool{}
+	for _, img := range w.images() {
+		inPass[img] = true
+	}
+	for i, e := range w.opts.Plan.Images {
+		if inPass[e.Image] {
+			image = i
+		}
+	}
+	return domain, image
 }
 
 // Run executes the pre-flight and returns the coverage report. The error is
@@ -453,13 +493,16 @@ func (w *PreflightWarmer) pollGoldens(ctx context.Context, t *goldenTracker) {
 		if len(pending) == 0 {
 			return
 		}
+		// No sleep beyond the deadline: with GoldenTimeout below GoldenPoll
+		// the wait ends at the timeout, after one last poll.
+		sleep := min(o.GoldenPoll, max(0, o.GoldenTimeout-o.now().Sub(t.lastProgress())))
 		select {
 		case <-ctx.Done():
 			for _, img := range pending {
 				w.settleGolden(t, img, schema.GoldenRecord{Image: img, Template: t.template(img), State: "pending", Error: ctx.Err().Error()}, false)
 			}
 			return
-		case <-time.After(o.GoldenPoll):
+		case <-time.After(sleep):
 		}
 		forEach(ctx, len(pending), o.EnsureWidth, func(i int) {
 			img := pending[i]
@@ -470,7 +513,7 @@ func (w *PreflightWarmer) pollGoldens(ctx context.Context, t *goldenTracker) {
 			}
 			w.settleFromState(t, img, st, false)
 		})
-		if stalled := o.now().Sub(t.lastProgress()); stalled > o.GoldenTimeout {
+		if stalled := o.now().Sub(t.lastProgress()); stalled >= o.GoldenTimeout {
 			for _, img := range t.pending() {
 				w.settleGolden(t, img, schema.GoldenRecord{Image: img, Template: t.template(img), State: "pending", Error: fmt.Sprintf("golden still pending after %s without progress", o.GoldenTimeout)}, false)
 			}
@@ -583,142 +626,167 @@ func (w *PreflightWarmer) cover(ctx context.Context, domains []schema.PlacementD
 	return results, allOK
 }
 
-// coverImage runs rounds of probes for one image in one domain until every
-// node of the domain has run it or the rounds run out.
+// coverImage runs ate-env-api's WarmImage for one image in one domain: the
+// server runs the rounds of probes until every node of the domain has run
+// the image or the rounds run out, and reports the coverage. Each probe the
+// stream reports becomes a preflight_probe event. A call the control plane
+// cuts off (Unavailable, Unknown, DeadlineExceeded, Internal, Aborted) is
+// repeated with the wake backoff, for up to ProbeTimeout and
+// maxWarmAttempts attempts inside ctx, unless its stream showed every node
+// already; each attempt sends its own run id, so the probes of a broken
+// call that an api server restart left behind never share a name with the
+// repeat's. The pair's coverage sums its attempts. The probes a broken call
+// streamed are listed in UndeletedProbes: the server deletes them when it
+// can, and the call that would have said so never ended.
 func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.PlacementDomain, img string) schema.ImageCoverage {
 	o := w.opts
 	ic := schema.ImageCoverage{Image: img, Nodes: []string{}, Wanted: d.Nodes}
-	nodes := map[string]bool{}
-	width := d.Nodes * o.ProbesPerNode
-	for round := 1; round <= o.MaxRounds && len(nodes) < d.Nodes && ctx.Err() == nil; round++ {
-		ic.Rounds = round
-		type outcome struct {
-			id   string
-			sb   Sandbox
-			node string
-			err  error
-		}
-		outcomes := make([]outcome, width)
-		// Create and wait for every probe of the round before releasing any,
-		// so they occupy distinct slots while the scheduler places the rest.
-		forEach(ctx, width, width, func(k int) {
-			id := probeID(o.RunID, di, ii, round, k)
-			t0 := o.now()
-			pctx, cancel := context.WithTimeout(ctx, o.ProbeTimeout)
-			defer cancel()
-			var node string
-			sb, err := o.Backend.CreateWith(pctx, id, img, CreateOptions{WorkerSelector: d.Selector})
-			if err == nil {
-				// The first command returns once the restore finished: the
-				// layers and the golden snapshot are on the node by then.
-				if rerr := w.runProbe(pctx, sb); rerr != nil {
-					err = fmt.Errorf("first command: %w", rerr)
-				} else if node, err = o.Backend.Node(pctx, id); err == nil && node == "" {
-					err = errors.New("the environment reports no node")
-				}
-			}
-			w.record(Event{Event: EventPreflightProbe, Image: img, Env: id, Node: node, Attempts: round, DurMS: DurMS(o.now().Sub(t0)), OK: err == nil, Err: errString(err), Labels: map[string]string{"domain": d.Name}})
-			outcomes[k] = outcome{id: id, sb: sb, node: node, err: err}
-		})
-		started, roundFailed := 0, 0
-		for _, oc := range outcomes {
-			if oc.id == "" {
-				continue // a slot forEach never started: the context ended
-			}
-			started++
-			ic.Probes++
-			if oc.err != nil {
-				ic.Failed++
-				roundFailed++
-				ic.Error = oc.err.Error()
-			} else {
-				nodes[oc.node] = true
-			}
-		}
-		// Delete the round's probes together, each within the cleanup budget,
-		// whatever happened to ctx: a wide domain would otherwise wait on one
-		// delete after another.
-		undeleted := make([]string, width)
-		forEach(context.Background(), width, width, func(k int) {
-			oc := outcomes[k]
-			if oc.id == "" {
-				return
-			}
-			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-			defer cancel()
-			if oc.sb == nil {
-				// A create the server refused made nothing; one that was cut
-				// off may have landed, so that one is deleted by id. The
-				// distinction matters on AlreadyExists: the name belongs to
-				// another pass or to a user, and deleting it would take their
-				// environment.
-				if createRefused(oc.err) {
-					return
-				}
-				if del, ok := o.Backend.(Backend); ok {
-					if err := del.Delete(rctx, oc.id); err != nil && !errors.Is(err, env.ErrNotFound) && status.Code(err) != codes.NotFound {
-						o.Logger.Warn("preflight: delete of a cut-off create failed", slog.String("env", oc.id), slog.Any("err", err))
-						undeleted[k] = oc.id
-					}
-				}
-				return
-			}
-			if err := oc.sb.Delete(rctx); err != nil && !errors.Is(err, env.ErrNotFound) && status.Code(err) != codes.NotFound {
-				// NotFound is gone already (a first attempt the delete
-				// budget passes through unchanged); anything else leaves
-				// the probe in place.
-				o.Logger.Warn("preflight: delete failed", slog.String("env", oc.id), slog.Any("err", err))
-				undeleted[k] = oc.id
-			}
-		})
-		for _, id := range undeleted {
-			if id != "" {
-				ic.UndeletedProbes = append(ic.UndeletedProbes, id)
-			}
-		}
-		if started > 0 && roundFailed == started {
-			// Nothing of this round came up: the image, the domain or the
-			// cluster is the problem, and more rounds would not change it.
-			o.Logger.Warn("preflight: every probe of the round failed", slog.String("image", img), slog.String("domain", d.Name), slog.String("err", ic.Error))
-			break
+	opts := WarmOptions{
+		WorkerSelector: d.Selector,
+		Nodes:          d.Nodes,
+		ProbesPerNode:  o.ProbesPerNode,
+		MaxRounds:      o.MaxRounds,
+		ProbeTimeout:   o.ProbeTimeout,
+	}
+	// The pair's coverage is the sum of its attempts: the nodes are the
+	// union, the counters add up. An attempt that ended in an error counts
+	// with what its stream showed (the server sends its coverage only at the
+	// end); one that ended clean counts with the server's coverage.
+	seen := map[string]bool{}
+	var probes, failed, rounds int
+	var waited time.Duration
+	undeleted := []string{}
+	// The attempt in flight, as its stream shows it.
+	var mu sync.Mutex
+	var att struct {
+		ids                    []string
+		probes, failed, rounds int
+		err                    string
+	}
+	onProbe := func(p WarmProbe) {
+		w.record(Event{Event: EventPreflightProbe, Image: img, Env: p.ID, Node: p.Node, Attempts: p.Round, DurMS: DurMS(p.Duration), OK: p.Error == "", Err: p.Error, Labels: map[string]string{"domain": d.Name}})
+		mu.Lock()
+		defer mu.Unlock()
+		att.ids = append(att.ids, p.ID)
+		att.probes++
+		att.rounds = max(att.rounds, p.Round)
+		if p.Error != "" {
+			att.failed++
+			att.err = p.Error
+		} else if p.Node != "" {
+			seen[p.Node] = true
 		}
 	}
-	ic.Nodes = sortedKeys(nodes)
-	ic.Complete = len(ic.Nodes) >= d.Nodes
-	sort.Strings(ic.UndeletedProbes)
+	// fill writes the sums into ic; errText is the pair's error.
+	fill := func(errText string) {
+		ic.Nodes = sortedKeys(seen)
+		ic.Probes, ic.Failed, ic.Rounds = probes, failed, rounds
+		ic.Complete = len(ic.Nodes) >= d.Nodes
+		ic.Error = errText
+		ic.WaitedMS = DurMS(waited)
+		ic.UndeletedProbes = nil
+		if len(undeleted) > 0 {
+			ic.UndeletedProbes = append([]string{}, undeleted...)
+			sort.Strings(ic.UndeletedProbes)
+		}
+	}
+	wait := o.wakeBackoff
+	var giveUp time.Time
+	for attempt := 1; ; attempt++ {
+		opts.RunID = warmRunID(o.RunID, di, ii, attempt)
+		mu.Lock()
+		att.ids, att.probes, att.failed, att.rounds, att.err = nil, 0, 0, 0, ""
+		mu.Unlock()
+		cov, err := o.Backend.WarmImage(ctx, img, opts, onProbe)
+		if err == nil {
+			for _, node := range cov.Nodes {
+				seen[node] = true
+			}
+			probes, failed, rounds = probes+cov.Probes, failed+cov.Failed, rounds+cov.Rounds
+			waited += cov.Waited
+			undeleted = append(undeleted, cov.UndeletedProbes...)
+			fill(cov.Error)
+			// A clean call alone is complete when the server says so.
+			if attempt == 1 {
+				ic.Complete = cov.Complete && ic.Complete
+			}
+			break
+		}
+		mu.Lock()
+		probes, failed, rounds = probes+att.probes, failed+att.failed, rounds+att.rounds
+		if ctx.Err() == nil {
+			// The server deletes a round's probes after it streamed them, and
+			// reports the ones it could not delete in the coverage this call
+			// never sent: an api server that restarted left them all. The
+			// pass cannot tell, so every probe the call streamed is listed.
+			// After a cancel the server is there and deletes them.
+			undeleted = append(undeleted, att.ids...)
+		}
+		fill(err.Error())
+		mu.Unlock()
+		// The stream can have shown every node before the call broke: the
+		// pair is covered, and a repeat would only boot the image again.
+		// Every line about a cut-off call names the call's run id: its
+		// probes are <run id>-<round>-<slot>, and when the api server
+		// restarted nothing else records them.
+		call := []any{slog.String("image", img), slog.String("domain", d.Name), slog.String("run_id", opts.RunID), slog.Int("attempt", attempt), slog.Any("err", err)}
+		if ctx.Err() != nil {
+			break
+		}
+		if ic.Complete {
+			o.Logger.Warn("preflight: warm call cut off after its stream showed every node, not repeated; its probes may be left", call...)
+			break
+		}
+		if !isTransient(err) {
+			break
+		}
+		if giveUp.IsZero() {
+			giveUp = time.Now().Add(o.ProbeTimeout)
+		}
+		// The repeats last until giveUp, not until a whole backoff no longer
+		// fits before it: the wait is cut to what is left.
+		left := time.Until(giveUp)
+		if attempt >= maxWarmAttempts || left <= 0 {
+			o.Logger.Warn("preflight: warm call cut off, giving up; the probes of the cut-off calls may be left", call...)
+			break
+		}
+		sleep := min(wait, left)
+		if dl, ok := ctx.Deadline(); ok && time.Now().Add(sleep).After(dl) {
+			break
+		}
+		o.Logger.Warn("preflight: warm call cut off, repeating", call...)
+		select {
+		case <-ctx.Done():
+			return ic
+		case <-time.After(sleep):
+		}
+		wait = min(wait*2, 5*o.wakeBackoff)
+	}
 	if o.Recorder != nil {
 		_ = o.Recorder.Flush()
 	}
 	return ic
 }
 
-// runProbe runs the probe's first command, retrying transient wake or bake
-// errors inside ctx with DefaultWakeBackoff the way doStep does: a cold pull
-// or golden restore that exceeds one router forward timeout answers
-// Unavailable or Unknown while ctx still has budget left.
-func (w *PreflightWarmer) runProbe(ctx context.Context, sb Sandbox) error {
-	wait := w.opts.wakeBackoff
-	for {
-		res, err := sb.Run(ctx, "true", w.opts.ProbeTimeout)
-		if err == nil {
-			if res.ExitCode != 0 {
-				return fmt.Errorf("exit %d", res.ExitCode)
-			}
-			return nil
-		}
-		if !isTransient(err) || ctx.Err() != nil {
-			return err
-		}
-		if dl, ok := ctx.Deadline(); ok && time.Now().Add(wait).After(dl) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return err
-		case <-time.After(wait):
-		}
-		wait = min(wait*2, 5*w.opts.wakeBackoff)
-	}
+// warmRunIDLimit is ate-env-api's limit on WarmImage's run_id; the pass's
+// run id plus the domain, image and attempt indexes it appends must fit in
+// it. maxWarmAttempts bounds the repeats of a cut-off call (and the attempt
+// index to one digit).
+const (
+	warmRunIDLimit  = 20
+	maxWarmAttempts = 9
+)
+
+// warmRunID is the run id of one WarmImage call: the pass's run id with the
+// plan indexes of the domain and the image and the attempt, so the calls of
+// one pass, and the repeats of one call, never name a probe alike; the
+// server appends -<round>-<slot>. The indexes are in base 36 (0-9, a-z):
+// with the default pf-<6> run id that leaves seven characters for the two,
+// enough for 46,656 domains with 1,679,616 images (decimal ran out at 351
+// domains with 36,841 images). PreflightWarmer._warm_run_id in
+// clients/python writes the same names.
+func warmRunID(runID string, domain, image, attempt int) string {
+	return runID + "-" + strconv.FormatInt(int64(domain), 36) + "-" + strconv.FormatInt(int64(image), 36) + "-" + strconv.Itoa(attempt)
 }
 
 // DefaultPreflightRunIDPrefix starts the run id of a pass that gives none;
@@ -733,33 +801,6 @@ func newPreflightRunID() string {
 		b[i] = alphabet[int(b[i])%len(alphabet)]
 	}
 	return DefaultPreflightRunIDPrefix + "-" + string(b)
-}
-
-// createRefused reports whether a failed create made no environment: the
-// server refused the request (the name exists, a bad argument, a missing or
-// conflicting template, no permission, no room: ate-env-api's
-// CreateEnvironment is one CreateActor call, and ResourceExhausted is the
-// control plane saying no before anything exists, as WarmImage's
-// createMayHaveLanded reads it too). A create that was cut off
-// (Unavailable, DeadlineExceeded, Canceled, Unknown) may still have landed.
-func createRefused(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, env.ErrInvalidArgument) || errors.Is(err, env.ErrPermissionDenied) || errors.Is(err, env.ErrFailedPrecondition) {
-		return true
-	}
-	switch status.Code(err) {
-	case codes.AlreadyExists, codes.InvalidArgument, codes.FailedPrecondition, codes.PermissionDenied, codes.Unauthenticated, codes.ResourceExhausted:
-		return true
-	}
-	return false
-}
-
-// probeID names a probe environment: short, Substrate-valid, unique per
-// run, domain, image, round and slot.
-func probeID(runID string, domain, image, round, slot int) string {
-	return fmt.Sprintf("%s-%d-%d-%d-%d", runID, domain, image, round, slot)
 }
 
 func (w *PreflightWarmer) record(e Event) {

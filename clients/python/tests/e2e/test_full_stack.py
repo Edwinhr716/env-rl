@@ -578,3 +578,58 @@ def test_fleet_lookahead_warm_pool_lifecycle():
         finally:
             warmer.close()
         assert fleet.pool_size(warm_img) == 0
+
+
+@pytest.mark.skipif(
+    not ROOTFS_IMAGE,
+    reason="set ATE_ENV_ROOTFS_IMAGE=repo@sha256:... for the fleet pre-flight test",
+)
+def test_fleet_preflight_flag_warms_the_nodes_before_the_run():
+    """FleetConfig(preflight=True): run() puts the tasks' rootfs image on
+    every node of the base template's pools through WarmImage before the
+    sliding strategy starts; the template-routed image has no rootfs to warm.
+    Needs the global viewer binding (hack/ci/e2e.py applies it)."""
+    atespace = os.environ.get("NAMESPACE", "ate-env")
+    base_tmpl = TEMPLATE or "default-template"
+    fixed_img = "e2e-preflight-fixed:latest"
+    cfg = FleetConfig(
+        backend="substrate",
+        endpoint=TARGET,
+        tenancy=atespace,
+        template=base_tmpl,
+        image_templates={fixed_img: base_tmpl},
+        strategy="sliding",
+        batch_size=2,
+        max_warmpool_replicas=1,
+        preflight=True,
+        auth_token=AUTH_TOKEN,
+    )
+    tasks = [
+        Task(id=f"pf-{uuid.uuid4().hex[:6]}-a", image=ROOTFS_IMAGE),
+        Task(id=f"pf-{uuid.uuid4().hex[:6]}-b", image=ROOTFS_IMAGE),
+        Task(id=f"pf-{uuid.uuid4().hex[:6]}-c", image=fixed_img),
+    ]
+
+    def process(task, handle):
+        res = handle.exec("echo preflight-ok")
+        assert res.exit_code == 0
+        return res.stdout.strip()
+
+    with SandboxFleet(cfg) as fleet:
+        fleet.load_tasks(tasks)
+        results = fleet.run(process, concurrency=2)
+        coverage = fleet.preflight_coverage
+        report = fleet.report
+    assert results == ["preflight-ok"] * 3
+    assert coverage is not None, "the rootfs image was not warmed"
+    assert coverage.complete, coverage.shortfall()
+    # One image warmed, over every pool the base template addresses; each
+    # domain saw every node it has.
+    assert [g.image for g in coverage.goldens] == [ROOTFS_IMAGE]
+    assert coverage.domains and all(d.complete and d.nodes_seen for d in coverage.domains)
+    assert all(ic.image == ROOTFS_IMAGE for d in coverage.domains for ic in d.images)
+    assert coverage.undeleted_probes == []
+    summary = report.environment["substrate"]["preflight"]
+    assert summary["complete"] is True and summary["run_id"] == coverage.run_id
+    assert report.phases["preflight_images"][0] == 1
+    assert report.phases["preflight_probe"][0] >= 1

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import MISSING, asdict, dataclass, field, fields
@@ -29,6 +30,41 @@ _DNS1123_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 ALLOWED_BACKENDS = {"substrate", "mock"}
 ALLOWED_STRATEGIES = {"none", "naive", "sliding", "pipelined"}
 ALLOWED_DATA_PLANES = {"ate_env"}
+# FleetConfig.preflight_golden, in the order the docs give them.
+PREFLIGHT_GOLDEN_POLICIES = ("wait", "skip", "fail")
+# What ate-env-api's WarmImage takes (parseWarmOptions in
+# internal/apiservice/placement.go): it refuses more probes per node or
+# rounds, and a probe timeout that is not positive. The timeout goes on the
+# wire in whole microseconds, so less than one is zero there; the upper end
+# is the range of a protobuf Duration (10,000 years), the most that encodes.
+WARM_MAX_PROBES_PER_NODE = 8
+WARM_MAX_ROUNDS = 10
+WARM_MIN_PROBE_TIMEOUT_S = 1e-6
+WARM_MAX_PROBE_TIMEOUT_S = 315_576_000_000
+
+
+def warm_knob_error(
+    probes_per_node: Any, max_rounds: Any, probe_timeout_s: Any, *, names: tuple[str, str, str]
+) -> str | None:
+    """The reason ate-env-api's ``WarmImage`` would refuse these knobs, or
+    None. One check for ``FleetConfig`` and ``PreflightWarmer``, which name
+    the three differently (``names``)."""
+    for name, value, most in (
+        (names[0], probes_per_node, WARM_MAX_PROBES_PER_NODE),
+        (names[1], max_rounds, WARM_MAX_ROUNDS),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= most:
+            return f"{name} must be an int between 1 and {most}, got {value!r}"
+    if (
+        not isinstance(probe_timeout_s, (int, float))
+        or isinstance(probe_timeout_s, bool)
+        or not WARM_MIN_PROBE_TIMEOUT_S <= probe_timeout_s <= WARM_MAX_PROBE_TIMEOUT_S
+    ):
+        return (
+            f"{names[2]} must be a number between {WARM_MIN_PROBE_TIMEOUT_S:g} and "
+            f"{WARM_MAX_PROBE_TIMEOUT_S} seconds, got {probe_timeout_s!r}"
+        )
+    return None
 
 # Run id the Substrate backend gives warm-pool actors created without a run
 # id (a direct warm_pool() call; fleets pass theirs). Reserved, so a job's
@@ -211,6 +247,37 @@ class FleetConfig:
     # (the rootfs_image): the placement plan that keeps an image's
     # environments on the pools whose nodes already hold it.
     placement: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Image pre-flight: before the strategy runs, run() puts every loaded
+    # task's digest-pinned image on every node of the pools its creates can
+    # land on (node_selector, placement), through ate-env-api's WarmImage,
+    # so the run's first boot of an image on a node is a restore, not a
+    # pull (see ate_env_rl.PreflightWarmer). Needs ate-env-api's global
+    # viewer binding (ate-env manifest access-policy --global) to list the
+    # pools. An incomplete pre-flight is logged and the run goes on; the
+    # coverage is fleet.preflight_coverage and in the run report.
+    preflight: bool = False
+    # The image pre-flight's knobs (they do nothing without preflight).
+    # Probes started per node of a pool in one round, 1 to 8, and the
+    # rounds per (image, pool) before the pair is short, 1 to 10. A pool's
+    # node_slots bounds the probes per node. ate-env-api refuses a value
+    # above its -warm-max-probes-per-node (2 unless raised): each warm call
+    # then fails and the pairs are reported short with that reason.
+    preflight_probes_per_node: int = 2
+    preflight_rounds: int = 3
+    # Seconds one probe may take on the server (create, resume, node read;
+    # not the delete, which has the server's own 60 s; at least a
+    # microsecond, the wire's unit), and seconds the
+    # pass waits for the goldens while none becomes ready or fails.
+    preflight_probe_timeout_s: float = 10 * 60
+    preflight_golden_timeout_s: float = 30 * 60
+    # What the pass does about an image's golden snapshot: "wait" for it
+    # (up to preflight_golden_timeout_s without progress), then probe the
+    # image whether or not it is ready; "skip" the wait and probe at once,
+    # so a job over many new images starts on time with the layers on the
+    # nodes and the goldens still baking; "fail" waits, does not probe an
+    # image whose golden is not ready, and raises PreflightError before any
+    # task runs when one is not.
+    preflight_golden: str = "wait"
     tolerations: list[dict[str, Any]] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
 
@@ -288,6 +355,31 @@ class FleetConfig:
                 )
             placement[image] = dict(labels)
         object.__setattr__(self, "placement", placement)
+        if not isinstance(self.preflight, bool):
+            raise ValidationError(f"preflight must be a bool, got {self.preflight!r}")
+        bad = warm_knob_error(
+            self.preflight_probes_per_node,
+            self.preflight_rounds,
+            self.preflight_probe_timeout_s,
+            names=("preflight_probes_per_node", "preflight_rounds", "preflight_probe_timeout_s"),
+        )
+        if bad:
+            raise ValidationError(bad)
+        value = self.preflight_golden_timeout_s
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValidationError(
+                f"preflight_golden_timeout_s must be a finite number > 0, got {value!r}"
+            )
+        if self.preflight_golden not in PREFLIGHT_GOLDEN_POLICIES:
+            raise ValidationError(
+                f"preflight_golden must be one of {', '.join(PREFLIGHT_GOLDEN_POLICIES)}, "
+                f"got {self.preflight_golden!r}"
+            )
         object.__setattr__(self, "tolerations", list(self.tolerations))
         object.__setattr__(self, "labels", dict(self.labels))
 

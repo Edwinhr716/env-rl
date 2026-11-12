@@ -143,6 +143,9 @@ def test_unit_helpers_duration_graders_and_labels(tmp_path, monkeypatch):
         rfb.parse_duration_s("-5")
     with pytest.raises(ValueError):
         rfb.parse_duration_s("5days")
+    for raw in ("nan", "NaN", "inf", "Infinity", "1e999", "9" * 400 + "h"):
+        with pytest.raises(ValueError, match="invalid duration"):
+            rfb.parse_duration_s(raw)
 
     assert rfb.format_go_duration(0) == "0s"
     assert rfb.format_go_duration(0.25) == "250ms"
@@ -836,6 +839,91 @@ def test_real_substrate_driver_warm_pool_over_the_fake_api(tmp_path: pathlib.Pat
     assert run_ev["count"] == 2
     assert run_ev["working_set_hits"] == 2
     assert run_ev["working_set_misses"] == 0
+
+
+def test_preflight_flags_reach_the_fleet_and_the_report(tmp_path: pathlib.Path) -> None:
+    """--preflight over the real driver and the fake ate-env-api: the knobs are in
+    the WarmImage calls, and the fleet report carries the pre-flight summary."""
+    import asyncio
+
+    manifest = _write_r2e_manifest(tmp_path / "r2e.jsonl", count=2)
+    out_jsonl = tmp_path / "events.jsonl"
+    report_prefix = tmp_path / "fleet"
+    env_svc, server, loop, thread, port = _serve_fake_ate_env_api()
+    # One pool of two nodes behind the base template. The images' goldens are
+    # new and never finish in the fake: "skip" probes without the wait.
+    env_svc.domain_nodes = {"d0": ["node-1", "node-2"]}
+    env_svc.template_selectors[("ate-env", "default-template")] = {}
+    try:
+        argv = [
+            "--backend=substrate",
+            f"--endpoint=127.0.0.1:{port}",
+            "--atespace=ate-env",
+            "--base-template=default-template",
+            "--connections=1",
+            f"--dataset={manifest}",
+            "--trajectory=command-default",
+            "--mode=steps",
+            "--strategy=none",
+            "--rollouts=1",
+            "--steps=1",
+            "--width=2",
+            "--create-timeout=30s",
+            "--step-timeout=30s",
+            "--run-id=preflight-t1",
+            f"--out={out_jsonl}",
+            f"--fleet-report-out={report_prefix}",
+            "--preflight",
+            "--preflight-probes-per-node=1",
+            "--preflight-rounds=4",
+            "--preflight-probe-timeout=45s",
+            "--preflight-golden=skip",
+        ]
+        rc = rfb.run_benchmark(argv)
+    finally:
+        asyncio.run_coroutine_threadsafe(server.stop(None), loop).result(timeout=30)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=10)
+    assert rc == 0
+    reqs = env_svc.warm_requests
+    assert len(reqs) == 2
+    assert {r.probes_per_node for r in reqs} == {1}
+    assert {r.max_rounds for r in reqs} == {4}
+    assert {r.probe_timeout.ToSeconds() for r in reqs} == {45}
+    # The warm calls came before the first task's create.
+    assert env_svc.call_log.index("warm") < env_svc.call_log.index("create")
+    report = json.loads((tmp_path / "fleet.json").read_text(encoding="utf-8"))
+    summary = report["environment"]["substrate"]["preflight"]
+    assert summary["images"] == 2 and summary["domains"] == 1
+    assert summary["goldens_not_ready"] == 2 and summary["complete"] is False
+
+
+def test_preflight_flags_are_validated(tmp_path: pathlib.Path) -> None:
+    manifest = _write_r2e_manifest(tmp_path / "r2e.jsonl", count=1)
+    base = ["--backend=mock", f"--dataset={manifest}", "--trajectory=command-default", "--dry-run"]
+    for flag, match in (
+        ("--preflight-probes-per-node=0", "--preflight-probes-per-node must be between 1 and 8"),
+        ("--preflight-rounds=0", "--preflight-rounds must be between 1 and 10"),
+        # ate-env-api's wire bounds.
+        ("--preflight-probes-per-node=9", "--preflight-probes-per-node must be between 1 and 8"),
+        ("--preflight-rounds=11", "--preflight-rounds must be between 1 and 10"),
+        ("--preflight-probe-timeout=500ns", "--preflight-probe-timeout must be at least 1us"),
+        ("--preflight-probe-timeout=0s", "must be above zero"),
+        # Above the range of a protobuf Duration, which FleetConfig refuses
+        # after --out is open.
+        ("--preflight-probe-timeout=1e15", "--preflight-probe-timeout must be at most 315576000000s"),
+        ("--preflight-probe-timeout=87660000h1s", "--preflight-probe-timeout must be at most 315576000000s"),
+        ("--preflight-golden-timeout=0", "must be above zero"),
+        # float() takes these; a duration is a finite number.
+        ("--preflight-probe-timeout=nan", "invalid duration 'nan'"),
+        ("--preflight-golden-timeout=inf", "invalid duration 'inf'"),
+        ("--preflight-golden-timeout=1e999", "invalid duration '1e999'"),
+        ("--create-timeout=nan", "invalid duration 'nan'"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            rfb.run_benchmark([*base, flag])
+    with pytest.raises(SystemExit):
+        rfb.run_benchmark([*base, "--preflight-golden=never"])
 
 
 def test_enable_tracing_emits_v1_trace_events(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:

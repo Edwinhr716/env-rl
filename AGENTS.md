@@ -106,8 +106,8 @@ make python-test
 make nemo-gym-test
 make harbor-test
 make ci-dafny   # when touching docs/plans/telemetry/verify or modelled code
-python -m pytest integrations/openhands/tests benchmarking/swebench benchmarking/telemetry_report internal/benchmarking/swebench/trajectories examples/Qwen3-1.7B-verl/tests hack/release/test_create_release.py
-ruff check clients/python examples/verl_swebench benchmarking/telemetry_report hack/release
+python -m pytest integrations/openhands/tests benchmarking/swebench benchmarking/telemetry_report internal/benchmarking/swebench/trajectories examples/Qwen3-1.7B-verl/tests hack/release/test_create_release.py hack/ci/test_e2e_policy.py
+ruff check clients/python examples/verl_swebench benchmarking/telemetry_report hack/release hack/ci
 ruff check --config clients/python/pyproject.toml examples/Qwen3-1.7B-verl
 ```
 
