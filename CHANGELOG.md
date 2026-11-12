@@ -7,6 +7,10 @@ user needs to know across them.
 ## Unreleased
 
 ### Changed
+- Go client: the install steps in `clients/go/README.md` set
+  `GOPRIVATE=github.com/ai-on-gke/*`, because the repository is private.
+  Without it, `go mod tidy` takes `@main` from `proxy.golang.org`, which
+  still serves the commit from before the repository became private.
 - Python client: the `Env.shell` span (`ate_env_client.shell`) records
   `ate_env.timed_out`, as Go's `Env.Run` span does. The span keeps its name.
 - `bench prewarm` ensures each image's derived template through
