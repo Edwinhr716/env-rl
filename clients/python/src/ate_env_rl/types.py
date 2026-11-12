@@ -186,8 +186,9 @@ class PlacementDomain:
     at once, 0 when unknown.
 
     An ``ImagePlacement`` plan's domains are this type too: the plan file
-    carries ``name``, ``selector``, ``nodes`` and ``node_slots``, thus
-    ``worker_namespace`` and ``workers`` keep their defaults there.
+    carries ``name``, ``selector``, ``nodes`` and ``node_slots``, and
+    ``worker_namespace`` and ``workers`` when the plan was made from
+    ``placement-domains --json``; they keep their defaults otherwise.
     """
 
     name: str

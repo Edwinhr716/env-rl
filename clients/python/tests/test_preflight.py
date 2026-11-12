@@ -429,6 +429,46 @@ def test_create_refused_classifies_the_errors():
     assert not any(_create_refused(e) for e in cut_off)
 
 
+def test_plan_keeps_workers_and_namespace_from_the_api() -> None:
+    plan = json.loads(json.dumps(PLAN))
+    plan["domains"][0].update({"workers": 8, "worker_namespace": "ate-system", "node_slots": 6})
+    loaded = ImagePlacement.from_dict(plan)
+    d0 = loaded.domain("d0")
+    assert d0 is not None and d0.workers == 8 and d0.worker_namespace == "ate-system" and d0.node_slots == 6
+    d1 = loaded.domain("d1")
+    assert d1 is not None and d1.workers == 0 and d1.worker_namespace == ""
+    plan["domains"][0]["workers"] = -1
+    with pytest.raises(ValueError, match="workers"):
+        ImagePlacement.from_dict(plan)
+    # A value of the wrong type is refused, a falsy one too: it is not read
+    # as "absent". The schema allows an integer and a string, nothing else.
+    for field, bad in [
+        *(("workers", v) for v in (False, True, "", "8", [], {}, 0.0, 8.0, None)),
+        *(("worker_namespace", v) for v in (123, 0, True, False, ["ate-system"], {}, None)),
+    ]:
+        plan = json.loads(json.dumps(PLAN))
+        plan["domains"][0][field] = bad
+        with pytest.raises(ValueError, match=f"{field} must be"):
+            ImagePlacement.from_dict(plan)
+
+
+def test_plan_refuses_domain_fields_of_the_wrong_type() -> None:
+    # The same rule for the fields the plan always had: no falsy value of the
+    # wrong type is read as "absent", and no wrong type reaches the domain.
+    for field, bad, match in [
+        *(("node_slots", v, "node_slots must be") for v in (False, True, "", [], {}, 0.0, None)),
+        *(("name", v, "a unique name is required") for v in (123, True, ["d0"], None)),
+        *(("selector", v, "a selector is required") for v in ({"k": 1}, {"k": None}, {1: "v"}, [["k", "v"]], "ab", 7)),
+    ]:
+        plan = json.loads(json.dumps(PLAN))
+        plan["domains"][0][field] = bad
+        with pytest.raises(ValueError, match=match):
+            ImagePlacement.from_dict(plan)
+    # An absent node_slots is still 0, "unknown".
+    d0 = ImagePlacement.from_dict(PLAN).domain("d0")
+    assert d0 is not None and d0.node_slots == 0
+
+
 async def test_cancelled_run_retains_undeleted_probes_and_partial_coverage(fake_stack):
     client, fakes = fake_stack
     fakes.environments.domain_nodes = dict(NODES)

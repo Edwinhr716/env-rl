@@ -55,8 +55,16 @@ type PlacementDomain struct {
 	NodeCacheBytes int64 `json:"node_cache_bytes"`
 	// NodeSlots is how many environments one node of the domain runs at
 	// once, when known; the pre-flight caps its concurrency by it. 0 means
-	// unknown.
+	// unknown. In a domains file with Workers (the output of `ate-env
+	// placement-domains --json`) the field is one worker's configured
+	// capacity, and the planner's reader turns it into a per-node value
+	// (swebench.ReadPlacementDomains); the plan carries the per-node value.
 	NodeSlots int `json:"node_slots,omitempty"`
+	// Workers is the domain's active worker pods and WorkerNamespace the
+	// Kubernetes namespace they run in, as `ate-env placement-domains --json`
+	// reports them (ListPlacementDomains); absent in a hand-written file.
+	Workers         int    `json:"workers,omitempty"`
+	WorkerNamespace string `json:"worker_namespace,omitempty"`
 	// AssignedBytes is the unpacked size of the images assigned to the
 	// domain, which each of its nodes holds; filled by the planner.
 	AssignedBytes int64 `json:"assigned_bytes"`
@@ -161,8 +169,8 @@ func (d PlacementDomain) Validate() error {
 	if d.Nodes < 1 {
 		return fmt.Errorf("domain %q: nodes must be >= 1", d.Name)
 	}
-	if d.NodeCacheBytes < 0 || d.AssignedBytes < 0 || d.ImageCount < 0 || d.NodeSlots < 0 {
-		return fmt.Errorf("domain %q: node_cache_bytes, node_slots, assigned_bytes and image_count must be >= 0", d.Name)
+	if d.NodeCacheBytes < 0 || d.AssignedBytes < 0 || d.ImageCount < 0 || d.NodeSlots < 0 || d.Workers < 0 {
+		return fmt.Errorf("domain %q: node_cache_bytes, node_slots, workers, assigned_bytes and image_count must be >= 0", d.Name)
 	}
 	return nil
 }

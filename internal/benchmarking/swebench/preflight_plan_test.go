@@ -15,6 +15,7 @@
 package swebench
 
 import (
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -218,18 +219,145 @@ func TestReadPlacementDomainsAndWriteReadPlan(t *testing.T) {
 		return p
 	}
 	good := write("domains.json", `{"domains":[{"name":"d0","selector":{"ate-env/domain":"d0"},"nodes":4,"node_cache_bytes":100}]}`)
-	domains, err := ReadPlacementDomains(good)
+	domains, _, err := ReadPlacementDomains(good)
 	if err != nil || len(domains) != 1 || domains[0].Nodes != 4 {
 		t.Fatalf("ReadPlacementDomains = %v, %v", domains, err)
 	}
+	// The output of `ate-env placement-domains --json`: workers and
+	// worker_namespace, no node_cache_bytes, and node_slots one worker's
+	// configured capacity. The reader's per-node value is min(capacity,
+	// DefaultActorsPerWorker) x workers per node: 8 workers on 4 nodes with
+	// capacity 10 give 3 x 2 = 6, with capacity 1 give 1 x 2 = 2 (not the
+	// capacity alone, which the pre-flight would refuse two probes on), with
+	// no capacity 3 x 2 = 6; 16 workers on 4 nodes with capacity 10 give 12;
+	// an uneven pool rounds its workers per node down (5 on 2 nodes: 2), at
+	// least one (1 worker on 4 nodes: 3).
+	api := write("api.json", `{"domains":[`+
+		`{"name":"pool-d0","worker_namespace":"ate-system","selector":{"ate-env/domain":"d0"},"nodes":4,"workers":8,"node_slots":10},`+
+		`{"name":"pool-d1","worker_namespace":"ate-system","selector":{"ate-env/domain":"d1"},"nodes":4,"workers":8,"node_slots":1},`+
+		`{"name":"pool-d2","worker_namespace":"ate-system","selector":{"ate-env/domain":"d2"},"nodes":4,"workers":8},`+
+		`{"name":"pool-d3","worker_namespace":"ate-system","selector":{"ate-env/domain":"d3"},"nodes":4,"workers":16,"node_slots":10},`+
+		`{"name":"pool-d4","worker_namespace":"ate-system","selector":{"ate-env/domain":"d4"},"nodes":2,"workers":5,"node_slots":12},`+
+		`{"name":"pool-d5","worker_namespace":"ate-system","selector":{"ate-env/domain":"d5"},"nodes":4,"workers":1,"node_slots":12}]}`)
+	fromAPI, apiSkipped, err := ReadPlacementDomains(api)
+	if err != nil {
+		t.Fatalf("ReadPlacementDomains(api output): %v", err)
+	}
+	for i, want := range []int{6, 2, 6, 12, 6, 3} {
+		if fromAPI[i].NodeSlots != want {
+			t.Errorf("%s node_slots = %d, want %d", fromAPI[i].Name, fromAPI[i].NodeSlots, want)
+		}
+	}
+	if fromAPI[0].Workers != 8 || fromAPI[0].WorkerNamespace != "ate-system" || fromAPI[0].NodeCacheBytes != 0 {
+		t.Errorf("pool-d0 = %+v, want workers and worker_namespace kept and no budget", fromAPI[0])
+	}
+	// A plan over the API's domains validates against the JSON schema with
+	// the two fields in it.
+	apiPlan, err := PlanImagePlacement(PlanOptions{Instances: []Instance{{Image: imgA, ImageBytesCompressed: 7}}, Domains: fromAPI})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawPlan, err := json.Marshal(apiPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawPlan), `"workers":8`) || !strings.Contains(string(rawPlan), `"worker_namespace":"ate-system"`) {
+		t.Errorf("plan JSON lacks the API's fields:\n%s", rawPlan)
+	}
+	if err := schema.ValidateAgainstJSONSchema("image_placement.schema.json", rawPlan); err != nil {
+		t.Errorf("plan over the API's domains against the schema: %v", err)
+	}
+	if len(apiSkipped) != 0 {
+		t.Errorf("skipped = %v, want none", apiSkipped)
+	}
+	// A pool of the API's output that no selector addresses is skipped with
+	// its reason and the rest of the file is read: workers that report no
+	// node, a shared label with an empty value, workers that share no label
+	// (a file made without --template). The order of the file is kept.
+	mixed, skipped, err := ReadPlacementDomains(write("mixed.json", `{"domains":[`+
+		`{"name":"pool-nonode","worker_namespace":"ate-system","selector":{"ate-env/domain":"x"},"nodes":0,"workers":2,"node_slots":10},`+
+		`{"name":"pool-ok","worker_namespace":"ate-system","selector":{"ate-env/domain":"d0"},"nodes":4,"workers":8,"node_slots":10},`+
+		`{"name":"pool-emptyval","worker_namespace":"ate-system","selector":{"canary":"","ate-env/domain":"y"},"nodes":1,"workers":1,"node_slots":10},`+
+		`{"name":"pool-nolabel","worker_namespace":"ns-b","selector":{},"nodes":2,"workers":2},`+
+		`{"name":"pool-nolabel-nons","selector":{},"nodes":2,"workers":2}]}`))
+	if err != nil {
+		t.Fatalf("ReadPlacementDomains(mixed): %v", err)
+	}
+	if len(mixed) != 1 || mixed[0].Name != "pool-ok" || mixed[0].NodeSlots != 6 {
+		t.Errorf("domains = %+v, want pool-ok alone with node_slots 6", mixed)
+	}
+	var got []string
+	for _, s := range skipped {
+		got = append(got, s.String())
+	}
+	wantSkipped := []string{
+		"ate-system/pool-nonode: its workers report no node",
+		`ate-system/pool-emptyval: its label "canary" has an empty value, which a selector cannot name`,
+		"ns-b/pool-nolabel: its workers share no label, so no selector addresses it",
+		"pool-nolabel-nons: its workers share no label, so no selector addresses it",
+	}
+	if !reflect.DeepEqual(got, wantSkipped) {
+		t.Errorf("skipped =\n%q\nwant\n%q", got, wantSkipped)
+	}
+	// A file whose pools are all skipped is an error that names each.
+	_, _, err = ReadPlacementDomains(write("allskipped.json", `{"domains":[`+
+		`{"name":"pool-a","worker_namespace":"ate-system","selector":{"a":"b"},"nodes":0,"workers":2},`+
+		`{"name":"pool-b","worker_namespace":"ate-system","selector":{},"nodes":1,"workers":1}]}`))
+	if err == nil || !strings.Contains(err.Error(), "no pool is addressable") || !strings.Contains(err.Error(), "ate-system/pool-a: its workers report no node") || !strings.Contains(err.Error(), "ate-system/pool-b: its workers share no label") {
+		t.Errorf("all pools skipped: err = %v, want each pool and its reason", err)
+	}
+	const okPool = `{"name":"pool-ok","worker_namespace":"ate-system","selector":{"ate-env/domain":"d0"},"nodes":4,"workers":8,"node_slots":10}`
+	// What still refuses an API file: one name in two namespaces, also when
+	// one of the two would be skipped; a worker count that overflows
+	// node_slots; a negative node count; planner fields set. And a
+	// hand-written domain (no workers, no worker_namespace) with a skipped
+	// pool's fault is a mistake in the file, not a pool's state.
+	for name, body := range map[string]string{
+		"dupname.json":     `{"domains":[{"name":"pool-x","worker_namespace":"ns-a","selector":{"a":"b"},"nodes":1,"workers":1},{"name":"pool-x","worker_namespace":"ns-b","selector":{"a":"c"},"nodes":1,"workers":1}]}`,
+		"dupskipped.json":  `{"domains":[{"name":"pool-x","worker_namespace":"ns-a","selector":{"a":"b"},"nodes":0,"workers":1},{"name":"pool-x","worker_namespace":"ns-b","selector":{"a":"c"},"nodes":1,"workers":1}]}`,
+		"overflow.json":    `{"domains":[{"name":"pool-x","worker_namespace":"ate-system","selector":{"a":"b"},"nodes":1,"workers":9223372036854775807}]}`,
+		"negnodes.json":    `{"domains":[{"name":"pool-x","worker_namespace":"ate-system","selector":{"a":"b"},"nodes":-1,"workers":1}]}`,
+		"apifilled.json":   `{"domains":[{"name":"pool-x","worker_namespace":"ate-system","selector":{"a":"b"},"nodes":1,"workers":1,"image_count":2}]}`,
+		"noname.json":      `{"domains":[{"worker_namespace":"ate-system","selector":{},"nodes":1,"workers":1}]}`,
+		"hand-nonode.json": `{"domains":[{"name":"d0","selector":{"a":"b"},"nodes":0}]}`,
+		"hand-empty.json":  `{"domains":[{"name":"d0","selector":{"a":""},"nodes":1}]}`,
+	} {
+		if _, _, err := ReadPlacementDomains(write(name, body)); err == nil {
+			t.Errorf("%s accepted, want an error", name)
+		}
+	}
+	// A fault of the file is refused in a pool that would be skipped too: the
+	// skip is for a state of the pool's workers, not for a malformed entry.
+	// Each of these has no node (or no shared label, or an empty label
+	// value) and one fault: a negative count, a planner field set, an empty
+	// selector key, a worker count that overflows node_slots.
+	for name, body := range map[string]string{
+		"skip-negworkers.json":   `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{"a":"b"},"nodes":0,"workers":-3}]}`,
+		"skip-negslots.json":     `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{"a":"b"},"nodes":0,"workers":2,"node_slots":-1}]}`,
+		"skip-negcache.json":     `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{},"nodes":1,"workers":2,"node_cache_bytes":-1}]}`,
+		"skip-assigned.json":     `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{"a":"b"},"nodes":0,"workers":2,"assigned_bytes":500}]}`,
+		"skip-imagecount.json":   `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{"a":""},"nodes":1,"workers":2,"image_count":2}]}`,
+		"skip-negassigned.json":  `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{"a":"b"},"nodes":0,"workers":2,"assigned_bytes":-5}]}`,
+		"skip-emptykey.json":     `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{"":"b"},"nodes":0,"workers":2}]}`,
+		"skip-emptykeyval.json":  `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{"":""},"nodes":1,"workers":2}]}`,
+		"skip-overflow.json":     `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{"a":"b"},"nodes":0,"workers":9223372036854775807}]}`,
+		"skip-overflow-nol.json": `{"domains":[` + okPool + `,{"name":"pool-x","worker_namespace":"ate-system","selector":{},"nodes":1,"workers":9223372036854775807,"node_slots":2}]}`,
+	} {
+		if _, _, err := ReadPlacementDomains(write(name, body)); err == nil {
+			t.Errorf("%s accepted, want an error", name)
+		} else if !strings.Contains(err.Error(), "domains[1]") {
+			t.Errorf("%s: err = %v, want it to name domains[1]", name, err)
+		}
+	}
 	for name, body := range map[string]string{
 		"filled.json": `{"domains":[{"name":"d0","selector":{"a":"b"},"nodes":1,"node_cache_bytes":0,"assigned_bytes":5}]}`,
+		"negw.json":   `{"domains":[{"name":"d0","selector":{"a":"b"},"nodes":1,"workers":-1}]}`,
 		"dup.json":    `{"domains":[{"name":"d0","selector":{"a":"b"},"nodes":1},{"name":"d0","selector":{"a":"c"},"nodes":1}]}`,
 		"nosel.json":  `{"domains":[{"name":"d0","nodes":1}]}`,
 		"empty.json":  `{"domains":[]}`,
 		"extra.json":  `{"domains":[{"name":"d0","selector":{"a":"b"},"nodes":1}],"other":1}`,
 	} {
-		if _, err := ReadPlacementDomains(write(name, body)); err == nil {
+		if _, _, err := ReadPlacementDomains(write(name, body)); err == nil {
 			t.Errorf("%s accepted, want an error", name)
 		}
 	}

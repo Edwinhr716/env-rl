@@ -111,20 +111,42 @@ class ImagePlacement:
         domains: list[PlacementDomain] = []
         names: set[str] = set()
         for i, d in enumerate(plan.get("domains") or []):
-            name = d.get("name") or ""
-            selector = dict(d.get("selector") or {})
+            name = d.get("name")
+            labels = d.get("selector")
             nodes = d.get("nodes", 0)
-            slots = d.get("node_slots", 0) or 0
-            if not name or name in names:
+            slots = d.get("node_slots", 0)
+            if not isinstance(name, str) or not name or name in names:
                 raise ValueError(f"image placement: domains[{i}]: a unique name is required")
-            if not selector or not all(k and v for k, v in selector.items()):
+            if (
+                not isinstance(labels, Mapping)
+                or not labels
+                or not all(isinstance(k, str) and isinstance(v, str) and k and v for k, v in labels.items())
+            ):
                 raise ValueError(f"image placement: domain {name!r}: a selector is required")
+            selector = dict(labels)
             if not isinstance(nodes, int) or isinstance(nodes, bool) or nodes < 1:
                 raise ValueError(f"image placement: domain {name!r}: nodes must be an int >= 1")
             if not isinstance(slots, int) or isinstance(slots, bool) or slots < 0:
                 raise ValueError(f"image placement: domain {name!r}: node_slots must be an int >= 0")
+            # Read as they are: an "or" default would turn a falsy value of
+            # the wrong type (false, "", [], 0.0) into "absent".
+            workers = d.get("workers", 0)
+            namespace = d.get("worker_namespace", "")
+            if not isinstance(workers, int) or isinstance(workers, bool) or workers < 0:
+                raise ValueError(f"image placement: domain {name!r}: workers must be an int >= 0")
+            if not isinstance(namespace, str):
+                raise ValueError(f"image placement: domain {name!r}: worker_namespace must be a string")
             names.add(name)
-            domains.append(PlacementDomain(name=name, selector=selector, nodes=nodes, node_slots=slots))
+            domains.append(
+                PlacementDomain(
+                    name=name,
+                    worker_namespace=namespace,
+                    selector=selector,
+                    nodes=nodes,
+                    workers=workers,
+                    node_slots=slots,
+                )
+            )
         if not domains:
             raise ValueError("image placement: at least one domain is required")
         images: list[PlacementEntry] = []

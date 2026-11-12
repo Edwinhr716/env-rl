@@ -294,7 +294,24 @@ staying the source of truth so a run does not depend on a collector.
    `node_cache_bytes` is the unpacked bytes one node may hold for the plan:
    the image-cache volume times atelet's low watermark (`--image-cache-low-percent`),
    minus headroom; `node_slots`, optional, is how many environments one node
-   runs at once, which caps the pre-flight's concurrency. Sizes come from the
+   runs at once, which caps the pre-flight's concurrency. The output of
+   `ate-env placement-domains --json` is a domains file too (`ate-env
+   placement-domains --template default-template --json > domains.json`; it
+   needs the global viewer binding). `--template` drops the pools without a
+   selector and the ones the template does not match. A pool that no
+   selector addresses is skipped, and `plan-placement` prints it with the
+   reason (`skipped pool <namespace>/<name>: ...`): its workers share no
+   label, a label they share has an empty value, or none reports a node. A
+   skipped pool gets no image; a file whose pools are all skipped is an
+   error. A skipped pool is still checked: a negative count, a planner field
+   (`assigned_bytes`, `image_count`), an empty label key or a worker count
+   that overflows `node_slots` makes the reader refuse the file. One pool name in two namespaces still makes the reader refuse the
+   file, so remove one of the two from it. Its `node_slots` is one worker's configured actor
+   capacity: the reader turns it into a per-node value, `min(capacity, 3) x
+   workers per node` (rounded down, at least one worker per node), until
+   Substrate reports what a node sustains. `-node-cache-bytes 400GB` supplies
+   the budget the output does not carry; without the flag those domains get
+   no budget check, and a zero budget is refused. Sizes come from the
    manifest's `image_bytes_compressed`
    (make-dataset.py records it) times `-unpack-factor` (default 2.5); an image
    without a size gets `-default-image-size` and is marked `size_assumed`. The

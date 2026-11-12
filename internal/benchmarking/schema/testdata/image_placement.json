@@ -4,7 +4,7 @@
   "replication": 1,
   "domains": [
     {"name": "d0", "selector": {"ate-env/domain": "d0"}, "nodes": 4, "node_cache_bytes": 400000000000, "assigned_bytes": 7500000000, "image_count": 1},
-    {"name": "d1", "selector": {"ate-env/domain": "d1"}, "nodes": 4, "node_cache_bytes": 400000000000, "assigned_bytes": 5000000000, "image_count": 1}
+    {"name": "d1", "worker_namespace": "ate-system", "selector": {"ate-env/domain": "d1"}, "nodes": 4, "node_cache_bytes": 400000000000, "node_slots": 6, "workers": 8, "assigned_bytes": 5000000000, "image_count": 1}
   ],
   "images": [
     {"image": "registry.example/swebench/django@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "domains": ["d0"], "bytes_compressed": 3000000000, "bytes_unpacked": 7500000000, "demand": 16},

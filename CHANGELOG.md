@@ -23,6 +23,24 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `swebench-loader plan-placement` takes the output of
+  `ate-env placement-domains --template <base> --json` as its `-domains`
+  file: `workers` and `worker_namespace` are kept in the plan (and read by
+  `ate_env_rl.ImagePlacement`, which now refuses a domain field of the wrong
+  type where it read a falsy one as absent), a domain with `workers` gets a
+  per-node `node_slots` of `min(the worker's capacity, 3) x workers per node`
+  (a stand-in until Substrate reports what a node sustains), and
+  `-node-cache-bytes` supplies the cache budget for domains that carry none
+  (a zero budget is refused). `image-placement.json` (schema v1) gains the
+  two optional domain fields.
+- `swebench-loader plan-placement` skips a pool of
+  `ate-env placement-domains --json` that no selector addresses: workers
+  that share no label, a shared label with an empty value, workers that
+  report no node. It prints each as `skipped pool <namespace>/<name>:
+  <reason>` and plans over the rest; a file whose pools are all skipped is an
+  error. A hand-written domain with the same fault is refused, and so is a
+  malformed entry (a negative count, a planner field set, an empty label key,
+  a worker count that overflows `node_slots`) in a skipped pool.
 - `swebench-loader run -preflight`: with `-placement`, runs the pre-flight
   over the plan inside the same command before the run (the `preflight`
   subcommand's defaults), writing `preflight-events.jsonl` and

@@ -37,39 +37,156 @@ const DefaultUnpackFactor = 2.5
 // PlacementDomainsFile is domains.json, the placement domains an operator
 // describes once per cluster shape: for each, the labels its worker pools
 // carry, its node count and the unpacked bytes one node may hold for a plan.
+// The output of `ate-env placement-domains --json` (ListPlacementDomains)
+// has the same shape, with workers and worker_namespace and without
+// node_cache_bytes.
 type PlacementDomainsFile struct {
 	Domains []schema.PlacementDomain `json:"domains"`
 }
 
+// DefaultActorsPerWorker is the environments one worker pod is taken to run
+// at once for first boots when the domains file carries workers: the
+// planner's node_slots is min(the worker's configured capacity,
+// DefaultActorsPerWorker) x the workers per node (floor, at least one). A
+// stand-in until Substrate reports what a node sustains (substrate #3702);
+// a worker's configured actor capacity, which ListPlacementDomains reports
+// as node_slots, is more than a loaded node sustains for first boots.
+const DefaultActorsPerWorker = 3
+
+// SkippedDomain is a pool of an API domains file the reader left out of the
+// planner's input, and why.
+type SkippedDomain struct {
+	Name            string
+	WorkerNamespace string
+	Reason          string
+}
+
+// String is the pool as `namespace/name: reason`.
+func (s SkippedDomain) String() string {
+	name := s.Name
+	if s.WorkerNamespace != "" {
+		name = s.WorkerNamespace + "/" + name
+	}
+	return name + ": " + s.Reason
+}
+
+// unaddressable says why no worker selector steers a first boot to a pool
+// of `ate-env placement-domains --json`, or "" when one does. Each reason is
+// a state of the pool's workers, not a mistake in the file: the workers
+// share no label, one of the labels they share has an empty value (which a
+// selector cannot name), or no worker reports its node.
+func unaddressable(d schema.PlacementDomain) string {
+	if len(d.Selector) == 0 {
+		return "its workers share no label, so no selector addresses it"
+	}
+	keys := make([]string, 0, len(d.Selector))
+	for k := range d.Selector {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if d.Selector[k] == "" {
+			return fmt.Sprintf("its label %q has an empty value, which a selector cannot name", k)
+		}
+	}
+	if d.Nodes == 0 {
+		return "its workers report no node"
+	}
+	return ""
+}
+
 // ReadPlacementDomains reads domains.json. The planner fills assigned_bytes
-// and image_count, so a file that sets them is refused.
-func ReadPlacementDomains(path string) ([]schema.PlacementDomain, error) {
+// and image_count, so a file that sets them is refused. In a domain with
+// workers (the output of `ate-env placement-domains --json`), node_slots is
+// one worker's configured actor capacity, as ListPlacementDomains reports
+// it: the reader turns it into a per-node value, min(capacity,
+// DefaultActorsPerWorker) x the workers per node, and DefaultActorsPerWorker
+// per worker when the file gives no capacity.
+//
+// A pool of the API's output (a domain with workers or a worker_namespace)
+// that no selector addresses is left out and returned as skipped, with the
+// reason: its workers share no label, a label they share has an empty value,
+// or none reports a node. `--template` drops the first kind on the server;
+// the other two reach the file. The rest of the file is still read, and a
+// file whose pools are all skipped is an error that lists them. A
+// hand-written domain (neither field) with the same fault is refused. Any
+// other fault is refused in every domain, a skipped pool included, because
+// it is checked before the skip: a missing name, a name used twice (two
+// pools of one name in two namespaces included), a negative number, a
+// planner field set, an empty selector key, a worker count that overflows
+// node_slots (a pool with no node counts as one node for that check).
+func ReadPlacementDomains(path string) ([]schema.PlacementDomain, []SkippedDomain, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 	file, err := schema.DecodeJSONStrict[PlacementDomainsFile](f)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if len(file.Domains) == 0 {
-		return nil, fmt.Errorf("%s: at least one domain is required", path)
+		return nil, nil, fmt.Errorf("%s: at least one domain is required", path)
 	}
 	names := make(map[string]bool, len(file.Domains))
+	domains := make([]schema.PlacementDomain, 0, len(file.Domains))
+	var skipped []SkippedDomain
 	for i, d := range file.Domains {
-		if err := d.Validate(); err != nil {
-			return nil, fmt.Errorf("%s: domains[%d]: %w", path, i, err)
-		}
-		if d.AssignedBytes != 0 || d.ImageCount != 0 {
-			return nil, fmt.Errorf("%s: domains[%d] (%s): assigned_bytes and image_count are the planner's to fill", path, i, d.Name)
+		// The name is checked for every domain, skipped or not, so two
+		// pools of one name are refused whichever of them is addressable.
+		if d.Name == "" {
+			return nil, nil, fmt.Errorf("%s: domains[%d]: name is required", path, i)
 		}
 		if names[d.Name] {
-			return nil, fmt.Errorf("%s: domains[%d]: duplicate domain %q", path, i, d.Name)
+			return nil, nil, fmt.Errorf("%s: domains[%d]: duplicate domain %q", path, i, d.Name)
 		}
 		names[d.Name] = true
+		// A fault of the file is refused before the skip, so a pool that no
+		// selector addresses is held to the same rules as one that is
+		// planned: the skip is for a state of the pool's workers only.
+		if d.Nodes < 0 || d.NodeCacheBytes < 0 || d.AssignedBytes < 0 || d.ImageCount < 0 || d.NodeSlots < 0 || d.Workers < 0 {
+			return nil, nil, fmt.Errorf("%s: domains[%d] (%s): nodes, node_cache_bytes, node_slots, workers, assigned_bytes and image_count must be >= 0", path, i, d.Name)
+		}
+		if d.AssignedBytes != 0 || d.ImageCount != 0 {
+			return nil, nil, fmt.Errorf("%s: domains[%d] (%s): assigned_bytes and image_count are the planner's to fill", path, i, d.Name)
+		}
+		if _, ok := d.Selector[""]; ok {
+			return nil, nil, fmt.Errorf("%s: domains[%d] (%s): selector keys must be non-empty", path, i, d.Name)
+		}
+		nodeSlots := d.NodeSlots
+		if d.Workers > 0 {
+			// A pool whose workers report no node counts as one node here:
+			// the overflow is a fault of the worker count, node or no node.
+			perNode := max(d.Workers/max(d.Nodes, 1), 1)
+			perWorker := d.NodeSlots
+			if perWorker == 0 || perWorker > DefaultActorsPerWorker {
+				perWorker = DefaultActorsPerWorker
+			}
+			if perNode > math.MaxInt/perWorker {
+				return nil, nil, fmt.Errorf("%s: domains[%d] (%s): %d workers on %d nodes overflow node_slots", path, i, d.Name, d.Workers, d.Nodes)
+			}
+			nodeSlots = perWorker * perNode
+		}
+		if d.Workers > 0 || d.WorkerNamespace != "" {
+			if reason := unaddressable(d); reason != "" {
+				skipped = append(skipped, SkippedDomain{Name: d.Name, WorkerNamespace: d.WorkerNamespace, Reason: reason})
+				continue
+			}
+		}
+		if err := d.Validate(); err != nil {
+			return nil, nil, fmt.Errorf("%s: domains[%d]: %w", path, i, err)
+		}
+		d.NodeSlots = nodeSlots
+		domains = append(domains, d)
 	}
-	return file.Domains, nil
+	if len(domains) == 0 {
+		reasons := make([]string, len(skipped))
+		for i, s := range skipped {
+			reasons[i] = s.String()
+		}
+		return nil, nil, fmt.Errorf("%s: no pool is addressable: %s", path, strings.Join(reasons, "; "))
+	}
+	return domains, skipped, nil
 }
 
 // PlanOptions are the inputs of PlanImagePlacement.

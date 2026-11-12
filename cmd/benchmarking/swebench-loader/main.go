@@ -411,10 +411,12 @@ func renderPlanCmd(args []string) error {
 // pre-flight fills the caches from it and the run steers creates with it.
 func planPlacementCmd(args []string, stderr io.Writer) error {
 	fs := flag.NewFlagSet("plan-placement", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	var (
 		dataset        = fs.String("dataset", "", "JSONL manifest of instances; a path or an https URL. Required. Image sizes come from its image_bytes_compressed (make-dataset.py).")
 		schedule       = fs.String("schedule", "", "schedule.json from resolve. When given, its images are placed, with each image's demand (the most environments one step asks for), and the whole manifest supplies the sizes; -images, -instances and -exclude-file then do not apply. Otherwise every selected image of the manifest is placed.")
-		domainsFile    = fs.String("domains", "", "domains.json: the placement domains, each with the worker-pool labels its per-environment worker selector names, its node count and node_cache_bytes, the unpacked bytes one node may hold. Required.")
+		domainsFile    = fs.String("domains", "", "domains.json: the placement domains, each with the worker-pool labels its per-environment worker selector names, its node count and node_cache_bytes, the unpacked bytes one node may hold; or the output of 'ate-env placement-domains --template <base> --json', whose per-worker node_slots becomes min(capacity, 3) x workers per node and which takes its cache budget from -node-cache-bytes (a pool no selector addresses is skipped and printed with its reason: workers that share no label, a shared label with an empty value, workers that report no node; a pool name used in two namespaces is refused). Required.")
+		nodeCache      = fs.String("node-cache-bytes", "", "Unpacked bytes one node may hold, for the domains whose node_cache_bytes is absent or 0 (the output of 'ate-env placement-domains --json' has none); a byte size such as 400GB. Default: no budget check for those domains.")
 		images         = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
 		instances      = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
 		excludeFile    = fs.String("exclude-file", "", "File of instance ids to leave out, one per line.")
@@ -444,6 +446,15 @@ func planPlacementCmd(args []string, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("-default-image-size: %w", err)
 	}
+	var nodeCacheBudget int64
+	if *nodeCache != "" {
+		if nodeCacheBudget, err = swebench.ParseByteSize(*nodeCache); err != nil {
+			return fmt.Errorf("-node-cache-bytes: %w", err)
+		}
+		if nodeCacheBudget <= 0 {
+			return fmt.Errorf("-node-cache-bytes %q is not a budget above zero; leave the flag out for no budget check", *nodeCache)
+		}
+	}
 	all, err := swebench.LoadDataset(*dataset)
 	if err != nil {
 		return err
@@ -466,9 +477,16 @@ func planPlacementCmd(args []string, stderr io.Writer) error {
 			return err
 		}
 	}
-	domains, err := swebench.ReadPlacementDomains(*domainsFile)
+	domains, skipped, err := swebench.ReadPlacementDomains(*domainsFile)
 	if err != nil {
 		return err
+	}
+	if nodeCacheBudget > 0 {
+		for i := range domains {
+			if domains[i].NodeCacheBytes == 0 {
+				domains[i].NodeCacheBytes = nodeCacheBudget
+			}
+		}
 	}
 	opts := swebench.PlanOptions{
 		Instances:              selected,
@@ -492,6 +510,11 @@ func planPlacementCmd(args []string, stderr io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stderr, "placed %d images in %d domains; %d unplaced; wrote %s\n", len(plan.Images), len(plan.Domains), len(plan.Unplaced), *out)
+	// A skipped pool gets no image, so a run that expects it warm must see
+	// why it is not in the plan.
+	for _, sk := range skipped {
+		fmt.Fprintf(stderr, "  skipped pool %s\n", sk)
+	}
 	for _, d := range plan.Domains {
 		fill := "no budget"
 		if d.NodeCacheBytes > 0 {

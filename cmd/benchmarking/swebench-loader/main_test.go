@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
@@ -664,6 +665,81 @@ func TestPlanPlacementCmd(t *testing.T) {
 	}
 	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "-hot-demand", "4"}, &stderr); err == nil {
 		t.Error("-hot-demand without -schedule accepted")
+	}
+	// The output of `ate-env placement-domains --json` as the domains file,
+	// with -node-cache-bytes for the budget it does not carry.
+	apiDomains := filepath.Join(dir, "api-domains.json")
+	if err := os.WriteFile(apiDomains, []byte(`{"domains":[
+		{"name":"pool-d0","worker_namespace":"ate-system","selector":{"ate-env/domain":"d0"},"nodes":4,"workers":8,"node_slots":1}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	apiOut := filepath.Join(dir, "api-plan.json")
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", apiDomains, "-node-cache-bytes", "8GB", "-default-image-size", "1GiB", "-out", apiOut}, &stderr); err != nil {
+		t.Fatalf("plan-placement over the API's domains: %v\n%s", err, stderr.String())
+	}
+	apiPlan, err := swebench.ReadImagePlacement(apiOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := apiPlan.Domains[0]; d.NodeCacheBytes != 8_000_000_000 || d.NodeSlots != 2 || d.Workers != 8 {
+		t.Errorf("domain from the API output = %+v, want the 8GB budget, node_slots 1 per worker x 2 per node, workers kept", d)
+	}
+	// 7.5 GB unpacked a does not fit the 8 GB budget next to the assumed b (2.5 GB): one is unplaced.
+	if len(apiPlan.Unplaced) != 1 {
+		t.Errorf("unplaced = %+v, want the budget to bite", apiPlan.Unplaced)
+	}
+	// A pool no selector addresses is not planned over and the command says
+	// why; the plan carries the addressable pool alone.
+	skipDomains := filepath.Join(dir, "api-domains-skip.json")
+	if err := os.WriteFile(skipDomains, []byte(`{"domains":[
+		{"name":"pool-starting","worker_namespace":"ate-system","selector":{"ate-env/domain":"d1"},"nodes":0,"workers":2,"node_slots":10},
+		{"name":"pool-d0","worker_namespace":"ate-system","selector":{"ate-env/domain":"d0"},"nodes":4,"workers":8,"node_slots":1}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skipOut := filepath.Join(dir, "api-plan-skip.json")
+	stderr.Reset()
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", skipDomains, "-default-image-size", "1GiB", "-out", skipOut}, &stderr); err != nil {
+		t.Fatalf("plan-placement over a file with an unaddressable pool: %v\n%s", err, stderr.String())
+	}
+	if want := "skipped pool ate-system/pool-starting: its workers report no node"; !strings.Contains(stderr.String(), want) {
+		t.Errorf("stderr lacks %q:\n%s", want, stderr.String())
+	}
+	skipPlan, err := swebench.ReadImagePlacement(skipOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipPlan.Domains) != 1 || skipPlan.Domains[0].Name != "pool-d0" {
+		t.Errorf("plan domains = %+v, want pool-d0 alone", skipPlan.Domains)
+	}
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", apiDomains, "-node-cache-bytes", "lots"}, &stderr); err == nil {
+		t.Error("-node-cache-bytes lots accepted")
+	}
+	// A budget of zero is not "no budget": it is refused, before the dataset
+	// is read.
+	for _, v := range []string{"0", "0GB", "0.4B"} {
+		if err := planPlacementCmd([]string{"-dataset", filepath.Join(dir, "missing.jsonl"), "-domains", apiDomains, "-node-cache-bytes", v}, &stderr); err == nil || !strings.Contains(err.Error(), "not a budget above zero") {
+			t.Errorf("-node-cache-bytes %s: err = %v, want a refusal before the dataset is read", v, err)
+		}
+	}
+	// -help names each flag's argument by its type: a backquoted span in a
+	// usage string would become the argument's name (flag.UnquoteUsage).
+	var help bytes.Buffer
+	if err := planPlacementCmd([]string{"-h"}, &help); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("-h: err = %v, want flag.ErrHelp", err)
+	}
+	flagLine := regexp.MustCompile(`^  -[a-z-]+( (string|int|float|duration|uint|value))?$`)
+	var flagLines int
+	for _, line := range strings.Split(help.String(), "\n") {
+		if !strings.HasPrefix(line, "  -") {
+			continue
+		}
+		flagLines++
+		if !flagLine.MatchString(line) {
+			t.Errorf("-h prints %q, want the flag and its type", line)
+		}
+	}
+	if flagLines == 0 || !strings.Contains(help.String(), "  -domains string\n") || !strings.Contains(help.String(), "  -node-cache-bytes string\n") {
+		t.Errorf("-h output lacks -domains string and -node-cache-bytes string:\n%s", help.String())
 	}
 	sched := filepath.Join(dir, "schedule.json")
 	all, err := swebench.LoadDataset(manifest)
