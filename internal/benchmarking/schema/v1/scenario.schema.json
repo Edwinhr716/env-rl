@@ -8,6 +8,8 @@
   "properties": {
     "schema_version": { "type": "string", "enum": ["v1"] },
     "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "seed": { "type": "integer" },
     "repeat": { "type": "integer", "minimum": 0 },
     "footing": { "type": "string", "enum": ["warm", "cold"] },
     "sut": { "$ref": "#/$defs/SUTSpec" },
@@ -17,11 +19,16 @@
       "items": { "$ref": "#/$defs/JobSpec" }
     },
     "window_policy": { "$ref": "#/$defs/WindowPolicy" },
+    "window": { "$ref": "#/$defs/WindowPolicy" },
     "telemetry": { "$ref": "#/$defs/TelemetrySpec" },
     "preflight": { "$ref": "#/$defs/PreflightSpec" },
     "variants": {
       "type": "array",
       "items": { "$ref": "#/$defs/FeatureOverlay" }
+    },
+    "overlays": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/FeatureOverlay" }
     }
   },
   "$defs": {
@@ -91,6 +98,18 @@
         "extra_args": {
           "type": "object",
           "additionalProperties": { "type": "string" }
+        },
+        "namespace": { "type": "string" },
+        "template": { "type": "string" },
+        "server_addr": { "type": "string" },
+        "storage_backend": { "type": "string" },
+        "pool_enabled": { "type": "boolean" },
+        "pool_size_per_image": { "type": "integer" },
+        "max_active_pods": { "type": "integer" },
+        "values_overlay": { "type": "object" },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
         }
       }
     },
@@ -105,28 +124,56 @@
     "JobSpec": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "kind"],
+      "required": ["name"],
+      "anyOf": [{ "required": ["kind"] }, { "required": ["mode"] }],
       "properties": {
         "name": { "type": "string", "minLength": 1 },
         "kind": { "type": "string", "enum": ["simulated", "real"] },
+        "mode": { "type": "string", "enum": ["closed-loop", "open-loop", "real"] },
         "loader_mode": { "type": "string", "enum": ["eval", "steps", "open-loop"] },
         "real_mode": { "type": "string", "enum": ["measure", "trace"] },
+        "priority": { "type": "integer" },
+        "weight": { "type": "number" },
         "start_offset_ms": { "type": "number", "minimum": 0 },
         "dataset": { "type": "string" },
+        "dataset_path": { "type": "string" },
         "trajectory": { "type": "string" },
+        "image_prefix": { "type": "string" },
         "park": {
           "type": "string",
-          "enum": ["suspend-async", "suspend-sync", "fork", "delete", "none", "suspend"]
+          "enum": ["suspend-async", "suspend-sync", "fork", "delete", "none", "suspend", "hold", "snapshot", "release"]
+        },
+        "park_policy": {
+          "type": "string",
+          "enum": ["suspend-async", "suspend-sync", "fork", "delete", "none", "suspend", "hold", "snapshot", "release"]
         },
         "images": { "type": "integer", "minimum": 0 },
+        "instances": { "type": "integer" },
         "tasks_per_step": { "type": "integer", "minimum": 0 },
+        "batch_size": { "type": "integer" },
         "group_size": { "type": "integer", "minimum": 0 },
+        "rollouts_per_task": { "type": "integer" },
         "steps": { "type": "integer", "minimum": 0 },
         "max_concurrent": { "type": "integer", "minimum": 0 },
+        "concurrency": { "type": "integer" },
         "step_pause_ms": { "type": "number", "minimum": 0 },
+        "arrival_rate": { "type": "number" },
+        "duration_sec": { "type": "number" },
         "prefetch": { "type": "boolean" },
+        "lookahead_steps": { "type": "integer" },
+        "snapshot_loop": { "type": "boolean" },
         "seed": { "type": "integer" },
-        "schedule_mode": { "type": "string", "enum": ["fixed", "sampled", "explicit"] }
+        "schedule_mode": { "type": "string", "enum": ["fixed", "sampled", "explicit"] },
+        "trainer_manifest": { "type": "string" },
+        "trainer_command": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "trace_mode": { "type": "string" },
+        "env_vars": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
       }
     },
     "WindowPolicy": {
@@ -136,6 +183,9 @@
         "steady_state_start_step": { "type": "integer", "minimum": 0 },
         "steady_state_end_step": { "type": "integer", "minimum": 0 },
         "warmup_steps": { "type": "integer", "minimum": 0 },
+        "cooldown_steps": { "type": "integer" },
+        "warmup_sec": { "type": "number" },
+        "cooldown_sec": { "type": "number" },
         "max_duration_s": { "type": "number", "minimum": 0 }
       }
     },
@@ -144,13 +194,23 @@
       "additionalProperties": false,
       "required": ["name"],
       "properties": {
+        "schema_version": { "type": "string", "enum": ["v1"] },
         "name": { "type": "string", "minLength": 1 },
         "description": { "type": "string" },
         "park": {
           "type": "string",
-          "enum": ["suspend-async", "suspend-sync", "fork", "delete", "none", "suspend"]
+          "enum": ["suspend-async", "suspend-sync", "fork", "delete", "none", "suspend", "hold", "snapshot", "release"]
+        },
+        "park_policy": {
+          "type": "string",
+          "enum": ["suspend-async", "suspend-sync", "fork", "delete", "none", "suspend", "hold", "snapshot", "release"]
         },
         "prefetch": { "type": "boolean" },
+        "lookahead_steps": { "type": "integer" },
+        "warm_pool_size": { "type": "integer" },
+        "snapshot_mode": { "type": "string" },
+        "prewarm_policy": { "type": "string" },
+        "sut": { "$ref": "#/$defs/SUTSpec" },
         "env_vars": {
           "type": "object",
           "additionalProperties": { "type": "string" }

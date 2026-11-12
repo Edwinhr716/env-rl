@@ -422,6 +422,21 @@ user needs to know across them.
   stays as a re-export of the new module, with the same names.
 
 ### Fixed
+- `internal/benchmarking/schema/v1/scenario.schema.json` describes every
+  field `bench run` reads: it lacked 41 of them (`description`, `seed`,
+  `window`, `overlays`, and fields of the SUT, job, window and overlay
+  blocks), required a job's `kind` where `mode` is accepted, and refused
+  the `hold`, `snapshot` and `release` park policies, so the scenarios
+  under `benchmarking/scenarios/` did not validate against it. A test now
+  fails when a scenario type gains a field the schema lacks, or when a
+  field's type, a `$ref` target or an element type differs.
+- `validate_schema.py` without the `jsonschema` package enforces `anyOf`
+  (it accepted a scenario job with neither `kind` nor `mode`), and
+  `--schema` takes the names `scenario`, `measurements`, `node_cache` and
+  `restore_sample`.
+- `swebench-loader preflight -events-dir <run>/events` writes its two files
+  to `<run>`, next to the shards directory, as documented, where it wrote
+  them among the shards; `-out` and `-coverage-out` on one path are refused.
 - `swebench-loader preflight -events-dir <run>/events` writes its two files
   to `<run>`, next to the shards directory, as documented, where it wrote
   them among the shards; `-out` and `-coverage-out` on one path are refused.

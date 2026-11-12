@@ -39,10 +39,14 @@ SCHEMA_DIR = Path(__file__).resolve().parent / "v1"
 SCHEMA_MAP = {
     "event": "event.schema.json",
     "image_placement": "image_placement.schema.json",
+    "measurements": "measurements.schema.json",
+    "node_cache": "node_cache.schema.json",
     "placement": "placement.schema.json",
     "preflight_coverage": "preflight_coverage.schema.json",
     "report": "report.schema.json",
+    "restore_sample": "restore_sample.schema.json",
     "run_window": "run_window.schema.json",
+    "scenario": "scenario.schema.json",
     "schedule": "schedule.schema.json",
     "stats_row": "stats_row.schema.json",
     "system_description": "system_description.schema.json",
@@ -133,6 +137,28 @@ def _check_scalar_constraints(
             )
 
 
+def _check_any_of(
+    instance: Any,
+    schema: dict[str, Any],
+    root_schema: dict[str, Any],
+    path: str,
+) -> None:
+    """Validate anyOf: instance must satisfy at least one of the subschemas."""
+    branches = schema.get("anyOf")
+    if not branches:
+        return
+    failures = []
+    for sub_schema in branches:
+        try:
+            _validate_stdlib(instance, sub_schema, root_schema, path)
+            return
+        except SchemaValidationError as exc:
+            failures.append(str(exc))
+    raise SchemaValidationError(
+        f"{path}: anyOf: no subschema matched ({'; '.join(failures)})"
+    )
+
+
 def _check_container_constraints(
     instance: Any,
     schema: dict[str, Any],
@@ -196,6 +222,7 @@ def _validate_stdlib(
 
     _check_scalar_constraints(instance, schema, path)
     _check_container_constraints(instance, schema, root_schema, path)
+    _check_any_of(instance, schema, root_schema, path)
 
 
 def validate_instance(instance: Any, schema: dict[str, Any]) -> None:

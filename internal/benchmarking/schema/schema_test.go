@@ -622,6 +622,72 @@ func TestPythonSchemaValidatorCLI(t *testing.T) {
 		}
 	})
 
+	// stdlib runs validate_schema.py with the jsonschema package hidden, so
+	// the subtests below exercise the fallback wherever they run.
+	stdlib := func(args ...string) *exec.Cmd {
+		const hide = `import runpy, sys; sys.modules["jsonschema"] = None; sys.argv[0] = "validate_schema.py"; runpy.run_path("validate_schema.py", run_name="__main__")`
+		return exec.Command(py, append([]string{"-c", hide}, args...)...)
+	}
+	scenarioWithJob := func(t *testing.T, job string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "scenario.json")
+		doc := `{"schema_version":"v1","name":"s","sut":{},"jobs":[` + job + `]}`
+		if err := os.WriteFile(p, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// A job needs kind or mode (anyOf in $defs/JobSpec). The fallback and
+	// the Go validator must give the same verdict.
+	for _, tc := range []struct {
+		name, job string
+		valid     bool
+	}{
+		{"kind only", `{"name":"j1","kind":"real","real_mode":"measure"}`, true},
+		{"mode only", `{"name":"j1","mode":"closed-loop"}`, true},
+		{"kind and mode", `{"name":"j1","kind":"simulated","mode":"closed-loop"}`, true},
+		{"no kind or mode", `{"name":"j1"}`, false},
+	} {
+		t.Run("stdlib fallback scenario job: "+tc.name, func(t *testing.T) {
+			p := scenarioWithJob(t, tc.job)
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if goErr := ValidateAgainstJSONSchema("scenario.schema.json", raw); (goErr == nil) != tc.valid {
+				t.Fatalf("Go validator: valid=%v, want %v (%v)", goErr == nil, tc.valid, goErr)
+			}
+			out, err := stdlib("--schema", "scenario", p).CombinedOutput()
+			if (err == nil) != tc.valid {
+				t.Fatalf("stdlib fallback: valid=%v, want %v\n%s", err == nil, tc.valid, out)
+			}
+			if !tc.valid && !strings.Contains(string(out), "anyOf") {
+				t.Errorf("the error does not name anyOf:\n%s", out)
+			}
+		})
+	}
+
+	t.Run("SCHEMA_MAP names each v1 schema", func(t *testing.T) {
+		out, err := exec.Command(py, "-B", "-c", `import validate_schema as v; print("\n".join(sorted(v.SCHEMA_MAP.values())))`).Output()
+		if err != nil {
+			t.Fatalf("list SCHEMA_MAP: %v", err)
+		}
+		mapped := map[string]bool{}
+		for _, f := range strings.Fields(string(out)) {
+			mapped[f] = true
+		}
+		files, err := filepath.Glob(filepath.Join("v1", "*.schema.json"))
+		if err != nil || len(files) == 0 {
+			t.Fatalf("glob v1 schemas: %v (%d files)", err, len(files))
+		}
+		for _, f := range files {
+			if !mapped[filepath.Base(f)] {
+				t.Errorf("SCHEMA_MAP has no name for %s", filepath.Base(f))
+			}
+		}
+	})
+
 	t.Run("rejects unknown field", func(t *testing.T) {
 		tmp := t.TempDir()
 		badPath := filepath.Join(tmp, "bad.jsonl")
