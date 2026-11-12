@@ -41,6 +41,9 @@ user needs to know across them.
   error. A hand-written domain with the same fault is refused, and so is a
   malformed entry (a negative count, a planner field set, an empty label key,
   a worker count that overflows `node_slots`) in a skipped pool.
+- Python client: `Client(credentials=...)` connects to ate-env-api over TLS
+  with the given `grpc.ChannelCredentials`, as the Go client can with
+  `DialOptions`. Without it the channel stays plaintext.
 - `swebench-loader run -preflight`: with `-placement`, runs the pre-flight
   over the plan inside the same command before the run (the `preflight`
   subcommand's defaults), writing `preflight-events.jsonl` and

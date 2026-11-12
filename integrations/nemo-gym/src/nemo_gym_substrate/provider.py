@@ -1026,7 +1026,7 @@ class SubstrateSandboxProvider:
         options = [("grpc.use_local_subchannel_pool", 1)] if own_connection else None
         url = urlparse(api_url if "://" in api_url else f"//{api_url}")
         if url.scheme == "https":
-            # ate_env_rl.Client only dials h2c itself; hand it a TLS channel.
+            # Hand Client a TLS channel with default roots for https:// endpoints.
             target = f"{url.hostname}:{url.port or 443}"
             channel = grpc.aio.secure_channel(
                 target, grpc.ssl_channel_credentials(), options=options
