@@ -53,8 +53,10 @@ type JobScheduleSpec struct {
 	Steps         int
 	TasksPerStep  int
 	GroupSize     int
-	Instances     []Instance
-	ExplicitJob   *schema.ScheduledJob
+	// LookaheadSteps is how many steps ahead the prefetch hints look; 0 means 1.
+	LookaheadSteps int
+	Instances      []Instance
+	ExplicitJob    *schema.ScheduledJob
 }
 
 // ResolveScheduleOptions configures multi-job deterministic schedule resolution.
@@ -145,7 +147,7 @@ func resolveJobSchedule(idx int, spec JobScheduleSpec) (schema.ScheduledJob, err
 			}
 			cp.ParkPolicy = norm
 		}
-		populatePrefetchImages(cp.Steps)
+		PopulatePrefetchImages(cp.Steps, spec.LookaheadSteps)
 		return cp, nil
 	}
 
@@ -190,7 +192,7 @@ func resolveJobSchedule(idx int, spec JobScheduleSpec) (schema.ScheduledJob, err
 		return schema.ScheduledJob{}, fmt.Errorf("swebench: job %s: unsupported schedule source %q", spec.JobID, src)
 	}
 
-	populatePrefetchImages(steps)
+	PopulatePrefetchImages(steps, spec.LookaheadSteps)
 	return schema.ScheduledJob{
 		Job:           spec.JobID,
 		StartOffsetMS: spec.StartOffsetMS,
@@ -242,26 +244,36 @@ func buildScheduledStep(stepNum int, picked []Instance, groupSize int, trajector
 	}
 }
 
-// populatePrefetchImages computes Step[s].PrefetchImages = need(s+1) \ active(s)
-// in deterministic order of first appearance in Step[s+1].
-func populatePrefetchImages(steps []schema.ScheduledStep) {
-	for s := 0; s+1 < len(steps); s++ {
+// PopulatePrefetchImages sets Step[s].PrefetchImages to the images of steps
+// s+1 through s+lookahead that step s does not run, in order of first
+// appearance; the last step gets none. A lookahead of 0 or less means 1, the
+// default for a job without lookahead_steps. The schedule generator and
+// bench run -overlay both call it, so a run with and without an overlay gets
+// the same hints for the same job settings.
+func PopulatePrefetchImages(steps []schema.ScheduledStep, lookahead int) {
+	if lookahead <= 0 {
+		lookahead = 1
+	}
+	for s := range steps {
+		if s+1 >= len(steps) {
+			steps[s].PrefetchImages = nil
+			continue
+		}
 		active := make(map[string]bool, len(steps[s].Tasks))
 		for _, t := range steps[s].Tasks {
 			active[t.Image] = true
 		}
-		seen := make(map[string]bool, len(steps[s+1].Tasks))
+		seen := make(map[string]bool)
 		var prefetch []string
-		for _, t := range steps[s+1].Tasks {
-			if !active[t.Image] && !seen[t.Image] {
-				seen[t.Image] = true
-				prefetch = append(prefetch, t.Image)
+		for next := s + 1; next < len(steps) && next <= s+lookahead; next++ {
+			for _, t := range steps[next].Tasks {
+				if !active[t.Image] && !seen[t.Image] {
+					seen[t.Image] = true
+					prefetch = append(prefetch, t.Image)
+				}
 			}
 		}
 		steps[s].PrefetchImages = prefetch
-	}
-	if len(steps) > 0 {
-		steps[len(steps)-1].PrefetchImages = nil
 	}
 }
 
@@ -344,17 +356,18 @@ func ResolveScenarioSchedule(scen schema.Scenario, defaultDataset string, datase
 			jSeed = uint64(seed + int64(idx)*1000)
 		}
 		jobs = append(jobs, JobScheduleSpec{
-			JobID:         j.Name,
-			Source:        src,
-			Seed:          jSeed,
-			StartOffsetMS: j.StartOffsetMS,
-			StepPauseMS:   j.StepPauseMS,
-			ParkPolicy:    park,
-			Trajectory:    traj,
-			Steps:         stepsCount,
-			TasksPerStep:  tasksPerStep,
-			GroupSize:     groupSize,
-			Instances:     instances,
+			JobID:          j.Name,
+			Source:         src,
+			Seed:           jSeed,
+			StartOffsetMS:  j.StartOffsetMS,
+			StepPauseMS:    j.StepPauseMS,
+			ParkPolicy:     park,
+			Trajectory:     traj,
+			Steps:          stepsCount,
+			TasksPerStep:   tasksPerStep,
+			GroupSize:      groupSize,
+			LookaheadSteps: j.LookaheadSteps,
+			Instances:      instances,
 		})
 	}
 	return ResolveSchedule(ResolveScheduleOptions{
@@ -486,16 +499,17 @@ func (g *ScheduleGenerator) Generate(opts ScheduleOptions, instances []Instance)
 		Seed:         int64(g.seed),
 		Jobs: []JobScheduleSpec{
 			{
-				JobID:         jobName,
-				Source:        ScheduleSourceSampled,
-				Seed:          g.seed,
-				StartOffsetMS: opts.StartOffsetMS,
-				StepPauseMS:   opts.StepPauseMS,
-				ParkPolicy:    schema.ParkPolicy(opts.ParkPolicy),
-				Steps:         steps,
-				TasksPerStep:  batch,
-				GroupSize:     rollouts,
-				Instances:     instances,
+				JobID:          jobName,
+				Source:         ScheduleSourceSampled,
+				Seed:           g.seed,
+				StartOffsetMS:  opts.StartOffsetMS,
+				StepPauseMS:    opts.StepPauseMS,
+				ParkPolicy:     schema.ParkPolicy(opts.ParkPolicy),
+				Steps:          steps,
+				TasksPerStep:   batch,
+				GroupSize:      rollouts,
+				LookaheadSteps: opts.LookaheadSteps,
+				Instances:      instances,
 			},
 		},
 	})

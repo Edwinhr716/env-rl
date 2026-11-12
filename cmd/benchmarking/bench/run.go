@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -94,6 +95,11 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 	}
 
 	overlays := parseOverlayFlag(*overlayFlag)
+	for _, name := range overlays {
+		if err := schema.ValidateOverlayName(name); err != nil {
+			return fmt.Errorf("-overlay: %w", err)
+		}
+	}
 	ctx := context.Background()
 	if len(overlays) <= 1 {
 		ovName := ""
@@ -111,6 +117,9 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 	}
 
 	nameA, nameB := overlays[0], overlays[1]
+	if nameA == nameB {
+		return fmt.Errorf("-overlay %s,%s: a pair needs two different overlays, or arm B overwrites arm A", nameA, nameB)
+	}
 	dirA := filepath.Join(targetDir, nameA)
 	dirB := filepath.Join(targetDir, nameB)
 	repA, err := executeScenarioRun(ctx, &scen, sched, nameA, *runID+"-a", *cluster, dirA)
@@ -165,56 +174,32 @@ func executeScenarioRun(
 	cluster string,
 	outDir string,
 ) (*swebench.Report, error) {
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return nil, err
-	}
-
-	runScen := *scen
-	if len(scen.Jobs) > 0 {
-		runScen.Jobs = append([]schema.JobSpec(nil), scen.Jobs...)
-		for i := range runScen.Jobs {
-			if len(scen.Jobs[i].TrainerCommand) > 0 {
-				runScen.Jobs[i].TrainerCommand = append([]string(nil), scen.Jobs[i].TrainerCommand...)
-			}
-			if len(scen.Jobs[i].EnvVars) > 0 {
-				envCopy := make(map[string]string, len(scen.Jobs[i].EnvVars))
-				for k, v := range scen.Jobs[i].EnvVars {
-					envCopy[k] = v
-				}
-				runScen.Jobs[i].EnvVars = envCopy
-			}
-		}
-	}
-	if len(scen.SUT.ExtraArgs) > 0 {
-		extraCopy := make(map[string]string, len(scen.SUT.ExtraArgs))
-		for k, v := range scen.SUT.ExtraArgs {
-			extraCopy[k] = v
-		}
-		runScen.SUT.ExtraArgs = extraCopy
-	}
-	if len(scen.SUT.Labels) > 0 {
-		labelsCopy := make(map[string]string, len(scen.SUT.Labels))
-		for k, v := range scen.SUT.Labels {
-			labelsCopy[k] = v
-		}
-		runScen.SUT.Labels = labelsCopy
-	}
-	defaultSource := string(schema.SourceWarmPool)
+	// Resolve the overlay before anything touches outDir, so a bad name
+	// creates no directory.
+	runScen := cloneScenario(scen)
+	var resolvedOv *schema.FeatureOverlay
 	if overlayName != "" {
-		ov, err := overlay.ResolveOverlay(overlayName, scen.Overlays)
+		ov, err := resolveScenarioOverlay(overlayName, scen)
 		if err != nil {
 			return nil, err
 		}
-		if ov.PrewarmPolicy == "warm" {
-			runScen.Footing = "warm"
-		} else if ov.PrewarmPolicy == "cold" || ov.PrewarmPolicy == "none" {
-			runScen.Footing = "cold"
+		if err := applyFeatureOverlay(&runScen, ov); err != nil {
+			return nil, err
 		}
-		if ov.WarmPoolSize > 0 {
-			defaultSource = string(schema.SourceWarmPool)
-		} else {
-			defaultSource = string(schema.SourceColdStart)
-		}
+		resolvedOv = ov
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return nil, err
+	}
+	defaultSource := string(acquisitionSource(&runScen, resolvedOv))
+	// The footing the run executes with. The acquisition source decides it,
+	// not runScen.Footing alone: sut.pool_enabled: false acquires cold on a
+	// warm footing, and a pool acquires warm on an omitted footing. The
+	// prewarm event, lifecycle_policy and Validity Rule 1 follow it, so they
+	// agree with the acquisitions report.json records.
+	runFooting := "cold"
+	if defaultSource == string(schema.SourceWarmPool) {
+		runFooting = "warm"
 	}
 
 	// 1. Render SUT manifest and system_description.json.
@@ -227,6 +212,12 @@ func executeScenarioRun(
 		return nil, err
 	}
 	sysDesc := sut.BuildSystemDescription(runScen.SUT, cluster, "v1.31", "HEAD", "verified", nil)
+	if sysDesc.Backend == "" {
+		sysDesc.Backend = runScen.SUT.Backend
+	}
+	if sysDesc.Access == "" {
+		sysDesc.Access = runScen.SUT.Access
+	}
 	if overlayName != "" {
 		scenBytes, _ := json.Marshal(scen)
 		scenSum := sha256.Sum256(scenBytes)
@@ -235,12 +226,15 @@ func executeScenarioRun(
 		if basePath == "" {
 			basePath = "scenario.yaml"
 		}
-		sysDesc.Overlays = []schema.OverlayRef{{
+		ref := schema.OverlayRef{
 			Name:           overlayName,
 			Hash:           "sha256:" + hex.EncodeToString(ovSum[:8]),
 			BaseRecipePath: basePath,
 			BaseRecipeHash: "sha256:" + hex.EncodeToString(scenSum[:8]),
-		}}
+		}
+		recordOverlayInputs(&ref, resolvedOv)
+		recordResolvedJobSettings(&ref, runScen.Jobs)
+		sysDesc.Overlays = []schema.OverlayRef{ref}
 	}
 	if err := sut.WriteSystemDescription(filepath.Join(outDir, "system_description.json"), sysDesc); err != nil {
 		return nil, err
@@ -258,10 +252,11 @@ func executeScenarioRun(
 	}
 
 	// 3. Run ScenarioRunner across all jobs (writing schedule.json and events.jsonl).
+	execSched := executionSchedule(sched, &runScen, resolvedOv)
 	sr := &job.ScenarioRunner{
 		RunID:    runID,
 		Scenario: &runScen,
-		Schedule: sched,
+		Schedule: execSched,
 		OutDir:   outDir,
 		ClientFunc: func(_ schema.JobSpec) swebench.EnvClient {
 			return &localScenarioEnvClient{source: defaultSource}
@@ -271,17 +266,30 @@ func executeScenarioRun(
 	if err := sr.Run(ctx); err != nil {
 		return nil, err
 	}
+	// The runner wrote the execution schedule. Replace it with the base
+	// schedule, so both sides of an A/B pair hold identical schedule.json
+	// files and the comparison's schedule match holds. The scenario's jobs,
+	// and OverlayRef in system_description.json with an overlay, record the
+	// settings the run executed with. A crash between the two writes leaves
+	// the execution schedule on disk.
+	if sched != nil {
+		if err := swebench.WriteSchedule(filepath.Join(outDir, "schedule.json"), sched); err != nil {
+			return nil, err
+		}
+	}
 
 	// 4. A scenario whose footing rests on a pre-flight names its coverage
 	// file: for a warm arm it goes into the bundle as preflight-coverage.json,
 	// the evidence Validity Rule 1 reads (a cold arm of an overlay run gets
 	// none, as a pre-flight contradicts cold footing). Without one, a warm
 	// footing gets the synthetic prewarm event this local run stands in
-	// with.
+	// with. The footing is the one the run executes with (runFooting, from
+	// the acquisition source), so a run that acquires cold on a scenario
+	// with footing: warm gets neither.
 	eventsPath := filepath.Join(outDir, "events.jsonl")
 	var coverage *schema.PreflightCoverage
 	coverageName := ""
-	if runScen.Preflight != nil && runScen.Footing == "warm" {
+	if runScen.Preflight != nil && runFooting == "warm" {
 		if runScen.Preflight.Coverage == "" {
 			// A plan alone is not evidence: the warm footing would fall back
 			// to the synthetic prewarm event and pass for the wrong reason.
@@ -300,7 +308,7 @@ func executeScenarioRun(
 		}
 		coverage = cov
 	}
-	if runScen.Footing == "warm" && coverage == nil {
+	if runFooting == "warm" && coverage == nil {
 		f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0o644)
 		if err == nil {
 			rec := swebench.NewRecorder(f)
@@ -335,7 +343,7 @@ func executeScenarioRun(
 		mode := "ephemeral"
 		parkMode := "ephemeral"
 		prewarm := false
-		if runScen.Footing == "warm" {
+		if runFooting == "warm" {
 			mode = "prewarmed"
 			parkMode = "suspend"
 			prewarm = true
@@ -344,6 +352,9 @@ func executeScenarioRun(
 			Mode:           mode,
 			ParkMode:       parkMode,
 			PrewarmAtStart: prewarm,
+			// The prewarm events the run wrote, so the file on disk agrees
+			// with report.json without the later AttachClusterTelemetry.
+			PrewarmCount: rep.PrewarmCount,
 		}
 	}
 	if err := sut.WriteSystemDescription(filepath.Join(outDir, "system_description.json"), sysDesc); err != nil {
@@ -351,7 +362,7 @@ func executeScenarioRun(
 	}
 	rep.AttachClusterTelemetry(&sysDesc, meas)
 	swebench.Validate(rep, swebench.ValidateOptions{
-		Footing:        runScen.Footing,
+		Footing:        runFooting,
 		Schedule:       sched,
 		TraceCaptured:  slices.ContainsFunc(runScen.Jobs, func(j schema.JobSpec) bool { return j.TraceMode == "trace" }),
 		TraceFileCount: len(swebench.FindTraceFiles(outDir)),
@@ -378,6 +389,420 @@ func executeScenarioRun(
 		return nil, err
 	}
 	return rep, nil
+}
+
+func cloneScenario(scen *schema.Scenario) schema.Scenario {
+	runScen := *scen
+	runScen.SUT = cloneSUTSpec(scen.SUT)
+	if len(scen.Jobs) > 0 {
+		runScen.Jobs = slices.Clone(scen.Jobs)
+		for i := range runScen.Jobs {
+			runScen.Jobs[i].TrainerCommand = slices.Clone(scen.Jobs[i].TrainerCommand)
+			runScen.Jobs[i].EnvVars = maps.Clone(scen.Jobs[i].EnvVars)
+		}
+	}
+	return runScen
+}
+
+func cloneSUTSpec(s schema.SUTSpec) schema.SUTSpec {
+	out := s
+	if s.Substrate != nil {
+		sub := *s.Substrate
+		out.Substrate = &sub
+	}
+	if s.PoolEnabled != nil {
+		pe := *s.PoolEnabled
+		out.PoolEnabled = &pe
+	}
+	out.ExtraArgs = maps.Clone(s.ExtraArgs)
+	out.ValuesOverlay = maps.Clone(s.ValuesOverlay)
+	out.Labels = maps.Clone(s.Labels)
+	return out
+}
+
+// acquisitionSource is the source the local scenario client reports for a
+// run of runScen, after ov (nil without -overlay) was applied. The pool
+// fields and the footing decide, with or without an overlay: a pool that is
+// off acquires cold; a cold footing acquires cold, because the pool was not
+// filled before the run window, unless the overlay itself sized or enabled
+// the pool; a pool that is on or a warm footing acquires from the pool.
+func acquisitionSource(runScen *schema.Scenario, ov *schema.FeatureOverlay) schema.AcquisitionSource {
+	s := runScen.SUT
+	poolOn := s.PoolSizePerImg > 0 || (s.PoolEnabled != nil && *s.PoolEnabled)
+	overlayPool := ov != nil && (ov.WarmPoolSize > 0 ||
+		ov.SUT.PoolSizePerImg > 0 ||
+		(ov.SUT.PoolEnabled != nil && *ov.SUT.PoolEnabled))
+	switch {
+	case s.PoolEnabled != nil && !*s.PoolEnabled:
+		return schema.SourceColdStart
+	case runScen.Footing == "cold" && !overlayPool:
+		// A base pool size stays in the manifest, but the run acquires cold.
+		return schema.SourceColdStart
+	case poolOn, runScen.Footing == "warm":
+		return schema.SourceWarmPool
+	default:
+		return schema.SourceColdStart
+	}
+}
+
+func resolveScenarioOverlay(name string, scen *schema.Scenario) (*schema.FeatureOverlay, error) {
+	if err := schema.ValidateOverlayName(name); err != nil {
+		return nil, err
+	}
+	var merged map[string]schema.FeatureOverlay
+	if len(scen.Variants) > 0 || len(scen.Overlays) > 0 {
+		merged = make(map[string]schema.FeatureOverlay, len(scen.Variants)+len(scen.Overlays))
+		for _, v := range scen.Variants {
+			if v.Name != "" {
+				merged[v.Name] = v
+			}
+		}
+		for k, v := range scen.Overlays {
+			merged[k] = v
+		}
+	}
+	ov, err := overlay.ResolveOverlay(name, merged)
+	if err != nil {
+		return nil, err
+	}
+	if err := ov.Validate(); err != nil {
+		return nil, err
+	}
+	return ov, nil
+}
+
+// applyFeatureOverlay applies ov to runScen in place. An overlay that fails
+// FeatureOverlay.Validate is an error before anything changes, so a value
+// outside its range (prewarm_policy: "off", warm_pool_size: -4) never runs as
+// the base scenario.
+func applyFeatureOverlay(runScen *schema.Scenario, ov *schema.FeatureOverlay) error {
+	if ov == nil {
+		return nil
+	}
+	if err := ov.Validate(); err != nil {
+		return err
+	}
+	if ov.PrewarmPolicy != "" {
+		footing, err := schema.FootingForPrewarmPolicy(ov.PrewarmPolicy)
+		if err != nil {
+			return fmt.Errorf("overlay %q: %w", ov.Name, err)
+		}
+		runScen.Footing = footing
+	}
+	// warm_pool_size and prewarm_policy are separate knobs: a cold prewarm
+	// policy leaves the base pool size alone.
+	if ov.WarmPoolSize > 0 {
+		runScen.SUT.PoolSizePerImg = ov.WarmPoolSize
+	}
+	// A pool size from the overlay turns the pool on, so a base with
+	// sut.pool_enabled: false acquires from the pool the overlay sized. An
+	// overlay sut.pool_enabled wins; the merge below applies it.
+	if ov.SUT.PoolEnabled == nil && (ov.WarmPoolSize > 0 || ov.SUT.PoolSizePerImg > 0) {
+		on := true
+		runScen.SUT.PoolEnabled = &on
+	}
+
+	mergeSUTSpec(&runScen.SUT, ov.SUT)
+	if err := runScen.SUT.Validate(); err != nil {
+		return fmt.Errorf("overlay %q sut: %w", ov.Name, err)
+	}
+	// flags reach the trainer command of each real job only. The ate-env-api
+	// arguments come from sut.extra_args, so a trainer flag never lands in
+	// the manifest and an API flag never lands in the trainer argv. A
+	// simulated job runs no trainer, and a trainer_manifest job takes no
+	// argv, so flags on a scenario without a real trainer_command job are an
+	// error: system_description.json would record them as active.
+	if args := trainerFlagArgs(ov.Flags); len(args) > 0 {
+		applied := 0
+		for i := range runScen.Jobs {
+			j := &runScen.Jobs[i]
+			if !isRealJob(*j) {
+				continue
+			}
+			if len(j.TrainerCommand) == 0 {
+				return fmt.Errorf("overlay %q: flags reach a trainer_command only; real job %q runs a trainer_manifest", ov.Name, j.Name)
+			}
+			j.TrainerCommand = append(j.TrainerCommand, args...)
+			applied++
+		}
+		if applied == 0 {
+			return fmt.Errorf("overlay %q: flags need a real job with a trainer_command; the scenario has none", ov.Name)
+		}
+	}
+
+	// snapshot_mode drives the runner's snapshot loop only. The park policy
+	// is a separate knob and changes only when the overlay sets park or
+	// park_policy.
+	if ov.SnapshotMode != "" {
+		loop, err := schema.SnapshotLoopForMode(ov.SnapshotMode)
+		if err != nil {
+			return fmt.Errorf("overlay %q: %w", ov.Name, err)
+		}
+		for i := range runScen.Jobs {
+			runScen.Jobs[i].SnapshotLoop = loop
+		}
+	}
+
+	rawPark := ov.Park
+	if rawPark == "" && ov.ParkPolicy != "" {
+		rawPark = schema.ParkPolicy(ov.ParkPolicy)
+	}
+	if rawPark != "" {
+		normPark, err := schema.NormalizeParkPolicy(rawPark)
+		if err != nil {
+			return fmt.Errorf("overlay %q: %w", ov.Name, err)
+		}
+		for i := range runScen.Jobs {
+			runScen.Jobs[i].Park = normPark
+			runScen.Jobs[i].ParkPolicy = normPark
+		}
+	}
+
+	for i := range runScen.Jobs {
+		if ov.Prefetch != nil {
+			runScen.Jobs[i].Prefetch = *ov.Prefetch
+			if !*ov.Prefetch && ov.Lookahead == 0 {
+				runScen.Jobs[i].LookaheadSteps = 0
+			}
+		}
+		if ov.Lookahead > 0 {
+			runScen.Jobs[i].LookaheadSteps = ov.Lookahead
+			if ov.Prefetch == nil {
+				runScen.Jobs[i].Prefetch = true
+			}
+		}
+		if len(ov.EnvVars) > 0 {
+			if runScen.Jobs[i].EnvVars == nil {
+				runScen.Jobs[i].EnvVars = make(map[string]string, len(ov.EnvVars))
+			}
+			maps.Copy(runScen.Jobs[i].EnvVars, ov.EnvVars)
+		}
+	}
+	return nil
+}
+
+// trainerFlagArgs renders overlay flags as sorted -name=value arguments. A key
+// that already starts with "-" keeps its dashes.
+func trainerFlagArgs(flags map[string]string) []string {
+	if len(flags) == 0 {
+		return nil
+	}
+	keys := slices.Sorted(maps.Keys(flags))
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		name := k
+		if !strings.HasPrefix(name, "-") {
+			name = "-" + name
+		}
+		out = append(out, name+"="+flags[k])
+	}
+	return out
+}
+
+func mergeSUTSpec(dst *schema.SUTSpec, src schema.SUTSpec) {
+	if src.Backend != "" {
+		dst.Backend = src.Backend
+	}
+	if src.Access != "" {
+		dst.Access = src.Access
+	}
+	if src.Endpoint != "" {
+		dst.Endpoint = src.Endpoint
+	}
+	if src.Substrate != nil {
+		if dst.Substrate == nil {
+			dst.Substrate = &schema.SubstrateSUTSpec{}
+		}
+		if src.Substrate.Atespace != "" {
+			dst.Substrate.Atespace = src.Substrate.Atespace
+		}
+		if src.Substrate.BaseTemplate != "" {
+			dst.Substrate.BaseTemplate = src.Substrate.BaseTemplate
+		}
+	}
+	if src.NodePool != "" {
+		dst.NodePool = src.NodePool
+	}
+	if src.RuntimeClass != "" {
+		dst.RuntimeClass = src.RuntimeClass
+	}
+	if src.Replicas > 0 {
+		dst.Replicas = src.Replicas
+	}
+	if src.Namespace != "" {
+		dst.Namespace = src.Namespace
+	}
+	if src.Template != "" {
+		dst.Template = src.Template
+	}
+	if src.ServerAddr != "" {
+		dst.ServerAddr = src.ServerAddr
+	}
+	if src.StorageBackend != "" {
+		dst.StorageBackend = src.StorageBackend
+	}
+	if src.PoolEnabled != nil {
+		pe := *src.PoolEnabled
+		dst.PoolEnabled = &pe
+	}
+	if src.PoolSizePerImg > 0 {
+		dst.PoolSizePerImg = src.PoolSizePerImg
+	}
+	if src.MaxActivePods > 0 {
+		dst.MaxActivePods = src.MaxActivePods
+	}
+	if len(src.ExtraArgs) > 0 {
+		if dst.ExtraArgs == nil {
+			dst.ExtraArgs = make(map[string]string, len(src.ExtraArgs))
+		}
+		maps.Copy(dst.ExtraArgs, src.ExtraArgs)
+	}
+	if len(src.ValuesOverlay) > 0 {
+		if dst.ValuesOverlay == nil {
+			dst.ValuesOverlay = make(map[string]any, len(src.ValuesOverlay))
+		}
+		maps.Copy(dst.ValuesOverlay, src.ValuesOverlay)
+	}
+	if len(src.Labels) > 0 {
+		if dst.Labels == nil {
+			dst.Labels = make(map[string]string, len(src.Labels))
+		}
+		maps.Copy(dst.Labels, src.Labels)
+	}
+}
+
+// recordResolvedJobSettings records on ref the snapshot loop the simulated
+// jobs share after the overlay, and the park policy, prefetch and lookahead
+// the closed-loop jobs share, because schedule.json on disk is the base
+// schedule. An open-loop job runs no step schedule and ignores those three.
+// A setting the jobs disagree on stays unset.
+func recordResolvedJobSettings(ref *schema.OverlayRef, jobs []schema.JobSpec) {
+	var (
+		parks      []schema.ParkPolicy
+		loops      []bool
+		prefetches []bool
+		lookaheads []int
+	)
+	for _, j := range jobs {
+		if isRealJob(j) {
+			continue
+		}
+		loops = append(loops, j.SnapshotLoop)
+		if j.Mode == schema.JobModeOpenLoop {
+			continue
+		}
+		park := j.Park
+		if park == "" {
+			park = j.ParkPolicy
+		}
+		if park != "" {
+			if norm, err := schema.NormalizeParkPolicy(park); err == nil {
+				park = norm
+			}
+		}
+		parks = append(parks, park)
+		prefetches = append(prefetches, j.Prefetch)
+		lookaheads = append(lookaheads, j.LookaheadSteps)
+	}
+	if p, ok := uniform(parks); ok {
+		ref.ParkPolicy = p
+	}
+	if l, ok := uniform(loops); ok {
+		ref.SnapshotLoop = &l
+	}
+	if p, ok := uniform(prefetches); ok {
+		ref.Prefetch = &p
+	}
+	if n, ok := uniform(lookaheads); ok {
+		ref.LookaheadSteps = n
+	}
+}
+
+// isRealJob reports whether j launches a real trainer, by mode or by kind.
+func isRealJob(j schema.JobSpec) bool {
+	return j.Mode == schema.JobModeReal || j.Kind == "real"
+}
+
+// uniform returns the one value all of vals hold, and false when vals is
+// empty or holds more than one value.
+func uniform[T comparable](vals []T) (T, bool) {
+	var zero T
+	if len(vals) == 0 {
+		return zero, false
+	}
+	for _, v := range vals[1:] {
+		if v != vals[0] {
+			return zero, false
+		}
+	}
+	return vals[0], true
+}
+
+// recordOverlayInputs copies into ref the overlay inputs that neither the
+// manifest nor the base schedule shows: sut.extra_args as sut_overrides,
+// flags as flags, and the names of env_vars as env_var_names. The three
+// stay in separate fields, so an equal key in two of them survives. An
+// env_vars value never reaches system_description.json, which bench upload
+// publishes; the scenario the base_recipe_hash names holds it.
+func recordOverlayInputs(ref *schema.OverlayRef, ov *schema.FeatureOverlay) {
+	if ov == nil {
+		return
+	}
+	if len(ov.SUT.ExtraArgs) > 0 {
+		ref.SUTOverrides = maps.Clone(ov.SUT.ExtraArgs)
+	}
+	if len(ov.Flags) > 0 {
+		ref.Flags = maps.Clone(ov.Flags)
+	}
+	if len(ov.EnvVars) > 0 {
+		ref.EnvVarNames = slices.Sorted(maps.Keys(ov.EnvVars))
+	}
+}
+
+// executionSchedule is the schedule the runner executes: a copy of sched
+// whose prefetch hints follow each job's prefetch and lookahead_steps, after
+// ov (nil without -overlay) was applied, and whose park_policy follows the
+// jobs when ov sets park or park_policy. The generator fills every job's
+// hints, so a prefetch: false job would emit prefetch_hint events from the
+// base schedule. sched stays the base schedule, which schedule.json on disk
+// holds.
+func executionSchedule(sched *schema.Schedule, runScen *schema.Scenario, ov *schema.FeatureOverlay) *schema.Schedule {
+	if sched == nil {
+		return nil
+	}
+	jobByName := make(map[string]schema.JobSpec, len(runScen.Jobs))
+	for _, j := range runScen.Jobs {
+		jobByName[j.Name] = j
+	}
+	cp := *sched
+	cp.Jobs = make([]schema.ScheduledJob, len(sched.Jobs))
+	for i, sj := range sched.Jobs {
+		sjCopy := sj
+		sjCopy.Steps = make([]schema.ScheduledStep, len(sj.Steps))
+		for s, st := range sj.Steps {
+			stCopy := st
+			stCopy.Tasks = slices.Clone(st.Tasks)
+			stCopy.PrefetchImages = slices.Clone(st.PrefetchImages)
+			sjCopy.Steps[s] = stCopy
+		}
+		if spec, ok := jobByName[sj.Job]; ok {
+			if ov != nil && (ov.Park != "" || ov.ParkPolicy != "") {
+				sjCopy.ParkPolicy = spec.ParkPolicy
+			}
+			if spec.Prefetch {
+				// The generator's function and default, so a run with and
+				// without an overlay gets the same hints for the same job
+				// settings.
+				swebench.PopulatePrefetchImages(sjCopy.Steps, spec.LookaheadSteps)
+			} else {
+				for s := range sjCopy.Steps {
+					sjCopy.Steps[s].PrefetchImages = nil
+				}
+			}
+		}
+		cp.Jobs[i] = sjCopy
+	}
+	return &cp
 }
 
 func validateCmd(args []string, stdout, stderr io.Writer) error {

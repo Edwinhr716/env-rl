@@ -17,6 +17,7 @@ package schema
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -69,6 +70,20 @@ func TestFixturesValidateAndRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DecodeYAMLStrict: %v", err)
 		}
+		if v.SUT.PoolSizePerImg != 4 || v.SUT.PoolEnabled == nil || !*v.SUT.PoolEnabled || v.SUT.MaxActivePods != 64 {
+			t.Errorf("sut pool fields = size %d, enabled %v, max_active_pods %d; want 4, true, 64", v.SUT.PoolSizePerImg, v.SUT.PoolEnabled, v.SUT.MaxActivePods)
+		}
+		ov, ok := v.Overlays["pool-8"]
+		if !ok || ov.WarmPoolSize != 8 || ov.SUT.PoolSizePerImg != 8 || ov.SUT.PoolEnabled == nil || !*ov.SUT.PoolEnabled {
+			t.Errorf("overlays[pool-8] = %+v (present %v); want warm_pool_size 8 and sut pool fields 8, true", ov, ok)
+		}
+		if v.Footing != "warm" || v.Seed != 7 || v.Window.CooldownSteps != 1 || v.Window.WarmupSec != 30 {
+			t.Errorf("footing %q, seed %d, window %+v; want warm, 7 and cooldown_steps 1, warmup_sec 30", v.Footing, v.Seed, v.Window)
+		}
+		// The decoded scenario marshals back to a document the schema accepts:
+		// the overlays: entry without an inner name must not come out as
+		// name: "".
+		roundTripJSON(t, "scenario.schema.json", v)
 		marshaledYAML, err := yaml.Marshal(v)
 		if err != nil {
 			t.Fatalf("yaml.Marshal: %v", err)
@@ -392,6 +407,191 @@ func TestBaselineEventStreamsDecode(t *testing.T) {
 	}
 }
 
+// An overlays: entry takes its name from the map key. An inner name must
+// match the key, and an empty key or a key that is not a directory name is
+// an error. The JSON schema accepts an entry without a name and requires one
+// on a variant.
+func TestScenarioOverlaysTakeTheirNameFromTheKey(t *testing.T) {
+	const head = `schema_version: v1
+name: overlays-by-key
+sut:
+  backend: substrate
+jobs:
+  - name: sim
+    kind: simulated
+    loader_mode: steps
+    steps: 1
+    dataset: d.jsonl
+    trajectory: t.yaml
+`
+	for _, tc := range []struct {
+		name    string
+		tail    string
+		wantErr string
+	}{
+		{"no inner name", "overlays:\n  pool-8:\n    warm_pool_size: 8\n", ""},
+		{"matching inner name", "overlays:\n  pool-8:\n    name: pool-8\n    warm_pool_size: 8\n", ""},
+		{"inner name differs", "overlays:\n  pool-8:\n    name: pool-16\n", "does not match the key"},
+		{"empty key", "overlays:\n  \"\":\n    warm_pool_size: 8\n", "empty key"},
+		{"key with a path separator", "overlays:\n  ../escaped:\n    warm_pool_size: 8\n", "../escaped"},
+		{"variant without a name", "variants:\n  - warm_pool_size: 8\n", "name is required"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(head + tc.tail)
+			v, err := DecodeYAMLStrict[Scenario](raw)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("DecodeYAMLStrict: %v", err)
+				}
+				if ov, ok := v.Overlays["pool-8"]; !ok || ov.WarmPoolSize != 8 {
+					t.Errorf("overlays[pool-8] = %+v (present %v), want warm_pool_size 8", ov, ok)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("DecodeYAMLStrict err = %v, want one that holds %q", err, tc.wantErr)
+			}
+			jsonBytes, err := yaml.YAMLToJSON(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			schemaErr := ValidateAgainstJSONSchema("scenario.schema.json", jsonBytes)
+			switch tc.name {
+			case "empty key", "variant without a name":
+				if schemaErr == nil {
+					t.Errorf("scenario.schema.json accepted the %s", tc.name)
+				}
+			case "no inner name", "matching inner name":
+				if schemaErr != nil {
+					t.Errorf("scenario.schema.json rejected the %s: %v", tc.name, schemaErr)
+				}
+			}
+		})
+	}
+}
+
+// FeatureOverlay.Validate and scenario.schema.json reject the same overlay
+// values: an unknown prewarm_policy or snapshot_mode, a negative
+// warm_pool_size or lookahead_steps, an invalid sut, and an empty env_vars or
+// flags name. Before, Validate let prewarm_policy: "off" and
+// warm_pool_size: -4 through and bench run -overlay dropped them.
+func TestFeatureOverlayInvalidValuesFailGoAndSchemaAlike(t *testing.T) {
+	const head = `schema_version: v1
+name: overlay-values
+footing: warm
+sut:
+  backend: substrate
+jobs:
+  - name: sim
+    kind: simulated
+    loader_mode: steps
+    steps: 1
+    dataset: d.jsonl
+    trajectory: t.yaml
+overlays:
+  probe:
+`
+	for _, tc := range []struct {
+		name    string
+		tail    string
+		wantErr string
+	}{
+		{"prewarm_policy off", "    prewarm_policy: \"off\"\n", "prewarm_policy"},
+		{"snapshot_mode sometimes", "    snapshot_mode: sometimes\n", "snapshot_mode"},
+		{"negative warm_pool_size", "    warm_pool_size: -4\n", "warm_pool_size"},
+		{"negative lookahead_steps", "    lookahead_steps: -1\n", "lookahead_steps"},
+		{"sut backend", "    sut:\n      backend: bogus\n", "backend"},
+		{"sut replicas", "    sut:\n      replicas: -1\n", "replicas"},
+		{"sut pool_size_per_image", "    sut:\n      pool_size_per_image: -4\n", "pool_size_per_image"},
+		{"sut max_active_pods", "    sut:\n      max_active_pods: -1\n", "max_active_pods"},
+		{"empty env_vars name", "    env_vars:\n      \"\": x\n", "env_vars"},
+		{"empty flags name", "    flags:\n      \"\": x\n", "flags"},
+		{"unknown park", "    park: bogus\n", "park policy"},
+		{"unknown park_policy", "    park_policy: bogus\n", "park policy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(head + tc.tail)
+			if _, err := DecodeYAMLStrict[Scenario](raw); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("DecodeYAMLStrict err = %v, want one that holds %q", err, tc.wantErr)
+			}
+			jsonBytes, err := yaml.YAMLToJSON(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateAgainstJSONSchema("scenario.schema.json", jsonBytes); err == nil {
+				t.Errorf("scenario.schema.json accepted the %s", tc.name)
+			}
+		})
+	}
+	t.Run("the documented values pass both", func(t *testing.T) {
+		tails := []string{
+			"    prewarm_policy: warm\n",
+			"    prewarm_policy: cold\n",
+			"    prewarm_policy: none\n",
+			"    snapshot_mode: sync\n",
+			"    snapshot_mode: async\n",
+			"    snapshot_mode: none\n",
+			"    snapshot_mode: \"off\"\n",
+			"    snapshot_mode: disabled\n",
+			"    warm_pool_size: 0\n    lookahead_steps: 0\n",
+			"    sut:\n      backend: agent-sandbox\n      replicas: 1\n",
+			"    sut:\n      pool_size_per_image: 0\n      max_active_pods: 0\n",
+		}
+		// park and park_policy take each value NormalizeParkPolicy takes.
+		for _, park := range []string{"suspend-async", "suspend-sync", "fork", "delete", "none", "suspend", "hold", "snapshot", "release"} {
+			if _, err := NormalizeParkPolicy(ParkPolicy(park)); err != nil {
+				t.Fatalf("NormalizeParkPolicy(%q): %v", park, err)
+			}
+			tails = append(tails, "    park: "+park+"\n", "    park_policy: "+park+"\n")
+		}
+		for _, tail := range tails {
+			raw := []byte(head + tail)
+			if _, err := DecodeYAMLStrict[Scenario](raw); err != nil {
+				t.Errorf("DecodeYAMLStrict(%q): %v", strings.TrimSpace(tail), err)
+			}
+			jsonBytes, err := yaml.YAMLToJSON(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateAgainstJSONSchema("scenario.schema.json", jsonBytes); err != nil {
+				t.Errorf("scenario.schema.json rejected %q: %v", strings.TrimSpace(tail), err)
+			}
+		}
+	})
+	// The base sut follows the same rules as an overlay's sut.
+	t.Run("negative counts on the base sut", func(t *testing.T) {
+		for _, field := range []string{"replicas", "pool_size_per_image", "max_active_pods"} {
+			raw := []byte(strings.Replace(head, "  backend: substrate\n", "  backend: substrate\n  "+field+": -4\n", 1) + "    warm_pool_size: 1\n")
+			if _, err := DecodeYAMLStrict[Scenario](raw); err == nil || !strings.Contains(err.Error(), field) {
+				t.Errorf("DecodeYAMLStrict with sut.%s: -4 err = %v, want one that holds %q", field, err, field)
+			}
+			jsonBytes, err := yaml.YAMLToJSON(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateAgainstJSONSchema("scenario.schema.json", jsonBytes); err == nil {
+				t.Errorf("scenario.schema.json accepted sut.%s: -4", field)
+			}
+		}
+	})
+	t.Run("Validate on the struct", func(t *testing.T) {
+		for _, tc := range []struct {
+			ov      FeatureOverlay
+			wantErr string
+		}{
+			{FeatureOverlay{Name: "p", PrewarmPolicy: "off"}, "prewarm_policy"},
+			{FeatureOverlay{Name: "p", SnapshotMode: "sometimes"}, "snapshot_mode"},
+			{FeatureOverlay{Name: "p", WarmPoolSize: -4}, "warm_pool_size"},
+			{FeatureOverlay{Name: "p", Lookahead: -1}, "lookahead_steps"},
+			{FeatureOverlay{Name: "p", SUT: SUTSpec{Access: "bogus"}}, "sut"},
+			{FeatureOverlay{Name: "p", SUT: SUTSpec{PoolSizePerImg: -4}}, "pool_size_per_image"},
+			{FeatureOverlay{Name: "p", SUT: SUTSpec{MaxActivePods: -1}}, "max_active_pods"},
+		} {
+			if err := tc.ov.Validate(); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("FeatureOverlay%+v.Validate() = %v, want an error that holds %q", tc.ov, err, tc.wantErr)
+			}
+		}
+	})
+}
+
 func TestStrictDecodeRejectsUnknownField(t *testing.T) {
 	t.Run("JSON unknown field", func(t *testing.T) {
 		payload := `{"schema_version":"v1","run_id":"r1","start_ts":"2026-10-22T01:20:00Z","end_ts":"2026-10-22T01:25:00Z","bogus":123}`
@@ -699,6 +899,136 @@ func TestPythonSchemaValidatorCLI(t *testing.T) {
 			t.Fatalf("expected validate_schema.py to fail on unknown field, got success:\n%s", string(out))
 		}
 	})
+
+	// propertyNames reaches the stdlib fallback too, so an empty overlay
+	// env_vars or flags name fails the CLI as it fails Validate.
+	t.Run("rejects an empty overlay env_vars name", func(t *testing.T) {
+		const scen = `{"schema_version":"v1","name":"s","sut":{"backend":"substrate"},` +
+			`"jobs":[{"name":"sim","kind":"simulated","loader_mode":"steps","steps":1,"dataset":"d.jsonl","trajectory":"t.yaml"}],` +
+			`"overlays":{"probe":{"env_vars":{%q:"x"}}}}`
+		tmp := t.TempDir()
+		for _, tc := range []struct {
+			key     string
+			wantErr bool
+		}{{"", true}, {"ATE_PREFETCH", false}} {
+			path := filepath.Join(tmp, "scenario.json")
+			if err := os.WriteFile(path, []byte(fmt.Sprintf(scen, tc.key)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			// The jsonschema package and the stdlib fallback word the
+			// failure differently; both name the env_vars location.
+			for _, cmd := range []*exec.Cmd{
+				exec.Command(py, "validate_schema.py", "--schema", "scenario.schema.json", path),
+				stdlibValidatorCmd(py, "--schema", "scenario.schema.json", path),
+			} {
+				out, err := cmd.CombinedOutput()
+				if tc.wantErr && (err == nil || !strings.Contains(string(out), "overlays.probe.env_vars")) {
+					t.Errorf("env_vars name %q: validate_schema.py err = %v, want a failure at overlays.probe.env_vars:\n%s", tc.key, err, out)
+				}
+				if !tc.wantErr && err != nil {
+					t.Errorf("env_vars name %q: validate_schema.py failed: %v\n%s", tc.key, err, out)
+				}
+			}
+		}
+	})
+
+	// A variants entry is checked through allOf (FeatureOverlay plus a
+	// required name). The CLI gives the same verdict with the jsonschema
+	// package and with the stdlib fallback, which is forced here because
+	// the package can be present on the machine.
+	t.Run("checks variants entries through allOf", func(t *testing.T) {
+		const scen = `{"schema_version":"v1","name":"s","sut":{"backend":"substrate"},` +
+			`"jobs":[{"name":"sim","kind":"simulated","loader_mode":"steps","steps":1,"dataset":"d.jsonl","trajectory":"t.yaml"}],` +
+			`"variants":[%s]}`
+		tmp := t.TempDir()
+		for _, tc := range []struct {
+			name    string
+			variant string
+			wantErr string
+		}{
+			{"no name", `{"prewarm_policy":"warm"}`, "name"},
+			{"invalid prewarm_policy", `{"name":"v","prewarm_policy":"off"}`, "off"},
+			{"negative warm_pool_size", `{"name":"v","warm_pool_size":-4}`, "-4"},
+			{"negative sut pool_size_per_image", `{"name":"v","sut":{"pool_size_per_image":-4}}`, "-4"},
+			{"unknown field", `{"name":"v","bogus":1}`, "bogus"},
+			{"not an object", `123`, "object"},
+			{"valid", `{"name":"v","prewarm_policy":"warm","warm_pool_size":4}`, ""},
+		} {
+			path := filepath.Join(tmp, "scenario.json")
+			if err := os.WriteFile(path, []byte(fmt.Sprintf(scen, tc.variant)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for _, mode := range []struct {
+				name string
+				cmd  *exec.Cmd
+			}{
+				{"default", exec.Command(py, "validate_schema.py", "--schema", "scenario.schema.json", path)},
+				{"stdlib fallback", stdlibValidatorCmd(py, "--schema", "scenario.schema.json", path)},
+			} {
+				out, err := mode.cmd.CombinedOutput()
+				if tc.wantErr != "" && (err == nil || !strings.Contains(string(out), tc.wantErr)) {
+					t.Errorf("%s, %s: validate_schema.py err = %v, want a failure that holds %q:\n%s", tc.name, mode.name, err, tc.wantErr, out)
+				}
+				if tc.wantErr == "" && err != nil {
+					t.Errorf("%s, %s: validate_schema.py failed: %v\n%s", tc.name, mode.name, err, out)
+				}
+			}
+		}
+	})
+
+	// The stdlib fallback enforces each keyword the v1 schemas use, and a
+	// schema with a keyword outside that set is an error, not a skipped rule.
+	t.Run("the stdlib fallback covers each v1 schema keyword", func(t *testing.T) {
+		const prog = `import glob, json, sys
+sys.modules["jsonschema"] = None
+import validate_schema as v
+bad = {p: v._unsupported_keywords(json.load(open(p))) for p in sorted(glob.glob("v1/*.json"))}
+bad = {p: k for p, k in bad.items() if k}
+sys.exit(f"keywords without a stdlib rule: {bad}" if bad else 0)`
+		if out, err := exec.Command(py, "-c", prog).CombinedOutput(); err != nil {
+			t.Errorf("v1 schemas: %v\n%s", err, out)
+		}
+
+		tmp := t.TempDir()
+		write := func(name, body string) string {
+			path := filepath.Join(tmp, name)
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}
+		unknown := write("unknown.schema.json", `{"type":"object","properties":{"a":{"type":"string","pattern":"^x"}}}`)
+		out, err := stdlibValidatorCmd(py, "--schema", unknown, write("a.json", `{"a":"y"}`)).CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "#/properties/a/pattern") {
+			t.Errorf("schema with pattern: err = %v, want a failure that names #/properties/a/pattern:\n%s", err, out)
+		}
+		// The walk follows anyOf branches as it follows allOf.
+		inAnyOf := write("anyof.schema.json", `{"anyOf":[{"type":"string","pattern":"^x"},{"type":"integer"}]}`)
+		out, err = stdlibValidatorCmd(py, "--schema", inAnyOf, write("b.json", `1`)).CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "#/anyOf/0/pattern") {
+			t.Errorf("schema with pattern under anyOf: err = %v, want a failure that names #/anyOf/0/pattern:\n%s", err, out)
+		}
+
+		// minProperties: stats_row.measurements and image_placement selector.
+		row := `{"schema_version":"v1","timestamp":"2026-11-11T00:00:00Z","test_name":"t","metric":"m","measurements":%s}`
+		out, err = stdlibValidatorCmd(py, "--schema", "stats_row", write("empty.json", fmt.Sprintf(row, `{}`))).CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "minProperties") {
+			t.Errorf("stats_row with empty measurements: err = %v, want a minProperties failure:\n%s", err, out)
+		}
+		if out, err := stdlibValidatorCmd(py, "--schema", "stats_row", write("one.json", fmt.Sprintf(row, `{"p50":1}`))).CombinedOutput(); err != nil {
+			t.Errorf("stats_row with one measurement: %v\n%s", err, out)
+		}
+	})
+}
+
+// stdlibValidatorCmd runs validate_schema.py with the jsonschema import
+// blocked, thus the stdlib fallback validates also where the package exists.
+func stdlibValidatorCmd(py string, args ...string) *exec.Cmd {
+	const prog = `import runpy, sys
+sys.modules["jsonschema"] = None
+sys.argv = ["validate_schema.py", *sys.argv[1:]]
+runpy.run_path("validate_schema.py", run_name="__main__")`
+	return exec.Command(py, append([]string{"-c", prog}, args...)...)
 }
 
 func mustRead(t *testing.T, rel string) []byte {

@@ -607,7 +607,23 @@ type OverlayRef struct {
 	BaseRecipeCommit string            `json:"base_recipe_commit,omitempty"`
 	PatchFile        string            `json:"patch_file,omitempty"`
 	BaseFileHashes   map[string]string `json:"base_file_hashes,omitempty"`
-	SUTOverrides     map[string]string `json:"sut_overrides,omitempty"`
+	// SUTOverrides are the overlay's sut.extra_args (bench run -overlay) or
+	// the overlay manifest's env_overrides (bench report).
+	SUTOverrides map[string]string `json:"sut_overrides,omitempty"`
+	// Flags are the overlay's flags, which bench run -overlay appends to each
+	// real job's trainer_command.
+	Flags map[string]string `json:"flags,omitempty"`
+	// EnvVarNames are the names of the overlay's env_vars, sorted. The
+	// values stay out of system_description.json, which bench upload
+	// publishes.
+	EnvVarNames []string `json:"env_var_names,omitempty"`
+	// The job settings in effect after bench run -overlay applied the
+	// overlay, when the run's simulated jobs share them; schedule.json on
+	// disk is the base schedule and does not show them.
+	ParkPolicy     ParkPolicy `json:"park_policy,omitempty"`
+	SnapshotLoop   *bool      `json:"snapshot_loop,omitempty"`
+	Prefetch       *bool      `json:"prefetch,omitempty"`
+	LookaheadSteps int        `json:"lookahead_steps,omitempty"`
 }
 
 // OverlayManifest is the standalone overlay/overlay.json metadata file stored

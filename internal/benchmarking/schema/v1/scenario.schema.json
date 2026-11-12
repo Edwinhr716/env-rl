@@ -24,10 +24,13 @@
     "preflight": { "$ref": "#/$defs/PreflightSpec" },
     "variants": {
       "type": "array",
-      "items": { "$ref": "#/$defs/FeatureOverlay" }
+      "items": {
+        "allOf": [{ "$ref": "#/$defs/FeatureOverlay" }, { "required": ["name"] }]
+      }
     },
     "overlays": {
       "type": "object",
+      "propertyNames": { "minLength": 1 },
       "additionalProperties": { "$ref": "#/$defs/FeatureOverlay" }
     }
   },
@@ -104,8 +107,8 @@
         "server_addr": { "type": "string" },
         "storage_backend": { "type": "string" },
         "pool_enabled": { "type": "boolean" },
-        "pool_size_per_image": { "type": "integer" },
-        "max_active_pods": { "type": "integer" },
+        "pool_size_per_image": { "type": "integer", "minimum": 0 },
+        "max_active_pods": { "type": "integer", "minimum": 0 },
         "values_overlay": { "type": "object" },
         "labels": {
           "type": "object",
@@ -192,7 +195,6 @@
     "FeatureOverlay": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name"],
       "properties": {
         "schema_version": { "type": "string", "enum": ["v1"] },
         "name": { "type": "string", "minLength": 1 },
@@ -206,17 +208,19 @@
           "enum": ["suspend-async", "suspend-sync", "fork", "delete", "none", "suspend", "hold", "snapshot", "release"]
         },
         "prefetch": { "type": "boolean" },
-        "lookahead_steps": { "type": "integer" },
-        "warm_pool_size": { "type": "integer" },
-        "snapshot_mode": { "type": "string" },
-        "prewarm_policy": { "type": "string" },
+        "lookahead_steps": { "type": "integer", "minimum": 0 },
+        "warm_pool_size": { "type": "integer", "minimum": 0 },
+        "snapshot_mode": { "type": "string", "enum": ["sync", "async", "none", "off", "disabled"] },
+        "prewarm_policy": { "type": "string", "enum": ["warm", "cold", "none"] },
         "sut": { "$ref": "#/$defs/SUTSpec" },
         "env_vars": {
           "type": "object",
+          "propertyNames": { "minLength": 1 },
           "additionalProperties": { "type": "string" }
         },
         "flags": {
           "type": "object",
+          "propertyNames": { "minLength": 1 },
           "additionalProperties": { "type": "string" }
         }
       }

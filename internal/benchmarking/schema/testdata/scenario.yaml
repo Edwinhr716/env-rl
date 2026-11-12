@@ -14,7 +14,10 @@
 
 schema_version: v1
 name: swebench-multi-step
+description: Five sampled steps over a four-image working set, two variants and one overlay
+seed: 7
 repeat: 2
+footing: warm
 sut:
   backend: substrate
   access: ate-env-api
@@ -27,6 +30,17 @@ sut:
   replicas: 2
   extra_args:
     log_level: info
+  namespace: ate-bench
+  template: swebench-lite
+  server_addr: http://ate-env-server.ate-bench.svc.cluster.local:8080
+  storage_backend: gcs
+  pool_enabled: true
+  pool_size_per_image: 4
+  max_active_pods: 64
+  values_overlay:
+    replicaCount: 3
+  labels:
+    tier: bench
 jobs:
   - name: sim-loop-1
     kind: simulated
@@ -49,7 +63,25 @@ window_policy:
   steady_state_end_step: 5
   warmup_steps: 1
   max_duration_s: 900
+window:
+  warmup_steps: 1
+  cooldown_steps: 1
+  warmup_sec: 30
+  cooldown_sec: 15
 variants:
+  - name: warm-pool-two-ahead
+    schema_version: v1
+    description: Warm pool of 8, async snapshot loop, two-step lookahead
+    park_policy: suspend-async
+    prefetch: true
+    lookahead_steps: 2
+    warm_pool_size: 8
+    snapshot_mode: async
+    prewarm_policy: warm
+    sut:
+      replicas: 3
+      extra_args:
+        wake_budget: 9m
   - name: async-park-prefetch
     description: Enable async suspend and next-step prefetch
     park: suspend-async
@@ -58,3 +90,10 @@ variants:
       ATE_PREFETCH: "1"
     flags:
       --enable-fast-restore: "true"
+overlays:
+  pool-8:
+    description: A pool of 8 per image; the name is the map key
+    warm_pool_size: 8
+    sut:
+      pool_size_per_image: 8
+      pool_enabled: true

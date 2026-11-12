@@ -129,7 +129,7 @@ A **Feature Overlay** is a self-contained layer of Kubernetes manifest patches, 
    - **Gate behavioral changes behind environment variables** (e.g. `ATE_BENCH_PARK_MODE=suspend`, `ATE_WARM_POOL_URL=http://verl-ray-head.default.svc:18999`, `PREWARM_COUNT=32`) so that when unset, the code behaves identically to Mode 0 (`ephemeral` / `on_demand`).
    - **Express Job/ConfigMap overrides as a Kustomize overlay** (`kustomization.yaml` + `job-patch.yaml`) on top of the baseline `job.yaml`.
 2. **For Synthetic Scenarios (`benchmarking/scenarios/*.yaml`)**:
-   - Define named entries under `overlays:` in `scenario.yaml`, or pass built-in presets (`pool-off`, `pool-on`, `snapshot-sync`, `snapshot-async`, `cold-only`, `warm-pool`) via `bench run -overlay <presetA>,<presetB>`.
+   - Define named entries under `overlays:` in `scenario.yaml`, or pass built-in presets (`pool-off`, `pool-on`, `snapshot-sync`, `snapshot-async`, `cold-only`, `warm-pool`) via `bench run -overlay <presetA>,<presetB>`. An overlay's `sut` and `warm_pool_size` reach the rendered manifest, `park`/`snapshot_mode`/`prefetch`/`lookahead_steps` reach the jobs, `env_vars` the trainer environment, and `flags` the trainer command only (`sut.extra_args` carries ate-env-api flags); see [`cmd/benchmarking/bench/README.md`](../cmd/benchmarking/bench/README.md).
 
 ### 3.2 What `$ARTIFACT_DIR/overlay/` Must Contain (Enforced by `bench validate -dest`)
 Whenever a cluster RL run uses a non-baseline lifecycle policy (`lifecycle_policy.mode != "ephemeral"`, `park_mode == "suspend"`, or `prewarm_at_start == true`), `$ARTIFACT_DIR/overlay/` **must** exist and include:

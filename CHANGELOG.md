@@ -466,6 +466,80 @@ user needs to know across them.
   deleted by id. The default run id is `pf-<6 random characters>`, unique per
   pass, as `WarmImage`'s is, instead of the fixed `pf`.
 
+- `bench run -overlay`: every behavioral overlay field now takes effect.
+  Before, only `prewarm_policy` (the footing) and `warm_pool_size` (the
+  acquisition source) did; `park`, `park_policy`, `prefetch`,
+  `lookahead_steps`, `snapshot_mode`, `sut`, `env_vars` and `flags` were
+  read and dropped, and `warm_pool_size` did not reach the manifest's
+  `pool_size_per_image`. An A/B pair that set those fields compared two
+  equal runs, so it gives different results after the upgrade. `flags`
+  reach each real job's `trainer_command` only, as `-name=value`; the
+  ate-env-api arguments come from `sut.extra_args`. `snapshot_mode` sets
+  the jobs' snapshot loop and does not change their park policy, and a
+  cold `prewarm_policy` keeps the base pool size. The executed schedule's
+  prefetch hints come from the schedule generator's function, so a job
+  gets the same hints with and without an overlay; the generator now
+  honors a job's `lookahead_steps` (it always looked one step ahead), which
+  changes `schedule.json` for a job with `lookahead_steps` above 1.
+  `system_description.json` `overlays[0]` records the resolved
+  `park_policy`, `snapshot_loop`, `prefetch` and `lookahead_steps`, because
+  `schedule.json` on disk stays the base schedule on both sides of a pair,
+  and the overlay's inputs in three fields: `sut_overrides` holds its
+  `sut.extra_args`, and the new `flags` and `env_var_names` hold its
+  `flags` and the sorted names of its `env_vars`; an `env_vars` value never
+  reaches the file, which `bench upload` publishes.
+  A pool size from the overlay (`warm_pool_size` or
+  `sut.pool_size_per_image`) turns `sut.pool_enabled` on unless the overlay
+  sets it, so `pool-on` on a base with the pool off acquires from its pool;
+  before, both arms of `pool-on,pool-off` acquired cold on such a base. The
+  simulated acquisition source now follows the scenario's footing and pool
+  fields with and without `-overlay`: a run without one on a scenario with
+  `footing: cold` or `sut.pool_enabled: false` records `cold_start`; before,
+  it always recorded `warm_pool`.
+- `bench run`: the `prewarm` event, `lifecycle_policy` and the footing
+  Validity Rule 1 checks follow the acquisition source, with and without
+  `-overlay`. Before, the three followed the scenario's `footing` alone, so
+  a pool on a cold or omitted footing recorded `warm_pool` tasks beside
+  `mode: "ephemeral"` and no `prewarm` event, and `sut.pool_enabled: false`
+  on a warm footing recorded `cold_start` tasks beside `mode: "prewarmed"`.
+- `bench run`: a job with `prefetch: false` emits no `prefetch_hint` events,
+  with and without `-overlay`. Before, the base schedule's hints ran unless
+  the overlay set `prefetch` or `lookahead_steps`. `schedule.json` on disk
+  stays the base schedule.
+- `bench run -overlay`: an `overlays:` entry in the scenario takes its name
+  from the map key, as documented; an inner `name` must match the key.
+  Before, an entry without an inner `name` failed the scenario's validation.
+  A name must not be `.`, `..` or hold `/` or `\`, and a pair needs two
+  different names; before, `../x` wrote outside `-dest` and
+  `pool-on,pool-on` overwrote arm A with arm B. `flags` need a real job with
+  a `trainer_command`; before, a `trainer_manifest` job dropped them while
+  `overlays[0].flags` recorded them as active. An empty `env_vars` or
+  `flags` name is an error, and so are a `prewarm_policy` other than `warm`,
+  `cold` or `none`, a `snapshot_mode` other than `sync`, `async`, `none`,
+  `off` or `disabled`, a negative `warm_pool_size` or `lookahead_steps` and
+  a `sut` the scenario's own rules reject; before, `prewarm_policy: "off"`
+  or `warm_pool_size: -4` was dropped and the run kept the base footing.
+  A negative `sut.pool_size_per_image` or `sut.max_active_pods` is an error
+  on the scenario's `sut` and on an overlay's `sut`, as the schema says;
+  before, an overlay's negative count was dropped, and one on the scenario's
+  `sut` reached a `system_description.json` that fails its schema.
+  `overlays[0]` `park_policy`, `prefetch` and `lookahead_steps` come from
+  the closed-loop jobs; before, an open-loop job, which ignores them, could
+  leave them unset.
+- `scenario.schema.json` lists every `sut`, scenario and window field
+  (`pool_enabled`, `pool_size_per_image`, `overlays`, `footing`, `seed`,
+  `description`, `window`, `cooldown_steps` and the rest). Before, a scenario
+  with one of them failed the schema with "unexpected additional
+  properties" although `bench run` accepted it. The schema rejects an empty
+  `env_vars` or `flags` name in an overlay, as `bench run` does, and a
+  decoded scenario marshals an `overlays:` entry without its empty `name`,
+  so the output passes the schema; before, it emitted `name: ""`.
+  `validate_schema.py` enforces `propertyNames` when the `jsonschema`
+  package is absent, and so `allOf` and `minProperties`; before, its
+  fallback skipped the three keywords, so an empty `overlays` key, a
+  `variants` entry of any shape and an empty `measurements` object passed
+  it. The fallback now fails on a schema keyword it does not enforce
+  instead of skipping the rule.
 - swebench-loader: the working-set counters in `report.json`. In a
   `-park fork` run, `created` counts the golden base after its create and
   each child after its fork, and `retired` counts a base whose suspend

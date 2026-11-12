@@ -65,8 +65,9 @@ A scenario whose warm footing rests on an image placement pre-flight names
 it, and `bench run` puts the coverage into the bundle as
 `preflight-coverage.json` instead of the synthetic `prewarm` event it writes
 for a warm footing otherwise; the report's `validity.evidence` names it. The
-coverage path is relative to the scenario file; a cold arm of an overlay run
-gets no coverage; when `plan` is given too, the coverage must name it:
+coverage path is relative to the scenario file; a run that acquires cold (a
+cold arm of an overlay run, or `sut.pool_enabled: false`) gets no coverage;
+when `plan` is given too, the coverage must name it:
 
 ```yaml
 footing: warm
@@ -74,6 +75,69 @@ preflight:
   plan: image-placement.json # what swebench-loader run -placement -preflight ran with
   coverage: runs/pf/preflight-coverage.json # what that pre-flight wrote, next to this file
 ```
+
+#### Overlays
+
+`bench run -overlay <A>[,<B>]` applies a feature overlay to a deep copy of the
+scenario. Two names run both, each in its own `<name>/` directory under
+`-dest`, and write `comparison.json` and `comparison.md`. A name is an entry
+under `overlays:` (or `variants:`) in the scenario, or a built-in preset:
+`pool-off`, `pool-on`, `snapshot-sync`, `snapshot-async`, `cold-only`,
+`warm-pool`. An `overlays:` entry takes its name from the map key; an inner
+`name` must match it. A name is the arm's directory name under `-dest` in a
+pair, so it must not be `.`, `..` or hold `/` or `\`, and a pair needs two
+different names. A field the overlay leaves unset keeps the scenario's value.
+Where each field lands:
+
+| Overlay field                 | Reaches                                                                                                              |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `sut`, `warm_pool_size`       | `sut-manifest.yaml` and `system_description.json`, by a field-by-field merge into `sut`                              |
+| `prewarm_policy`              | the footing (`warm`, or `cold`/`none`); not the pool size                                                            |
+| `park`, `park_policy`         | every job's park policy and the executed schedule's `park_policy`                                                    |
+| `snapshot_mode`               | every job's `snapshot_loop` (`sync`/`async` on, `none` off); not the park policy                                     |
+| `prefetch`, `lookahead_steps` | every job's prefetch settings; the executed schedule's prefetch hints are rebuilt with the generator's function      |
+| `env_vars`                    | every job's `env_vars`, the trainer environment                                                                      |
+| `flags`                       | each real job's `trainer_command`, as `-name=value`; never the ate-env-api arguments, which `sut.extra_args` carries |
+
+An overlay value outside its range is an error when the scenario loads, not a
+field that is dropped: `prewarm_policy` takes `warm`, `cold` or `none`;
+`snapshot_mode` takes `sync`, `async`, `none`, `off` or `disabled`;
+`warm_pool_size` and `lookahead_steps` take 0 or more; `sut` follows the
+scenario's `sut` rules (`replicas`, `pool_size_per_image` and
+`max_active_pods` take 0 or more); an `env_vars` or `flags` name must not be
+empty.
+`scenario.schema.json` rejects the same values.
+
+`flags` need a real job with a `trainer_command`: a simulated job runs no
+trainer and a `trainer_manifest` job takes no argv, so an overlay with `flags`
+fails on a scenario without one. The executed schedule's prefetch hints follow
+each job's `prefetch` and `lookahead_steps`, with and without `-overlay`: a
+`prefetch: false` job emits no `prefetch_hint` events, while `schedule.json`
+on disk stays the generator's base schedule, which holds hints for every job.
+
+A pool size from `warm_pool_size` or `sut.pool_size_per_image` turns
+`sut.pool_enabled` on, unless the overlay sets `sut.pool_enabled` itself, so
+`pool-on` acquires from its pool on a base that has the pool off. The
+acquisition source also sets the footing the run executes with, with and
+without `-overlay`: a run that acquires from a pool records one `prewarm`
+event and `lifecycle_policy.mode: prewarmed`; a run that acquires cold
+(`sut.pool_enabled: false`, or a cold footing with no pool from the overlay)
+records none and `mode: ephemeral`. Validity Rule 1 checks that footing.
+
+`schedule.json` on disk stays the base schedule on both sides of a pair, so
+the two files match. `system_description.json` `overlays[0]` records the
+overlay's hash, its inputs, and the resolved `park_policy`, `snapshot_loop`,
+`prefetch` and `lookahead_steps`: `snapshot_loop` from all simulated jobs, the
+other three from the closed-loop jobs, because an open-loop job runs no step
+schedule; a setting the jobs disagree on stays unset. The inputs sit in three
+fields, so an equal key in two of them survives, and an `env_vars` value stays
+out of the file that `bench upload` publishes:
+
+| `overlays[0]` field | Holds                                                                          |
+| ------------------- | ------------------------------------------------------------------------------ |
+| `sut_overrides`     | the overlay's `sut.extra_args`, as `{name: value}`                             |
+| `flags`             | the overlay's `flags`, as `{name: value}`                                      |
+| `env_var_names`     | the names of the overlay's `env_vars`, sorted; the values never reach the file |
 
 ### 2. Real RL Training Run (`examples/*-verl`)
 

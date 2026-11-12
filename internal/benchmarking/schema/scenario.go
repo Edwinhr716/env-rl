@@ -17,6 +17,7 @@ package schema
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // JobMode enumerates the supported job runner modes in a Scenario.
@@ -125,9 +126,21 @@ func (s Scenario) Validate() error {
 			return fmt.Errorf("scenario variant[%d]: %w", i, err)
 		}
 	}
-	for _, v := range s.Overlays {
+	for k, v := range s.Overlays {
+		// The key is the name bench run -overlay looks up; an inner name is
+		// optional and must agree with it. The defaulted name is not written
+		// back to the map: the key stays the entry's only name, and
+		// overlay.ResolveOverlay fills Name from it on lookup.
+		if k == "" {
+			return errors.New("scenario overlays: an empty key is not a name")
+		}
+		if v.Name == "" {
+			v.Name = k
+		} else if v.Name != k {
+			return fmt.Errorf("scenario overlay %q: name %q does not match the key", k, v.Name)
+		}
 		if err := v.Validate(); err != nil {
-			return fmt.Errorf("scenario overlay %q: %w", v.Name, err)
+			return fmt.Errorf("scenario overlay %q: %w", k, err)
 		}
 	}
 	return nil
@@ -160,7 +173,9 @@ type SubstrateSUTSpec struct {
 	BaseTemplate string `json:"base_template,omitempty"`
 }
 
-// Validate checks SUTSpec invariants.
+// Validate checks SUTSpec invariants: the backend and access values, and
+// non-negative replicas, pool_size_per_image and max_active_pods, as
+// scenario.schema.json does.
 func (s SUTSpec) Validate() error {
 	if s.Backend != "" && s.Backend != "substrate" && s.Backend != "agent-sandbox" {
 		return fmt.Errorf("invalid backend %q (want \"substrate\" or \"agent-sandbox\")", s.Backend)
@@ -170,6 +185,12 @@ func (s SUTSpec) Validate() error {
 	}
 	if s.Replicas < 0 {
 		return fmt.Errorf("replicas must be >= 0, got %d", s.Replicas)
+	}
+	if s.PoolSizePerImg < 0 {
+		return fmt.Errorf("pool_size_per_image must be >= 0, got %d", s.PoolSizePerImg)
+	}
+	if s.MaxActivePods < 0 {
+		return fmt.Errorf("max_active_pods must be >= 0, got %d", s.MaxActivePods)
 	}
 	return nil
 }
@@ -305,30 +326,97 @@ func (w WindowPolicy) Validate() error {
 	return nil
 }
 
-// FeatureOverlay bundles A/B feature overrides onto a base Scenario.
+// FeatureOverlay bundles A/B feature overrides onto a base Scenario. bench run
+// -overlay applies one to a deep copy of the scenario; a field left at its
+// zero value keeps the scenario's value.
 type FeatureOverlay struct {
-	SchemaVersion string            `json:"schema_version,omitempty"`
-	Name          string            `json:"name"`
-	Description   string            `json:"description,omitempty"`
-	Park          ParkPolicy        `json:"park,omitempty"`
-	ParkPolicy    string            `json:"park_policy,omitempty"`
-	Prefetch      *bool             `json:"prefetch,omitempty"`
-	Lookahead     int               `json:"lookahead_steps,omitempty"`
-	WarmPoolSize  int               `json:"warm_pool_size,omitempty"`
-	SnapshotMode  string            `json:"snapshot_mode,omitempty"`
-	PrewarmPolicy string            `json:"prewarm_policy,omitempty"`
-	SUT           SUTSpec           `json:"sut,omitempty"`
-	EnvVars       map[string]string `json:"env_vars,omitempty"`
-	Flags         map[string]string `json:"flags,omitempty"`
+	// SchemaVersion is the overlay schema version, "v1" when set.
+	SchemaVersion string `json:"schema_version,omitempty"`
+	// Name is the lookup name for -overlay, the name recorded in
+	// system_description.json and the directory name of one arm of a pair
+	// under -dest; ValidateOverlayName bounds it. An overlays: map entry
+	// takes it from the key and may leave it empty, so it is omitted when
+	// empty and the marshaled entry passes the schema's minLength.
+	Name string `json:"name,omitempty"`
+	// Description is free text; no artifact records it.
+	Description string `json:"description,omitempty"`
+	// Park sets every job's park and park_policy (legacy "suspend" maps to
+	// suspend-sync). It wins over ParkPolicy when both are set.
+	Park ParkPolicy `json:"park,omitempty"`
+	// ParkPolicy is Park under its other name, for scenarios whose jobs use
+	// park_policy.
+	ParkPolicy string `json:"park_policy,omitempty"`
+	// Prefetch sets every job's prefetch; false also clears lookahead_steps
+	// unless Lookahead is set. The execution schedule's prefetch hints are
+	// rebuilt from the job's prefetch and lookahead_steps.
+	Prefetch *bool `json:"prefetch,omitempty"`
+	// Lookahead sets every job's lookahead_steps and turns prefetch on unless
+	// Prefetch says otherwise.
+	Lookahead int `json:"lookahead_steps,omitempty"`
+	// WarmPoolSize sets sut.pool_size_per_image and turns sut.pool_enabled
+	// on, unless SUT.PoolEnabled is set.
+	WarmPoolSize int `json:"warm_pool_size,omitempty"`
+	// SnapshotMode sets every job's snapshot_loop: "sync" or "async" turns the
+	// per-task snapshot and resume phase on, "none" ("off", "disabled") turns
+	// it off; SnapshotLoopForMode maps it and rejects any other value. It
+	// does not change the park policy.
+	SnapshotMode string `json:"snapshot_mode,omitempty"`
+	// PrewarmPolicy sets the footing: "warm" prewarms, "cold" or "none" does
+	// not; FootingForPrewarmPolicy maps it and rejects any other value. It
+	// does not change the pool size.
+	PrewarmPolicy string `json:"prewarm_policy,omitempty"`
+	// SUT merges field by field into the scenario's sut: a set string, a
+	// positive int, a non-nil bool and a non-empty map (merged by key) win.
+	// A positive pool_size_per_image turns pool_enabled on, unless
+	// pool_enabled is set.
+	SUT SUTSpec `json:"sut,omitempty"`
+	// EnvVars merge by key into every job's env_vars.
+	EnvVars map[string]string `json:"env_vars,omitempty"`
+	// Flags are appended to each real job's trainer_command as -name=value
+	// in key order (a key that starts with "-" is kept as is). They never
+	// reach the ate-env-api manifest; sut.extra_args carries the API args.
+	// An overlay with flags needs a real job with a trainer_command.
+	Flags map[string]string `json:"flags,omitempty"`
 }
 
-// Validate checks FeatureOverlay invariants.
+// Validate checks FeatureOverlay invariants: the name, the prewarm_policy and
+// snapshot_mode values, non-negative warm_pool_size and lookahead_steps, the
+// sut by SUTSpec.Validate, the env_vars and flags names, and the park policy.
 func (o FeatureOverlay) Validate() error {
 	if o.SchemaVersion != "" && o.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("feature overlay %q: unsupported schema_version %q", o.Name, o.SchemaVersion)
 	}
-	if o.Name == "" {
-		return errors.New("feature overlay name is required")
+	if err := ValidateOverlayName(o.Name); err != nil {
+		return err
+	}
+	if o.PrewarmPolicy != "" {
+		if _, err := FootingForPrewarmPolicy(o.PrewarmPolicy); err != nil {
+			return fmt.Errorf("feature overlay %q: %w", o.Name, err)
+		}
+	}
+	if o.SnapshotMode != "" {
+		if _, err := SnapshotLoopForMode(o.SnapshotMode); err != nil {
+			return fmt.Errorf("feature overlay %q: %w", o.Name, err)
+		}
+	}
+	if o.WarmPoolSize < 0 {
+		return fmt.Errorf("feature overlay %q: warm_pool_size must be >= 0, got %d", o.Name, o.WarmPoolSize)
+	}
+	if o.Lookahead < 0 {
+		return fmt.Errorf("feature overlay %q: lookahead_steps must be >= 0, got %d", o.Name, o.Lookahead)
+	}
+	if err := o.SUT.Validate(); err != nil {
+		return fmt.Errorf("feature overlay %q sut: %w", o.Name, err)
+	}
+	for k := range o.EnvVars {
+		if k == "" {
+			return fmt.Errorf("feature overlay %q: env_vars has an empty name", o.Name)
+		}
+	}
+	for k := range o.Flags {
+		if k == "" {
+			return fmt.Errorf("feature overlay %q: flags has an empty name", o.Name)
+		}
 	}
 	if o.Park != "" {
 		if _, err := NormalizeParkPolicy(o.Park); err != nil {
@@ -339,6 +427,49 @@ func (o FeatureOverlay) Validate() error {
 		if _, err := NormalizeParkPolicy(ParkPolicy(o.ParkPolicy)); err != nil {
 			return fmt.Errorf("feature overlay %q: %w", o.Name, err)
 		}
+	}
+	return nil
+}
+
+// FootingForPrewarmPolicy returns the footing an overlay prewarm_policy sets:
+// "warm" for "warm", "cold" for "cold" or "none". Any other value is an
+// error. An empty policy leaves the footing alone; callers check it first.
+func FootingForPrewarmPolicy(policy string) (string, error) {
+	switch policy {
+	case "warm":
+		return "warm", nil
+	case "cold", "none":
+		return "cold", nil
+	default:
+		return "", fmt.Errorf("invalid prewarm_policy %q (want \"warm\", \"cold\", or \"none\")", policy)
+	}
+}
+
+// SnapshotLoopForMode returns the snapshot_loop an overlay snapshot_mode sets:
+// true for "sync" or "async", false for "none", "off" or "disabled". Any
+// other value is an error. An empty mode leaves the jobs alone; callers check
+// it first.
+func SnapshotLoopForMode(mode string) (bool, error) {
+	switch mode {
+	case "sync", "async":
+		return true, nil
+	case "none", "off", "disabled":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid snapshot_mode %q (want \"sync\", \"async\", \"none\", \"off\", or \"disabled\")", mode)
+	}
+}
+
+// ValidateOverlayName checks an overlay name as bench run -overlay uses it:
+// a lookup key, the name system_description.json records, and the directory
+// name of one arm of a pair under -dest. It must not be empty, "." or "..",
+// and must not hold a path separator.
+func ValidateOverlayName(name string) error {
+	if name == "" {
+		return errors.New("feature overlay name is required")
+	}
+	if name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("feature overlay name %q: must not be \".\" or \"..\" or hold \"/\" or \"\\\"", name)
 	}
 	return nil
 }

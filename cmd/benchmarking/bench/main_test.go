@@ -1018,6 +1018,25 @@ jobs:
 		t.Fatalf("bench validate without the coverage: code=%d, %s", code, errBuf.String())
 	}
 
+	// The coverage follows the footing the run executes with: the same
+	// scenario with the pool off acquires cold, thus the bundle gets no
+	// coverage and no synthetic prewarm event.
+	if err := os.WriteFile(scenPath, []byte(strings.Replace(scenYAML, "sut:\n", "sut:\n  pool_enabled: false\n", 1)+"preflight:\n  plan: image-placement.json\n  coverage: cov.json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	poolOffDir := filepath.Join(dir, "pool-off-out")
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"run", "-scenario", scenPath, "-dest", poolOffDir}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench run with the pool off failed (code=%d): %s", code, errBuf.String())
+	}
+	if _, err := os.Stat(filepath.Join(poolOffDir, "preflight-coverage.json")); !os.IsNotExist(err) {
+		t.Errorf("a run that acquires cold has a coverage in the bundle (stat err = %v)", err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(poolOffDir, "events.jsonl")); err != nil || strings.Contains(string(raw), `"event":"prewarm"`) {
+		t.Errorf("a run that acquires cold has a prewarm event (read err = %v):\n%s", err, raw)
+	}
+
 	// A plan that the coverage was not written for is refused, as is a
 	// coverage that names no plan when the scenario names one.
 	if err := os.WriteFile(scenPath, []byte(scenYAML+"preflight:\n  plan: other-plan.json\n  coverage: cov.json\n"), 0o644); err != nil {

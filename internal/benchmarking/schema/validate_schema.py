@@ -178,6 +178,10 @@ def _check_container_constraints(
         return
 
     if isinstance(instance, dict):
+        if "minProperties" in schema and len(instance) < schema["minProperties"]:
+            raise SchemaValidationError(
+                f"{path}: object has {len(instance)} properties < minProperties {schema['minProperties']}"
+            )
         for req_key in schema.get("required", []):
             if req_key not in instance:
                 raise SchemaValidationError(
@@ -185,6 +189,12 @@ def _check_container_constraints(
                 )
         props = schema.get("properties", {})
         addl = schema.get("additionalProperties", True)
+        prop_names = schema.get("propertyNames")
+        if isinstance(prop_names, dict):
+            for key in instance:
+                _validate_stdlib(
+                    key, prop_names, root_schema, f"{path}: property name {key!r}"
+                )
         for key, val in instance.items():
             if key in props:
                 _validate_stdlib(val, props[key], root_schema, f"{path}.{key}")
@@ -194,6 +204,39 @@ def _check_container_constraints(
                 )
             elif isinstance(addl, dict):
                 _validate_stdlib(val, addl, root_schema, f"{path}.{key}")
+
+
+# Keywords the stdlib fallback enforces, and annotations that carry no rule.
+_STDLIB_KEYWORDS = frozenset(
+    {
+        "$ref", "allOf", "anyOf", "type", "const", "enum", "minLength", "format",
+        "minimum", "exclusiveMinimum", "minItems", "items", "minProperties",
+        "required", "properties", "additionalProperties", "propertyNames",
+    }
+)  # fmt: skip
+_ANNOTATION_KEYWORDS = frozenset(
+    {"$schema", "$id", "$defs", "$comment", "title", "description", "default", "examples"}
+)
+
+
+def _unsupported_keywords(schema: Any, path: str = "#") -> list[str]:
+    """List the keywords under schema that the stdlib fallback does not enforce."""
+    if not isinstance(schema, dict):
+        return []
+    found = [
+        f"{path}/{key}"
+        for key in schema
+        if key not in _STDLIB_KEYWORDS and key not in _ANNOTATION_KEYWORDS
+    ]
+    for key in ("properties", "$defs"):
+        for name, sub in (schema.get(key) or {}).items():
+            found += _unsupported_keywords(sub, f"{path}/{key}/{name}")
+    for key in ("items", "additionalProperties", "propertyNames"):
+        found += _unsupported_keywords(schema.get(key), f"{path}/{key}")
+    for key in ("allOf", "anyOf"):
+        for idx, sub in enumerate(schema.get(key, [])):
+            found += _unsupported_keywords(sub, f"{path}/{key}/{idx}")
+    return found
 
 
 def _validate_stdlib(
@@ -206,7 +249,8 @@ def _validate_stdlib(
     if "$ref" in schema:
         target = _resolve_ref(root_schema, schema["$ref"])
         _validate_stdlib(instance, target, root_schema, path)
-        return
+    for sub_schema in schema.get("allOf", []):
+        _validate_stdlib(instance, sub_schema, root_schema, path)
 
     expected_type = schema.get("type")
     if expected_type is not None:
@@ -238,6 +282,14 @@ def validate_instance(instance: Any, schema: dict[str, Any]) -> None:
             loc = ".".join(str(p) for p in first.path) or "$"
             raise SchemaValidationError(f"{loc}: {first.message}")
         return
+    # A keyword the fallback does not know is an error, not a skipped rule.
+    unsupported = _unsupported_keywords(schema)
+    if unsupported:
+        raise SchemaValidationError(
+            "the stdlib fallback does not support "
+            + ", ".join(unsupported)
+            + "; install the jsonschema package"
+        )
     _validate_stdlib(instance, schema, schema)
 
 

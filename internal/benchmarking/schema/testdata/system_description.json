@@ -39,7 +39,15 @@
       "hash": "sha256:12345678",
       "sut_overrides": {
         "prefetch": "true"
-      }
+      },
+      "flags": {
+        "steps": "10"
+      },
+      "env_var_names": ["HF_TOKEN", "OVERLAY_MARKER"],
+      "park_policy": "suspend-async",
+      "snapshot_loop": true,
+      "prefetch": true,
+      "lookahead_steps": 1
     }
   ],
   "load": {

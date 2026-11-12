@@ -19,10 +19,78 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 )
+
+func TestPopulatePrefetchImagesLookahead(t *testing.T) {
+	mk := func() []schema.ScheduledStep {
+		return []schema.ScheduledStep{
+			{Step: 1, Tasks: []schema.ScheduledTask{{Image: "a"}}},
+			{Step: 2, Tasks: []schema.ScheduledTask{{Image: "b"}, {Image: "a"}}},
+			{Step: 3, Tasks: []schema.ScheduledTask{{Image: "c"}}},
+			{Step: 4, Tasks: []schema.ScheduledTask{{Image: "b"}}},
+		}
+	}
+	for _, tc := range []struct {
+		lookahead int
+		want      [][]string
+	}{
+		{0, [][]string{{"b"}, {"c"}, {"b"}, nil}},
+		{1, [][]string{{"b"}, {"c"}, {"b"}, nil}},
+		{2, [][]string{{"b", "c"}, {"c"}, {"b"}, nil}},
+		{9, [][]string{{"b", "c"}, {"c"}, {"b"}, nil}},
+	} {
+		steps := mk()
+		PopulatePrefetchImages(steps, tc.lookahead)
+		for i := range steps {
+			if !slices.Equal(steps[i].PrefetchImages, tc.want[i]) {
+				t.Errorf("lookahead %d step %d prefetch_images = %v, want %v", tc.lookahead, i+1, steps[i].PrefetchImages, tc.want[i])
+			}
+		}
+	}
+}
+
+func TestResolveScenarioScheduleHonorsLookaheadSteps(t *testing.T) {
+	scen := schema.Scenario{
+		Name: "lookahead",
+		Seed: 11,
+		Jobs: []schema.JobSpec{{Name: "sim", Mode: schema.JobModeClosedLoop, Steps: 5, TasksPerStep: 1}},
+	}
+	ds := map[string][]Instance{"": makeScheduleDataset(6)}
+	one, err := ResolveScenarioSchedule(scen, "", ds)
+	if err != nil {
+		t.Fatalf("ResolveScenarioSchedule(lookahead 1): %v", err)
+	}
+	scen.Jobs[0].LookaheadSteps = 2
+	two, err := ResolveScenarioSchedule(scen, "", ds)
+	if err != nil {
+		t.Fatalf("ResolveScenarioSchedule(lookahead 2): %v", err)
+	}
+	want := make([]schema.ScheduledStep, len(one.Jobs[0].Steps))
+	for i, st := range one.Jobs[0].Steps {
+		want[i] = st
+		want[i].PrefetchImages = nil
+	}
+	PopulatePrefetchImages(want, 2)
+	differs := false
+	for i, st := range two.Jobs[0].Steps {
+		if !slices.Equal(st.PrefetchImages, want[i].PrefetchImages) {
+			t.Errorf("step %d prefetch_images = %v, want %v (lookahead 2)", st.Step, st.PrefetchImages, want[i].PrefetchImages)
+		}
+		if !slices.Equal(st.Tasks, one.Jobs[0].Steps[i].Tasks) {
+			t.Errorf("step %d tasks changed with lookahead_steps: %v vs %v", st.Step, st.Tasks, one.Jobs[0].Steps[i].Tasks)
+		}
+		if !slices.Equal(st.PrefetchImages, one.Jobs[0].Steps[i].PrefetchImages) {
+			differs = true
+		}
+	}
+	if !differs {
+		t.Fatalf("lookahead 1 and 2 gave the same hints for every step; pick a seed whose steps differ: %+v", one.Jobs[0].Steps)
+	}
+}
 
 func makeScheduleDataset(n int) []Instance {
 	out := make([]Instance, n)
