@@ -7,6 +7,8 @@ user needs to know across them.
 ## Unreleased
 
 ### Changed
+- Python client: the `Env.shell` span (`ate_env_client.shell`) records
+  `ate_env.timed_out`, as Go's `Env.Run` span does. The span keeps its name.
 - `bench prewarm` ensures each image's derived template through
   `EnsureImageTemplate`, which starts its golden snapshot bake, and waits for
   the goldens to settle (`-golden-wait`, default on; `-golden-poll`) instead

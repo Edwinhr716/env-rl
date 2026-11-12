@@ -234,6 +234,7 @@ class Env:
                         env=self._id,
                         command=["sh", "-c", command_line],
                     )
+                t0 = time.monotonic()
                 proc = await self.start_process(
                     ["sh", "-c", command_line],
                     cwd=cwd,
@@ -260,8 +261,24 @@ class Env:
                     raise RuntimeError(
                         "ate_env_rl: output stream ended before the process exited"
                     )
+                duration = time.monotonic() - t0
                 if span is not None:
-                    set_attributes(span, {"ate_env.exit_code": exit_info.exit_code})
+                    if exit_info.timed_out is not None:
+                        timed_out = exit_info.timed_out
+                    else:
+                        # A guest that predates Process.timed_out: the
+                        # exit-code heuristic, as in ExecResult and Go's Run.
+                        to_s = timeout.total_seconds() if isinstance(timeout, timedelta) else timeout
+                        timed_out = (
+                            exit_info.exit_code == 137
+                            and to_s is not None
+                            and to_s > 0
+                            and duration >= to_s
+                        )
+                    set_attributes(
+                        span,
+                        {"ate_env.exit_code": exit_info.exit_code, "ate_env.timed_out": timed_out},
+                    )
                     annotate_span(
                         span,
                         exit=exit_info.exit_code,

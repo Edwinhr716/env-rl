@@ -209,7 +209,7 @@ keeps the heuristic and PR 6 records `ate_env.timed_out` from it.
   `exitClassOf`, so a process that exits on its own just as its timer fires is not a timeout. The
   swebench loader takes `ShellResponse.TimedOut` from the SDK drivers and keeps its own heuristic
   for agent-sandbox, which reports no flag. Python's `Env.shell` returns `ShellResult.timed_out` but
-  its span still records no `ate_env.timed_out`.
+  its span recorded no `ate_env.timed_out` until #361.
 - `CHANGELOG.md`: one entry that names both clients and the guest (section 7).
 
 ### PR 5: connections
@@ -349,7 +349,9 @@ Not in the pull request sequence above. If the decision is to build it, this is 
 1. Tier 3 now or on the trigger above. The recommendation is the trigger.
 2. D5: the `timed_out` proto field (PR 4) or the heuristic alone. The recommendation is the field;
    it also removes a documented guess from the Python client.
-3. The Python direct path's `shell` span name (D6): rename to `exec`, alias, or leave.
+3. The Python direct path's `shell` span name (D6): rename to `exec`, alias, or leave. Answer:
+   option (a) (leave `shell` and add `ate_env.timed_out`) chosen in #361; the rename stays open for
+   later.
 4. Whether `Run` should default to `Poll` when `Timeout` exceeds the router's route timeout. The
    plan keeps streaming as the default and lets the caller opt in, as the loader does.
 

@@ -356,3 +356,6 @@ Append-only. Each entry: date, who, what, why.
   and Go's backfill of server-resolved `ate.template.*` stay recorded differences, as does the #330
   entry's `exec` span difference (Go records `ate_env.exit_code` 137 on a timeout, Python none), and
   17.1 and 17.2 stay with per-client tests.
+- 2026-11-12, #361: option (a) chosen for plan question 3 (Python Env.shell attributes vs Go
+  Env.Run). Added `ate_env.timed_out` to `ate_env_client.shell` to close the 17.2 attribute
+  difference without a breaking span rename.

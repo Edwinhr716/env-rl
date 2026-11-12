@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from datetime import timedelta
 
 import grpc
 import grpc.aio
@@ -36,7 +37,12 @@ from ate_env_rl.config import TracerConfig, ValidationError
 from ate_env_rl.loop_runner import LoopRunner
 from ate_env_rl.telemetry import tracing
 
-from .fakes import FakeEnvironmentService, FakeFileSystemService, FakeProcessService
+from .fakes import (
+    FakeEnvironmentService,
+    FakeFileSystemService,
+    FakeProc,
+    FakeProcessService,
+)
 
 DIGEST = "sha256:" + "ab" * 32
 IMAGE = f"registry.example/swe/repo-a@{DIGEST}"
@@ -1010,3 +1016,30 @@ async def test_placement_spans_carry_the_template_and_follow_the_rpc(spans):
     assert warm.attributes["ate_env.rootfs_image"] == image
     for span in (plain, named, warm):
         assert span.status.status_code.name != "ERROR"
+
+
+async def test_shell_span_records_timed_out(spans, fake_stack):
+    # Env.shell sets ate_env.timed_out on every completed span, as Go's
+    # Env.Run does: the guest's Process.timed_out when it reports one, else
+    # the exit-code heuristic (137 and at least the timeout elapsed).
+    client, fakes = fake_stack
+    client.tracer = tracing.tracer_from_config(TracerConfig(enable_tracing=True))
+    env = client.env("dev1")
+    cases = [
+        (FakeProc(timed_out=True, exit_code=137), 10, True),  # guest says so
+        (FakeProc(timed_out=False, exit_code=137), 1e-6, False),  # guest wins
+        (FakeProc(exit_code=0), 10, False),  # old guest, clean exit
+        (FakeProc(exit_code=137), 10, False),  # old guest, killed early
+        (FakeProc(exit_code=137), 1e-6, True),  # old guest, past the timeout
+        (FakeProc(exit_code=1), 1e-6, False),  # old guest, non-137 exit code
+        (FakeProc(exit_code=137), None, False),  # old guest, no timeout set
+        (FakeProc(exit_code=137), 0, False),  # old guest, zero timeout
+        (FakeProc(exit_code=137), timedelta(microseconds=1), True),  # timedelta timeout
+    ]
+    for i, (proc, timeout, _) in enumerate(cases):
+        fakes.processes.next_procs.append(proc)
+        await env.shell(f"echo {i}", timeout=timeout)
+
+    shells = [s for s in spans.get_finished_spans() if s.name == "ate_env_client.shell"]
+    shells.sort(key=lambda s: s.start_time)
+    assert [s.attributes["ate_env.timed_out"] for s in shells] == [c[2] for c in cases]

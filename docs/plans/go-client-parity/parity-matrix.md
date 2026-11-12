@@ -104,8 +104,8 @@ off, so the `shell` span has no `start_process` child. The Python fleet handle n
 and turns the inner tracer off the same way. The Go client names the span of `Run` `exec` and the
 span of standalone `StartProcess` `start_process` (`Run` does not open a nested `start_process`
 span). [docs/observability.md](../../observability.md) documents both and says a Go client's spans
-take the place of the `ate_env_client.*` ones. Renaming or aliasing the Python `shell` span is a
-Python follow-up.
+take the place of the `ate_env_client.*` ones. Renaming or aliasing the Python `shell` span remains
+a Python follow-up (its missing `ate_env.timed_out` attribute was added in #361).
 
 ## G. Fleet SDK
 

@@ -832,7 +832,7 @@ traces and lifecycle records without a mapping. Client-only fields use the
 | `ate.template.atespace` | template atespace, when given | `create_environment` |
 | `ate_env.run_id` | fleet run id | `exec`, `write_file`, `read_file`, `acquire`, `warm_pool`, `reap` |
 | `ate_env.command.executable` | executable name only | `exec` |
-| `ate_env.exit_code`, `ate_env.timed_out` | exit state | `exec` |
+| `ate_env.exit_code`, `ate_env.timed_out` | exit state | `exec`, `shell` (`Env.shell`) |
 | `ate_env.first_command` | `true` on the first `exec` of each acquired sandbox | `exec` |
 | `ate_env.file.path`, `ate_env.file.size` | path and size in bytes | `write_file`, `read_file` |
 | `ate_env.replicas` | warm pool size | `warm_pool` |

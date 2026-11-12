@@ -331,9 +331,9 @@ Conventions:
   `read_file`, `write_file`), the span names are `<service>.<op>` with the same `<op>`.
 - 17.2: for the same inputs, both clients record the same `ate.*` and `ate_env.*` keys and values,
   except the differences [decisions.md](./decisions.md) records (`ate_env.run_id` is Python
-  fleet-only; `ate_env.timed_out` and the `exec` span name pair `Env.Run` with `SandboxHandle.exec`
-  while Python's direct `Env.shell` omits `ate_env.timed_out`; Go's `Create`, `ImageStatus` and
-  `EnsureImageTemplate` also backfill server-resolved `ate.template.*` from the response).
+  fleet-only; the `exec` span name pairs `Env.Run` with `SandboxHandle.exec` while Python's direct
+  `Env.shell` uses `shell`; Go's `Create`, `ImageStatus` and `EnsureImageTemplate` also backfill
+  server-resolved `ate.template.*` from the response).
 - 17.3: under each `OTEL_SEMCONV_STABILITY_OPT_IN` value (unset, `rpc/old`, `rpc/dup`), both clients
   record the same `rpc.*`, `server.address` and `server.port` keys and values for the same call, and
   the `rpc.*` keys and values are the ones otelgrpc records for that value.
