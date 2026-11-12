@@ -151,6 +151,12 @@ type Client struct {
 	guestPool map[string]*grpc.ClientConn
 }
 
+// maxControlRecvBytes is the largest control-plane response the client
+// reads. The lists ask for Substrate's largest page, 1,000 objects, and a
+// crashed actor alone carries a message of up to 4,096 bytes, so a full page
+// is over gRPC's default of 4 MiB.
+const maxControlRecvBytes = 32 << 20
+
 // New creates a Client. The control-plane connection is established
 // lazily on first use.
 func New(opts Options) (*Client, error) {
@@ -174,6 +180,7 @@ func New(opts Options) (*Client, error) {
 	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(creds),
 		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxControlRecvBytes)),
 	}
 	if opts.BearerTokenFile != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(fileTokenCreds{path: opts.BearerTokenFile}))
@@ -399,6 +406,18 @@ func (c *Client) List(ctx context.Context, atespace string) ([]*ateapipb.Actor, 
 	if atespace == "" {
 		atespace = DefaultAtespace
 	}
+	return c.listActors(ctx, atespace)
+}
+
+// ListAll returns every actor of every atespace, following the control
+// plane's pagination. It takes the global viewer role, as ListWorkers does.
+func (c *Client) ListAll(ctx context.Context) ([]*ateapipb.Actor, error) {
+	return c.listActors(ctx, "")
+}
+
+// listActors lists the actors of atespace, or of every atespace when it is
+// empty.
+func (c *Client) listActors(ctx context.Context, atespace string) ([]*ateapipb.Actor, error) {
 	var actors []*ateapipb.Actor
 	token := ""
 	for {
@@ -413,6 +432,66 @@ func (c *Client) List(ctx context.Context, atespace string) ([]*ateapipb.Actor, 
 		token = resp.GetNextPageToken()
 		if token == "" {
 			return actors, nil
+		}
+	}
+}
+
+// ListAtespaces returns every atespace, following the control plane's
+// pagination.
+func (c *Client) ListAtespaces(ctx context.Context) ([]*ateapipb.Atespace, error) {
+	var atespaces []*ateapipb.Atespace
+	token := ""
+	for {
+		resp, err := c.control.ListAtespaces(ctx, &ateapipb.ListAtespacesRequest{
+			Options: &ateapipb.ListOptions{PageToken: token, PageSize: 1000},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("ate: listing atespaces: %w", wrapGRPCError(err))
+		}
+		atespaces = append(atespaces, resp.GetAtespaces()...)
+		token = resp.GetNextPageToken()
+		if token == "" {
+			return atespaces, nil
+		}
+	}
+}
+
+// ListAllActorTemplates returns every ActorTemplate of every atespace,
+// following the control plane's pagination.
+func (c *Client) ListAllActorTemplates(ctx context.Context) ([]*ateapipb.ActorTemplate, error) {
+	var templates []*ateapipb.ActorTemplate
+	token := ""
+	for {
+		resp, err := c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{
+			Options: &ateapipb.ListOptions{PageToken: token, PageSize: 1000},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("ate: listing templates: %w", wrapGRPCError(err))
+		}
+		templates = append(templates, resp.GetActorTemplates()...)
+		token = resp.GetNextPageToken()
+		if token == "" {
+			return templates, nil
+		}
+	}
+}
+
+// ListAllTags returns every Tag of every atespace, following the control
+// plane's pagination.
+func (c *Client) ListAllTags(ctx context.Context) ([]*ateapipb.Tag, error) {
+	var tags []*ateapipb.Tag
+	token := ""
+	for {
+		resp, err := c.control.ListTags(ctx, &ateapipb.ListTagsRequest{
+			Options: &ateapipb.ListOptions{PageToken: token, PageSize: 1000},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("ate: listing tags: %w", wrapGRPCError(err))
+		}
+		tags = append(tags, resp.GetTags()...)
+		token = resp.GetNextPageToken()
+		if token == "" {
+			return tags, nil
 		}
 	}
 }

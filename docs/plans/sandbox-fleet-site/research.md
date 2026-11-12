@@ -196,6 +196,30 @@ changes in the plan:
   pods (#236); environments that cannot start fail fast with a reason (#222), which the Actor page
   can show later from the event stream.
 
+## Audit of main, 2026-11-10
+
+Checked against `ai-on-gke/sandboxenv-rl` at `3dd8bab2`, with pull request 2 on top; the Substrate
+`go.mod` requires is unchanged, `274605f1f2a8`. The seven steps of the drift check:
+
+1. `env.proto` has the same nine RPCs; the change since `f10c68c` is comments on `WarmImage` (#304).
+   No call enumerates environments.
+2. Substrate is the same version: `ListActors` with an empty atespace, the 1000-item page, no
+   `Batch*` or stream RPC, the three event names and the three roles are as audited on 2026-11-09.
+3. The JSON example in `interfaces.md` is the golden file of `internal/inventory`, with
+   `workers[].labels` and `actors[].worker_selector`; `go test ./internal/inventory/` passes.
+4. The four `ate_env_api_*` families of the named queries are in `docs/metrics.md`;
+   `ate.workerpool.workers` and `ate.actor.crashes` are in Substrate's registry. Checked by hand:
+   the test the README named for this step does not exist.
+5. `ate-env manifest` has `access-policy --global`, `--metrics-port`, `--enable-tracing`,
+   `--otlp-endpoint` and `--otlp-insecure`.
+6. `cmd/benchmarking/bench/bundle.go` is unchanged since `f10c68c`.
+7. `FS-` is used by this plan only.
+
+What the reporter's code found, recorded in [decisions.md](./decisions.md): Substrate's actors carry
+no labels, so `actors[].labels` has no source; `ate-env-api` has no `-ateapi-endpoint` or
+`-ateapi-ca-file` flag; and `fakecontrol` gave actors no uid or timestamps, which it now does, as
+the control plane does.
+
 ## Sources
 
 - Substrate: `docs/observability.md`, `internal/actorevent/actorevent.go`,

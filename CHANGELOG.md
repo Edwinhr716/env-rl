@@ -25,6 +25,19 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `ate-env-reporter` (`cmd/ate-env-reporter`): a per-cluster daemon that writes
+  the fleet inventory snapshot of `internal/inventory` every `-interval`
+  (default 5 s) to `gs://<-bucket>/v1/inventory/<project>/<cluster>/latest.json`,
+  or under `-out-dir`, and keeps one copy per `-snapshot-interval` (default 1 h)
+  under `v1/snapshots/`. It lists actors, workers, atespaces, templates and tags
+  from the Substrate control plane (global `viewer` role) and lists WorkerPools
+  and `ate-env-api` Deployments from the Kubernetes API (`list`).
+  `/healthz` and `/readyz` are on `-health-listen-addr` (default `:9091`). No
+  manifest or image is published yet. The snapshot schema v1 gains
+  `workers[].labels` and `actors[].worker_selector`, and requires `project`
+  and `cluster` to be one path segment each (no `/` or `\`, not `.` or `..`);
+  the reporter refuses such a `-project` or `-cluster` at start, and `-out-dir`
+  writes stay under the directory.
 - Pre-flight knobs on `FleetConfig` (they apply with `preflight=True`):
   `preflight_probes_per_node` (2, at most 8), `preflight_rounds` (3, at most
   10), `preflight_probe_timeout_s` (600, at least a microsecond and at most

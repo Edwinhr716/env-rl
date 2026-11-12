@@ -95,3 +95,34 @@ Append-only. Each entry: date, who, what, why.
 - 2026-11-09, orchestrator: the reporter's acceptance runs in two places: unit tests against
   `fakecontrol`, which pull request 2 extends with the three list calls it lacks, and one case in
   the Kind end-to-end job against the real `ateapi` with `-out-dir` (FS-14).
+- 2026-11-10, orchestrator: pull request 2 is two pull requests. 2 is the binary:
+  `internal/reporter`, `cmd/ate-env-reporter`, the schema additions and the `fakecontrol` list
+  calls. 2b is `ate-env manifest reporter` and the Kind end-to-end case (FS-14). The binary is
+  reviewable without its deployment, and the repo asks for one change per pull request.
+- 2026-11-10, orchestrator: the reporter's control-plane flags are `ate-env-api`'s own: `-ateapi`,
+  `-ateapi-token-file` and `-skip-verify`. The planned `-ateapi-endpoint` and `-ateapi-ca-file` do
+  not exist on `ate-env-api`, and the reporter was to match it. Kept snapshots are named
+  `<YYYYMMDD>T<HHMMSS>Z.json`, a name without colons. `/readyz` answers 200 while the last tick
+  wrote its snapshot.
+- 2026-11-10, orchestrator: three planned parts of the reporter are left out of pull request 2. The
+  diff on `uid` and `update_time`: each tick lists every actor and rewrites the whole object, so a
+  diff saves only the conversion of the listed actors, and no measurement asks for it.
+  `-enable-tracing` and `-metrics-listen-addr`: `docs/metrics.md` is generated from `ate-env-api`'s
+  definitions, a reporter family needs its own section there, and nothing scrapes the reporter
+  before the telemetry manifests of pull request 3, which is where they go. The ClusterRole rules
+  for `sandboxconfigs.ate.dev`, `services` and `pods`: the reporter reads WorkerPools and
+  Deployments only.
+- 2026-11-10, orchestrator, from the code: `actors[].labels` has no source, because Substrate's
+  `ResourceMetadata` carries no labels at the version `go.mod` requires; the field stays in the
+  schema and stays empty. The rule "labels pass through except keys under `ate.`" is replaced by the
+  schema's own rule: a label or selector key that names a credential is refused by both validators,
+  and the reporter leaves the key out and logs it once, so one such key does not stop a cluster's
+  snapshots.
+- 2026-11-10, orchestrator: drift check against `main` at `3dd8bab2` (research.md, "Audit of main,
+  2026-11-10"). The seven steps hold. Step 4 named a test, `TestFS13DriftCheckStep4`, that no
+  package has; the README no longer cites it.
+- 2026-11-10, orchestrator, from the review of pull request 2: the reporter lists WorkerPools and
+  Deployments on each tick and uses no informer. An informer whose watch dies keeps serving its last
+  cache without an error, so a snapshot would carry old Kubernetes state under a new `generated_at`.
+  A list that fails fails the tick, which `/readyz` and the stale badge show. The cost is two lists
+  per tick from the API server's cache, and the ClusterRole needs `list` only.

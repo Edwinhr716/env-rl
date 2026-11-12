@@ -69,6 +69,9 @@
       "allocated": {
         "cpu_m": 2000,
         "memory_bytes": 4294967296
+      },
+      "labels": {
+        "ate-env/workerpool": "default-template-workerpool"
       }
     }
   ],
@@ -81,6 +84,9 @@
       "state": "running",
       "assigned_node": "gke-bench-1-pool-1-abcd",
       "worker": "w-0a1b2c",
+      "worker_selector": {
+        "ate-env/workerpool": "default-template-workerpool"
+      },
       "create_time": "2026-11-03T12:00:03Z",
       "update_time": "2026-11-03T12:00:04Z",
       "labels": {

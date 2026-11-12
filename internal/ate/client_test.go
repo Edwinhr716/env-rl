@@ -18,7 +18,10 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -33,7 +36,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type fixture struct {
@@ -452,5 +457,178 @@ func TestCreateActorTemplatePreviewOptIn(t *testing.T) {
 	}
 	if got := control.LastTemplateCreateMetadata().Get(ate.PreviewHeader); len(got) != 1 || got[0] != "true" {
 		t.Errorf("template with a storageLocation sent %s=%q, want [true]", ate.PreviewHeader, got)
+	}
+}
+
+// TestListAllFitsAFullPageOfCrashedActors: Substrate's largest page is 1,000
+// actors, and a crashed actor carries a message of up to 4,096 bytes, so a
+// full page is over gRPC's default 4 MiB receive limit. The client must
+// still read it.
+func TestListAllFitsAFullPageOfCrashedActors(t *testing.T) {
+	control := fakecontrol.New()
+	control.AddTemplate(&ateapipb.ActorTemplate{Metadata: &ateapipb.ResourceMetadata{Atespace: "ate-env", Name: "tmpl"}})
+	message := strings.Repeat("x", 4096)
+	// The fake stamps a new actor with the wall clock, and the encoded size
+	// of a timestamp follows its nanoseconds: early in a second the page was
+	// under the limit. Every actor gets the same times, on a whole second
+	// (the shortest encoding), so the page has the same size on every run.
+	at := &timestamppb.Timestamp{Seconds: 1794441600} // 2026-11-12T00:00:00Z
+	const n = 1000
+	for i := range n {
+		name := fmt.Sprintf("env-%04d", i)
+		if _, err := control.CreateActor(t.Context(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: "ate-env", Name: name},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "ate-env", Name: "tmpl"},
+		}}); err != nil {
+			t.Fatalf("CreateActor(%s): %v", name, err)
+		}
+		control.MutateActor(name, func(a *ateapipb.Actor) {
+			a.Metadata.CreateTime, a.Metadata.UpdateTime = at, at
+			a.WorkerSelector = &ateapipb.Selector{MatchLabels: map[string]string{"ate-env/pool": "default"}}
+			a.Status = &ateapipb.ActorStatus{
+				State: ateapipb.ActorState_ACTOR_STATE_CRASHED,
+				Crash: &ateapipb.ActorCrash{Message: message, CrashTime: at},
+			}
+		})
+	}
+	addr, stop, err := control.Serve()
+	if err != nil {
+		t.Fatalf("starting fake control plane: %v", err)
+	}
+	t.Cleanup(stop)
+	client, err := ate.New(ate.Options{ControlAddr: addr, SkipVerify: true})
+	if err != nil {
+		t.Fatalf("ate.New: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	actors, err := client.ListAll(t.Context())
+	if err != nil {
+		t.Fatalf("ListAll: %v", err)
+	}
+	if len(actors) != n {
+		t.Fatalf("ListAll returned %d actors, want %d", len(actors), n)
+	}
+	if size := proto.Size(&ateapipb.ListActorsResponse{Actors: actors}); size <= 4<<20 {
+		t.Fatalf("the page is %d bytes, not over the 4 MiB default: the test does not test the limit", size)
+	}
+}
+
+// TestListsFollowThePagination: every list reads all pages. The fake serves
+// pages of two, over gRPC, and each list must return every object once.
+func TestListsFollowThePagination(t *testing.T) {
+	control := fakecontrol.New()
+	control.MaxPageSize = 2
+	const n = 5
+	var wantSpaces, wantNames []string
+	for i := range n {
+		space, name := fmt.Sprintf("space-%d", i), fmt.Sprintf("obj-%d", i)
+		wantSpaces, wantNames = append(wantSpaces, space), append(wantNames, name)
+		if _, err := control.CreateAtespace(t.Context(), &ateapipb.CreateAtespaceRequest{
+			Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: space}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		control.AddTemplate(&ateapipb.ActorTemplate{Metadata: &ateapipb.ResourceMetadata{Atespace: "ate-env", Name: name}})
+		control.AddTag(&ateapipb.Tag{Metadata: &ateapipb.ResourceMetadata{Atespace: "ate-env", Name: name}})
+		control.AddWorker(fakecontrol.Worker("ate-env", "pool", name, nil, 8))
+		// Actors in two atespaces: List reads one, ListAll both.
+		for _, atespace := range []string{"ate-env", "other"} {
+			if _, err := control.CreateActor(t.Context(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+				Metadata:      &ateapipb.ResourceMetadata{Atespace: atespace, Name: name + "-" + atespace},
+				ActorTemplate: &ateapipb.ObjectRef{Atespace: "ate-env", Name: name},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	addr, stop, err := control.Serve()
+	if err != nil {
+		t.Fatalf("starting fake control plane: %v", err)
+	}
+	t.Cleanup(stop)
+	client, err := ate.New(ate.Options{ControlAddr: addr, SkipVerify: true})
+	if err != nil {
+		t.Fatalf("ate.New: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := t.Context()
+
+	check := func(list string, got, want []string) {
+		t.Helper()
+		slices.Sort(got)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s = %v, want %v", list, got, want)
+		}
+	}
+	actorNames := func(actors []*ateapipb.Actor) (names []string) {
+		for _, a := range actors {
+			names = append(names, a.GetMetadata().GetName())
+		}
+		return names
+	}
+	suffixed := func(suffixes ...string) (names []string) {
+		for _, name := range wantNames {
+			for _, s := range suffixes {
+				names = append(names, name+s)
+			}
+		}
+		return names
+	}
+
+	all, err := client.ListAll(ctx)
+	if err != nil {
+		t.Fatalf("ListAll: %v", err)
+	}
+	check("ListAll", actorNames(all), suffixed("-ate-env", "-other"))
+
+	one, err := client.List(ctx, "other")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	check("List", actorNames(one), suffixed("-other"))
+
+	atespaces, err := client.ListAtespaces(ctx)
+	if err != nil {
+		t.Fatalf("ListAtespaces: %v", err)
+	}
+	var got []string
+	for _, a := range atespaces {
+		got = append(got, a.GetMetadata().GetName())
+	}
+	check("ListAtespaces", got, wantSpaces)
+
+	templates, err := client.ListAllActorTemplates(ctx)
+	if err != nil {
+		t.Fatalf("ListAllActorTemplates: %v", err)
+	}
+	got = nil
+	for _, tmpl := range templates {
+		got = append(got, tmpl.GetMetadata().GetName())
+	}
+	check("ListAllActorTemplates", got, wantNames)
+
+	tags, err := client.ListAllTags(ctx)
+	if err != nil {
+		t.Fatalf("ListAllTags: %v", err)
+	}
+	got = nil
+	for _, tag := range tags {
+		got = append(got, tag.GetMetadata().GetName())
+	}
+	check("ListAllTags", got, wantNames)
+
+	workers, err := client.ListWorkers(ctx)
+	if err != nil {
+		t.Fatalf("ListWorkers: %v", err)
+	}
+	if len(workers) != n {
+		t.Errorf("ListWorkers returned %d workers, want %d", len(workers), n)
+	}
+
+	// An unknown token is the caller's error, as on Substrate.
+	if _, err := control.ListActors(ctx, &ateapipb.ListActorsRequest{Options: &ateapipb.ListOptions{PageToken: "nope"}}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("ListActors with an unknown page token = %v, want InvalidArgument", err)
 	}
 }

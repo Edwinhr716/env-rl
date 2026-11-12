@@ -57,12 +57,14 @@ func goldenSnapshot() *Snapshot {
 		Workers: []Worker{{
 			Name: "w-0a1b2c", Namespace: "ate-env", Pool: "default-template-workerpool", Pod: "default-template-workerpool-7c9d8-x2k4q", Node: "gke-bench-1-pool-1-abcd",
 			State: WorkerStateActive, Capacity: Resources{CPUMillicores: 8000, MemoryBytes: 32 << 30}, Allocated: Resources{CPUMillicores: 2000, MemoryBytes: 4 << 30},
+			Labels: map[string]string{"ate-env/workerpool": "default-template-workerpool"},
 		}},
 		Actors: []Actor{
 			{
 				UID: "8f2a0001", Atespace: "ate-env", Name: "env-001", Template: "default-template-1a2b3c4d5e6f", State: ActorStateRunning,
 				AssignedNode: "gke-bench-1-pool-1-abcd", Worker: "w-0a1b2c", CreateTime: at(3), UpdateTime: at(4),
-				Labels: map[string]string{"example.com/run-id": "r-1"},
+				WorkerSelector: map[string]string{"ate-env/workerpool": "default-template-workerpool"},
+				Labels:         map[string]string{"example.com/run-id": "r-1"},
 			},
 			{
 				UID: "8f2a0002", Atespace: "ate-env", Name: "env-002", Template: "default-template-1a2b3c4d5e6f", SourceTag: "golden-default-template-1a2b3c4d5e6f",
@@ -159,6 +161,11 @@ func TestValidateRejects(t *testing.T) {
 		{"generated_at", func(s *Snapshot) { s.GeneratedAt = time.Time{} }, "generated_at"},
 		{"cluster", func(s *Snapshot) { s.Cluster = "" }, "cluster"},
 		{"interval", func(s *Snapshot) { s.Reporter.IntervalSeconds = 0 }, "interval_s"},
+		{"project with a slash", func(s *Snapshot) { s.Project = "projects/my-proj" }, "path segment"},
+		{"project of dots", func(s *Snapshot) { s.Project = ".." }, "path segment"},
+		{"project with a backslash", func(s *Snapshot) { s.Project = `a\b` }, "path segment"},
+		{"cluster with a slash", func(s *Snapshot) { s.Cluster = "us-central1/c1" }, "path segment"},
+		{"cluster of one dot", func(s *Snapshot) { s.Cluster = "." }, "path segment"},
 		{"actor state", func(s *Snapshot) { s.Actors[0].State = "paused"; s.Counts = ComputeCounts(s.Actors) }, "unknown state"},
 		{"worker state", func(s *Snapshot) { s.Workers[0].State = "idle" }, "unknown state"},
 		{"golden state", func(s *Snapshot) { s.Templates[1].GoldenState = "baking" }, "golden_state"},
@@ -168,6 +175,8 @@ func TestValidateRejects(t *testing.T) {
 		{"nil counts by atespace", func(s *Snapshot) { s.Counts.ActorsByAtespace = nil }, "not null"},
 		{"credential label key", func(s *Snapshot) { s.Actors[0].Labels = map[string]string{"example.com/api-token": "x"} }, "names a credential"},
 		{"credential label key, upper case", func(s *Snapshot) { s.Actors[0].Labels = map[string]string{"EXAMPLE.COM/CLIENT_SECRET": "x"} }, "names a credential"},
+		{"credential worker label key", func(s *Snapshot) { s.Workers[0].Labels = map[string]string{"example.com/api-token": "x"} }, "names a credential"},
+		{"credential worker_selector key", func(s *Snapshot) { s.Actors[0].WorkerSelector = map[string]string{"example.com/password": "x"} }, "names a credential"},
 		{"negative capacity", func(s *Snapshot) { s.Workers[0].Capacity.CPUMillicores = -1 }, "negative"},
 		{"nil actors", func(s *Snapshot) { s.Actors = nil; s.Counts = ComputeCounts(nil) }, "not null"},
 		{"nil deployments", func(s *Snapshot) { s.Deployments = nil }, "not null"},
@@ -322,8 +331,20 @@ func TestDecodeRejectsWhatTheSchemaRejects(t *testing.T) {
 		name string
 		edit func(doc map[string]any)
 	}{
+		{"project with a slash", func(d map[string]any) { d["project"] = "projects/my-proj" }},
+		{"project of dots", func(d map[string]any) { d["project"] = ".." }},
+		{"cluster with a backslash", func(d map[string]any) { d["cluster"] = `a\b` }},
+		{"cluster of one dot", func(d map[string]any) { d["cluster"] = "." }},
 		{"tags null", func(d map[string]any) { d["tags"] = nil }},
 		{"labels null", func(d map[string]any) { item(d, "actors", 0)["labels"] = nil }},
+		{"worker labels null", func(d map[string]any) { item(d, "workers", 0)["labels"] = nil }},
+		{"worker_selector null", func(d map[string]any) { item(d, "actors", 0)["worker_selector"] = nil }},
+		{"credential worker label key", func(d map[string]any) {
+			item(d, "workers", 0)["labels"] = map[string]any{"example.com/Access-Token": "x"}
+		}},
+		{"credential worker_selector key", func(d map[string]any) {
+			item(d, "actors", 0)["worker_selector"] = map[string]any{"example.com/Access-Token": "x"}
+		}},
 		{"crash null", func(d map[string]any) { item(d, "actors", 1)["crash"] = nil }},
 		{"metrics_port 0", func(d map[string]any) { item(d, "deployments", 0)["metrics_port"] = 0 }},
 		{"golden_state empty", func(d map[string]any) { item(d, "templates", 0)["golden_state"] = "" }},
@@ -474,7 +495,7 @@ func TestSchemaHasNoCredentialFields(t *testing.T) {
 }
 
 // TestLabelKeyPatternMatchesSchema keeps the Go label-key rule and the
-// schema's propertyNames rule on Actor.labels the same text, so a reader in
+// schema's propertyNames rule on $defs/Labels the same text, so a reader in
 // another language refuses exactly the keys Validate refuses. It also pins
 // the pattern's reach: every credential word in any letter case, and none of
 // the ordinary keys.
@@ -485,23 +506,19 @@ func TestLabelKeyPatternMatchesSchema(t *testing.T) {
 	}
 	var doc struct {
 		Defs struct {
-			Actor struct {
-				Properties struct {
-					Labels struct {
-						PropertyNames struct {
-							Not struct {
-								Pattern string `json:"pattern"`
-							} `json:"not"`
-						} `json:"propertyNames"`
-					} `json:"labels"`
-				} `json:"properties"`
-			} `json:"Actor"`
+			Labels struct {
+				PropertyNames struct {
+					Not struct {
+						Pattern string `json:"pattern"`
+					} `json:"not"`
+				} `json:"propertyNames"`
+			} `json:"Labels"`
 		} `json:"$defs"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := doc.Defs.Actor.Properties.Labels.PropertyNames.Not.Pattern, labelKeyPattern.String(); got != want {
+	if got, want := doc.Defs.Labels.PropertyNames.Not.Pattern, labelKeyPattern.String(); got != want {
 		t.Fatalf("schema propertyNames pattern\n got %q\nwant %q", got, want)
 	}
 	for _, w := range credentialWords {

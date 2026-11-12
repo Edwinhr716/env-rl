@@ -22,8 +22,8 @@
   "properties": {
     "schema_version": { "type": "string", "enum": ["v1"] },
     "generated_at": { "type": "string", "format": "date-time" },
-    "project": { "type": "string", "minLength": 1 },
-    "cluster": { "type": "string", "minLength": 1 },
+    "project": { "$ref": "#/$defs/PathSegment" },
+    "cluster": { "$ref": "#/$defs/PathSegment" },
     "location": { "type": "string" },
     "reporter": { "$ref": "#/$defs/Reporter" },
     "atespaces": { "type": "array", "items": { "$ref": "#/$defs/Atespace" } },
@@ -36,6 +36,13 @@
     "counts": { "$ref": "#/$defs/Counts" }
   },
   "$defs": {
+    "PathSegment": {
+      "description": "One segment of the object name v1/inventory/<project>/<cluster>/latest.json.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/\\\\]+$",
+      "not": { "enum": [".", ".."] }
+    },
     "Reporter": {
       "type": "object",
       "additionalProperties": false,
@@ -116,7 +123,8 @@
         "node": { "type": "string" },
         "state": { "type": "string", "enum": ["unspecified", "active", "draining", "unavailable"] },
         "capacity": { "$ref": "#/$defs/Resources" },
-        "allocated": { "$ref": "#/$defs/Resources" }
+        "allocated": { "$ref": "#/$defs/Resources" },
+        "labels": { "$ref": "#/$defs/Labels" }
       }
     },
     "Actor": {
@@ -147,17 +155,19 @@
         "create_time": { "type": "string", "format": "date-time" },
         "update_time": { "type": "string", "format": "date-time" },
         "crash": { "$ref": "#/$defs/Crash" },
-        "labels": {
-          "description": "The actor's labels as data. A key must not name a credential: it must not contain token, password, authorization, secret or credential in any letter case.",
-          "type": "object",
-          "propertyNames": {
-            "not": {
-              "pattern": "[Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]"
-            }
-          },
-          "additionalProperties": { "type": "string" }
-        }
+        "worker_selector": { "$ref": "#/$defs/Labels" },
+        "labels": { "$ref": "#/$defs/Labels" }
       }
+    },
+    "Labels": {
+      "description": "Labels or a label selector as data. A key must not name a credential: it must not contain token, password, authorization, secret or credential in any letter case.",
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "pattern": "[Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]"
+        }
+      },
+      "additionalProperties": { "type": "string" }
     },
     "Crash": {
       "description": "The control plane's crash record. Set when the actor entered crashed; it stays while a crashed actor is deleting or reverting and is cleared when a revert returns the actor to suspended, so it can accompany any state.",

@@ -30,8 +30,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"maps"
 	"math/big"
 	"net"
+	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -42,6 +45,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Server is a fake ateapi Control server.
@@ -55,6 +59,10 @@ type Server struct {
 	// Substrate does for an identity allowed to use but not create atespaces.
 	DenyCreateAtespace bool
 	templates          map[string]*ateapipb.ActorTemplate
+	// tags are the Tags ListTags reports (AddTag seeds them).
+	tags map[string]*ateapipb.Tag
+	// actorSeq numbers the actors CreateActor accepted, for their uids.
+	actorSeq int
 	// lastTemplateCreateMD is the incoming metadata of the last
 	// CreateActorTemplate call, for tests of the preview opt-in.
 	lastTemplateCreateMD metadata.MD
@@ -82,7 +90,10 @@ type Server struct {
 	// among them (always the first with SameNode): status.assigned_node and
 	// worker_assignment.node_name are set. With no workers, or none
 	// matching, the actor stays unplaced.
-	workers      []*ateapipb.Worker
+	workers []*ateapipb.Worker
+	// MaxPageSize caps a page of every List call, for tests of a client's
+	// pagination loop; zero is Substrate's cap of 1,000.
+	MaxPageSize  int
 	placeCounter int
 	SameNode     bool
 	// PendingGets makes each new actor report RESUMING for that many GetActor
@@ -246,6 +257,7 @@ func New() *Server {
 		actors:    make(map[string]*ateapipb.Actor),
 		atespaces: make(map[string]*ateapipb.Atespace),
 		templates: make(map[string]*ateapipb.ActorTemplate),
+		tags:      make(map[string]*ateapipb.Tag),
 	}
 }
 
@@ -274,6 +286,49 @@ func Worker(namespace, pool, node string, labels map[string]string, slots int32)
 	return w
 }
 
+// defaultMaxPageSize is Substrate's largest page, which it also serves when a
+// request names no page_size or a larger one.
+const defaultMaxPageSize = 1000
+
+// sortedValues returns m's values in key order, so pages do not overlap.
+func sortedValues[V any](m map[string]V) []V {
+	out := make([]V, 0, len(m))
+	for _, k := range slices.Sorted(maps.Keys(m)) {
+		out = append(out, m[k])
+	}
+	return out
+}
+
+// paginate returns the page of items that opts asks for and the token of the
+// next page, empty on the last. The page holds page_size items, or limit
+// (defaultMaxPageSize when zero) when page_size is unset or over it, as
+// Substrate does. The token is the offset of the page's first item.
+func paginate[T any](items []T, opts *ateapipb.ListOptions, limit int) ([]T, string, error) {
+	if limit <= 0 {
+		limit = defaultMaxPageSize
+	}
+	size := int(opts.GetPageSize())
+	if size < 0 {
+		return nil, "", status.Error(codes.InvalidArgument, "invalid page_size")
+	}
+	if size == 0 || size > limit {
+		size = limit
+	}
+	start := 0
+	if token := opts.GetPageToken(); token != "" {
+		var err error
+		if start, err = strconv.Atoi(token); err != nil || start < 0 || start > len(items) {
+			return nil, "", status.Error(codes.InvalidArgument, "invalid page_token")
+		}
+	}
+	end := min(start+size, len(items))
+	next := ""
+	if end < len(items) {
+		next = strconv.Itoa(end)
+	}
+	return items[start:end], next, nil
+}
+
 func (s *Server) ListWorkers(ctx context.Context, req *ateapipb.ListWorkersRequest) (*ateapipb.ListWorkersResponse, error) {
 	if s.OnListWorkers != nil {
 		s.OnListWorkers()
@@ -287,8 +342,12 @@ func (s *Server) ListWorkers(ctx context.Context, req *ateapipb.ListWorkersReque
 		s.ListWorkersUnavailable--
 		return nil, status.Error(codes.Unavailable, "api server restarting")
 	}
-	resp := &ateapipb.ListWorkersResponse{}
-	for _, w := range s.workers {
+	page, next, err := paginate(s.workers, req.GetOptions(), s.MaxPageSize)
+	if err != nil {
+		return nil, err
+	}
+	resp := &ateapipb.ListWorkersResponse{NextPageToken: next}
+	for _, w := range page {
 		resp.Workers = append(resp.Workers, proto.Clone(w).(*ateapipb.Worker))
 	}
 	return resp, nil
@@ -337,6 +396,7 @@ func (s *Server) place(a *ateapipb.Actor) {
 	w := candidates[idx]
 	a.Status.AssignedNode = w.GetNodeName()
 	a.Status.WorkerAssignment = &ateapipb.WorkerAssignment{
+		Worker:          &ateapipb.ObjectRef{Name: w.GetMetadata().GetName()},
 		WorkerNamespace: w.GetWorkerNamespace(),
 		WorkerPool:      w.GetWorkerPool(),
 		WorkerPod:       w.GetWorkerPod(),
@@ -375,7 +435,33 @@ func (s *Server) RemoveTemplate(atespace, name string) {
 func (s *Server) AddTemplate(tmpl *ateapipb.ActorTemplate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.templates[key(tmpl.GetMetadata().GetAtespace(), tmpl.GetMetadata().GetName())] = proto.Clone(tmpl).(*ateapipb.ActorTemplate)
+	stored := proto.Clone(tmpl).(*ateapipb.ActorTemplate)
+	stamp(stored.GetMetadata())
+	s.templates[key(tmpl.GetMetadata().GetAtespace(), tmpl.GetMetadata().GetName())] = stored
+}
+
+// AddTag seeds a Tag, as a golden snapshot build or a caller's CreateTag
+// leaves one.
+func (s *Server) AddTag(tag *ateapipb.Tag) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored := proto.Clone(tag).(*ateapipb.Tag)
+	stamp(stored.GetMetadata())
+	s.tags[key(tag.GetMetadata().GetAtespace(), tag.GetMetadata().GetName())] = stored
+}
+
+// stamp sets the create and update times the control plane assigns to a new
+// resource, unless the caller seeded them.
+func stamp(md *ateapipb.ResourceMetadata) {
+	if md == nil {
+		return
+	}
+	if md.CreateTime == nil {
+		md.CreateTime = timestamppb.Now()
+	}
+	if md.UpdateTime == nil {
+		md.UpdateTime = md.CreateTime
+	}
 }
 
 // Template returns a copy of a stored ActorTemplate, or nil.
@@ -487,6 +573,7 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 	s.templateSeq++
 	stored.Metadata.Uid = fmt.Sprintf("tmpl-%s-%d", md.GetName(), s.templateSeq)
 	stored.Metadata.Version = 1
+	stamp(stored.Metadata)
 	s.templates[k] = stored
 	return proto.Clone(stored).(*ateapipb.ActorTemplate), nil
 }
@@ -636,6 +723,27 @@ func (c inProcessControlClient) DeleteActorTemplate(ctx context.Context, in *ate
 	return c.s.DeleteActorTemplate(ctx, in)
 }
 
+func (c inProcessControlClient) ListAtespaces(ctx context.Context, in *ateapipb.ListAtespacesRequest, _ ...grpc.CallOption) (*ateapipb.ListAtespacesResponse, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.ListAtespaces(ctx, in)
+}
+
+func (c inProcessControlClient) ListActorTemplates(ctx context.Context, in *ateapipb.ListActorTemplatesRequest, _ ...grpc.CallOption) (*ateapipb.ListActorTemplatesResponse, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.ListActorTemplates(ctx, in)
+}
+
+func (c inProcessControlClient) ListTags(ctx context.Context, in *ateapipb.ListTagsRequest, _ ...grpc.CallOption) (*ateapipb.ListTagsResponse, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.ListTags(ctx, in)
+}
+
 func (c inProcessControlClient) ListWorkers(ctx context.Context, in *ateapipb.ListWorkersRequest, _ ...grpc.CallOption) (*ateapipb.ListWorkersResponse, error) {
 	if err := ctxErr(ctx); err != nil {
 		return nil, err
@@ -701,7 +809,7 @@ func (s *Server) Crash(name, message string) {
 		a.Status = &ateapipb.ActorStatus{}
 	}
 	a.Status.State = ateapipb.ActorState_ACTOR_STATE_CRASHED
-	a.Status.Crash = &ateapipb.ActorCrash{Message: message}
+	a.Status.Crash = &ateapipb.ActorCrash{Message: message, CrashTime: timestamppb.Now()}
 }
 
 // find returns the actor with the given name, whichever atespace holds it, or
@@ -778,11 +886,16 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	return clone(s.store(k, actor)), nil
 }
 
-// store keeps actor under k as an accepted create does: RUNNING and placed,
-// or SUSPENDED and unplaced when BornSuspended; the slow-start reads, the
-// high-water mark and the created log follow. Called with the lock held.
+// store keeps actor under k as an accepted create does: with a uid and its
+// create and update times, RUNNING and placed, or SUSPENDED and unplaced when
+// BornSuspended; the slow-start reads, the high-water mark and the created
+// log follow. The update time stays the create time: the fake's transitions
+// do not move it. Called with the lock held.
 func (s *Server) store(k string, actor *ateapipb.Actor) *ateapipb.Actor {
 	a := clone(actor)
+	s.actorSeq++
+	a.Metadata.Uid = fmt.Sprintf("actor-%s-%d", a.GetMetadata().GetName(), s.actorSeq)
+	stamp(a.Metadata)
 	a.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}
 	if s.BornSuspended {
 		a.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
@@ -953,11 +1066,19 @@ func (s *Server) ListActors(ctx context.Context, req *ateapipb.ListActorsRequest
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.listCalls++
-	resp := &ateapipb.ListActorsResponse{}
-	for _, a := range s.actors {
+	var all []*ateapipb.Actor
+	for _, a := range sortedValues(s.actors) {
 		if req.GetAtespace() != "" && a.GetMetadata().GetAtespace() != req.GetAtespace() {
 			continue
 		}
+		all = append(all, a)
+	}
+	page, next, err := paginate(all, req.GetOptions(), s.MaxPageSize)
+	if err != nil {
+		return nil, err
+	}
+	resp := &ateapipb.ListActorsResponse{NextPageToken: next}
+	for _, a := range page {
 		resp.Actors = append(resp.Actors, clone(a))
 	}
 	return resp, nil
@@ -978,8 +1099,69 @@ func (s *Server) CreateAtespace(ctx context.Context, req *ateapipb.CreateAtespac
 		return nil, status.Errorf(codes.AlreadyExists, "atespace %q already exists", name)
 	}
 	a := proto.Clone(space).(*ateapipb.Atespace)
+	stamp(a.Metadata)
 	s.atespaces[name] = a
 	return proto.Clone(a).(*ateapipb.Atespace), nil
+}
+
+func (s *Server) ListAtespaces(ctx context.Context, req *ateapipb.ListAtespacesRequest) (*ateapipb.ListAtespacesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	page, next, err := paginate(sortedValues(s.atespaces), req.GetOptions(), s.MaxPageSize)
+	if err != nil {
+		return nil, err
+	}
+	resp := &ateapipb.ListAtespacesResponse{NextPageToken: next}
+	for _, a := range page {
+		resp.Atespaces = append(resp.Atespaces, proto.Clone(a).(*ateapipb.Atespace))
+	}
+	return resp, nil
+}
+
+// ListActorTemplates lists the templates of one atespace, or of all when the
+// request names none, as Substrate does.
+func (s *Server) ListActorTemplates(ctx context.Context, req *ateapipb.ListActorTemplatesRequest) (*ateapipb.ListActorTemplatesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var all []*ateapipb.ActorTemplate
+	for _, t := range sortedValues(s.templates) {
+		if req.GetAtespace() != "" && t.GetMetadata().GetAtespace() != req.GetAtespace() {
+			continue
+		}
+		all = append(all, t)
+	}
+	page, next, err := paginate(all, req.GetOptions(), s.MaxPageSize)
+	if err != nil {
+		return nil, err
+	}
+	resp := &ateapipb.ListActorTemplatesResponse{NextPageToken: next}
+	for _, t := range page {
+		resp.ActorTemplates = append(resp.ActorTemplates, proto.Clone(t).(*ateapipb.ActorTemplate))
+	}
+	return resp, nil
+}
+
+// ListTags lists the tags of one atespace, or of all when the request names
+// none, as Substrate does.
+func (s *Server) ListTags(ctx context.Context, req *ateapipb.ListTagsRequest) (*ateapipb.ListTagsResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var all []*ateapipb.Tag
+	for _, t := range sortedValues(s.tags) {
+		if req.GetAtespace() != "" && t.GetMetadata().GetAtespace() != req.GetAtespace() {
+			continue
+		}
+		all = append(all, t)
+	}
+	page, next, err := paginate(all, req.GetOptions(), s.MaxPageSize)
+	if err != nil {
+		return nil, err
+	}
+	resp := &ateapipb.ListTagsResponse{NextPageToken: next}
+	for _, t := range page {
+		resp.Tags = append(resp.Tags, proto.Clone(t).(*ateapipb.Tag))
+	}
+	return resp, nil
 }
 
 func (s *Server) GetAtespace(ctx context.Context, req *ateapipb.GetAtespaceRequest) (*ateapipb.Atespace, error) {

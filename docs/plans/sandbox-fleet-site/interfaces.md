@@ -1,6 +1,6 @@
 # Interface contracts: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-09 against `f10c68c`. The snapshot schema in the next
+Status: accepted (#223); last checked 2026-11-10 against `3dd8bab2`. The snapshot schema in the next
 section is code since pull request 1 (#226, `internal/inventory`): its object kinds, field names and
 rules are fixed, and a change to them is a schema change. The names in the other sections (bucket
 layout, reporter flags and identity, event stream and tables, collector pipelines, site routes and
@@ -19,7 +19,9 @@ gs://<bench bucket>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>[_tra
 ```
 
 The site discovers clusters by listing `v1/inventory/*/*/latest.json`. There is no shared index
-object, so no two writers touch one object.
+object, so no two writers touch one object. `<project>` and `<cluster>` are one path segment each:
+the reporter, the snapshot schema and the decoder refuse a value that holds `/` or `\` or is `.` or
+`..`, so the name always has this depth and stays under the cluster's own prefix.
 
 ## Snapshot schema, `internal/inventory`
 
@@ -95,6 +97,9 @@ object, so no two writers touch one object.
       "allocated": {
         "cpu_m": 2000,
         "memory_bytes": 4294967296
+      },
+      "labels": {
+        "ate-env/workerpool": "default-template-workerpool"
       }
     }
   ],
@@ -107,6 +112,9 @@ object, so no two writers touch one object.
       "state": "running",
       "assigned_node": "gke-bench-1-pool-1-abcd",
       "worker": "w-0a1b2c",
+      "worker_selector": {
+        "ate-env/workerpool": "default-template-workerpool"
+      },
       "create_time": "2026-11-03T12:00:03Z",
       "update_time": "2026-11-03T12:00:04Z",
       "labels": {
@@ -151,36 +159,38 @@ object, so no two writers touch one object.
 }
 ```
 
-Additions planned for pull request 2, additive to v1, with the Go `Worker` and `Actor` structs in
-`internal/inventory/inventory.go`, `internal/inventory/v1/snapshot.schema.json` and the golden
-fixture updated together (the schema sets `additionalProperties: false` on `$defs/Worker` and
-`$defs/Actor`, `inventory_test.go` validates the golden against it, and `DecodeSnapshot` calls
-`dec.DisallowUnknownFields()` before the schema validation, thus a new field fails that test until
-the schema changes, and a snapshot that carries it fails to decode until the struct has the field):
-`workers[].labels`, the labels `ListWorkers` returns, because a placement domain is the distinct
-label set of a pool's workers, as `ListPlacementDomains` computes it; and
-`actors[].worker_selector`, the per-environment selector from #207.
+Added in pull request 2, additive to v1: `workers[].labels`, the labels `ListWorkers` returns,
+because a placement domain is the distinct label set of a pool's workers, as `ListPlacementDomains`
+computes it; and `actors[].worker_selector`, the per-environment selector from #207. Both are
+`$defs/Labels` in the schema, as `actors[].labels` is.
 
 Rules: timestamps RFC 3339 UTC; `state` is the `ateapi.ActorState` value lowercased, the same
 vocabulary as the event stream; `worker` and `name` of workers are opaque control-plane names, never
-parsed; labels pass through except keys under `ate.`; no key named `token`, `password` or
-`authorization` anywhere.
+parsed; a label or selector key that names a credential (`token`, `password`, `authorization`,
+`secret`, `credential`, in any letter case) is refused by both validators, and the reporter leaves
+such a key out. Substrate's actors carry no labels at the version `go.mod` requires, so
+`actors[].labels` stays empty until they do.
 
 ## Reporter, `cmd/ate-env-reporter`
 
-| Flag                                                        | Default                                 | Meaning                                                                                                                                                                       |
-| ----------------------------------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-bucket`                                                   | required unless `-out-dir` is set       | destination bucket                                                                                                                                                            |
-| `-project`, `-cluster`, `-location`                         | from the GKE metadata server when empty | snapshot identity; off GKE, `-project` and `-cluster` are required (`DecodeSnapshot` rejects a snapshot without them) and `-location` stays empty                             |
-| `-interval`                                                 | `5s`                                    | poll and write interval; backs off to 60 s on consecutive errors                                                                                                              |
-| `-snapshot-interval`                                        | `1h`                                    | how often `latest.json` is also kept under `snapshots/`                                                                                                                       |
-| `-out-dir`                                                  | empty                                   | write the bucket layout (`v1/inventory/`, `v1/snapshots/`) under a local directory instead of a bucket, which makes `-bucket` optional (unit tests, the Kind end-to-end case) |
-| `-ateapi-endpoint`, `-ateapi-token-file`, `-ateapi-ca-file` | as `ate-env-api`                        | Substrate control plane                                                                                                                                                       |
-| `-health-listen-addr`                                       | `:9091`                                 | `/healthz` and `/readyz`                                                                                                                                                      |
-| `-enable-tracing`, `-metrics-listen-addr`                   | off                                     | the same telemetry flags as `ate-env-api`; metric `ate_env_reporter_poll_duration_seconds{status}`                                                                            |
+| Flag                                | Default                                 | Meaning                                                                                                                                           |
+| ----------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-bucket`                           | required unless `-out-dir` is set       | destination bucket; exactly one of `-bucket` and `-out-dir` is set                                                                                |
+| `-project`, `-cluster`, `-location` | from the GKE metadata server when empty | snapshot identity; off GKE, `-project` and `-cluster` are required (`DecodeSnapshot` rejects a snapshot without them) and `-location` stays empty |
+| `-interval`                         | `5s`                                    | time from one tick's start to the next, at least 1 s; the wait doubles with each failed tick, up to 60 s                                          |
+| `-snapshot-interval`                | `1h`                                    | how often `latest.json` is also kept under `snapshots/`, as `<YYYYMMDD>T<HHMMSS>Z.json`; the first tick keeps one                                 |
+| `-out-dir`                          | empty                                   | write the bucket layout (`v1/inventory/`, `v1/snapshots/`) under a local directory (unit tests, the Kind end-to-end case)                         |
+| `-ateapi`, `-ateapi-token-file`     | as `ate-env-api`                        | Substrate control plane                                                                                                                           |
+| `-skip-verify`                      | `true`, as `ate-env-api`                | skip TLS verification of the control plane                                                                                                        |
+| `-health-listen-addr`               | `:9091`                                 | `/healthz`, and `/readyz`, which answers 200 while the last tick wrote its snapshot                                                               |
 
-Identity: Kubernetes ServiceAccount `ate-env-reporter` in namespace `ate-env-reporter` labeled
-`ate.dev/api-access=true`; projected token with audience `api.ate-system.svc`; Workload Identity to
+Not in pull request 2: `-enable-tracing` and `-metrics-listen-addr` with
+`ate_env_reporter_poll_duration_seconds{status}`. They come with the telemetry manifests (pull
+request 3), where a scrape configuration exists; see [decisions.md](./decisions.md).
+
+Identity (pull request 2b, `ate-env manifest reporter`): Kubernetes ServiceAccount
+`ate-env-reporter` in namespace `ate-env-reporter` labeled `ate.dev/api-access=true`; projected
+token with audience `api.ate-system.svc`; Workload Identity to
 `ate-env-reporter@<project>.iam.gserviceaccount.com` with `roles/storage.objectUser` on the bucket,
 restricted by an IAM condition to `v1/inventory/<project>/<cluster>/` and
 `v1/snapshots/<project>/<cluster>/` (an overwrite needs `storage.objects.delete` next to `create`);
@@ -188,19 +198,24 @@ the principal `user:system:serviceaccount:ate-env-reporter:ate-env-reporter` mer
 AccessPolicy's `viewer` binding (one object for the whole control plane: `ate-env manifest reporter`
 prints the binding and the operator merges it with `kubectl ate get access-policy --global -o yaml`
 and `kubectl ate update access-policy --global -f <file>`, as the README describes for
-`ate-env-api`'s `ListPlacementDomains`); ClusterRole with `get`, `list`, `watch` on
-`workerpools.ate.dev`, `sandboxconfigs.ate.dev`, `deployments.apps`, `services`, `pods`.
+`ate-env-api`'s `ListPlacementDomains`); ClusterRole with `list` on `workerpools.ate.dev` and
+`deployments.apps`, the two kinds the reporter reads.
 
 Behavior: one `ListActors` across atespaces and one `ListWorkers` per tick, paged at 1000;
-`ListAtespaces`, `ListActorTemplates` and `ListTags` every tenth tick or on a template-name miss;
-Kubernetes objects from informers. Each tick rewrites `latest.json` with one atomic object write,
-even when nothing but `generated_at` changed, so the object generation and the JSON `generated_at`
-move together and the site revalidates by generation. The reporter never calls `ate-env-api`.
+`ListAtespaces`, `ListActorTemplates` and `ListTags` every tenth tick, or at once when an actor
+names an atespace or a template the last read lacks (one that the read does not resolve, a template
+deleted under its actors, does not force another); one list of WorkerPools and one of Deployments
+per tick, from the API server's cache. A Deployment is taken when it has a container named
+`ate-env-api`. Each tick rewrites `latest.json` with one atomic object write, even when nothing but
+`generated_at` changed, so the object generation and the JSON `generated_at` move together and the
+site revalidates by generation. A tick that cannot read a source writes nothing and is retried. A
+tick whose kept copy fails has written `latest.json` and still counts as failed. The reporter never
+calls `ate-env-api`.
 
-Tests: unit tests against `internal/internaltest/fakecontrol`, which pull request 2 extends with
-`ListAtespaces`, `ListActorTemplates` and `ListTags` (it has `AddWorker`, `ListWorkers`,
-`ListActors` and `GetAtespace` today); one end-to-end case in `hack/ci/e2e.py` runs the reporter
-with `-out-dir`, `-project` and `-cluster` against the Kind Substrate and accepts the output with
+Tests: unit tests against `internal/internaltest/fakecontrol`, which has `ListAtespaces`,
+`ListActorTemplates`, `ListTags` and `AddTag` since pull request 2, and against the fake Kubernetes
+clientsets; pull request 2b adds one end-to-end case in `hack/ci/e2e.py` that runs the reporter with
+`-out-dir`, `-project` and `-cluster` against the Kind Substrate and accepts the output with
 `DecodeSnapshot` (FS-14).
 
 ## Event stream

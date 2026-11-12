@@ -1,8 +1,8 @@
 # Acceptance criteria: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-09 against `f10c68c`. Each criterion has a command and
-an expected result. Evidence goes into `evidence/` in this directory, one file per acceptance pass,
-with the commit of each component.
+Status: accepted (#223); last checked 2026-11-10 against `3dd8bab2`. Each criterion has a command
+and an expected result. Evidence goes into `evidence/` in this directory, one file per acceptance
+pass, with the commit of each component.
 
 | ID    | Title                                    | Phase |
 | ----- | ---------------------------------------- | ----- |

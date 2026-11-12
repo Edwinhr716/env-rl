@@ -9,6 +9,7 @@ cmd/
   ate-env/               # CLI: environment management and manifest generation (ate-env manifest)
   ate-env-api/           # API server daemon: gRPC services, MCP handler, port proxy
   ate-env-guest/         # Guest daemon: Linux PID 1 subreaper init, sidecar supervision
+  ate-env-reporter/      # Fleet inventory reporter daemon: one snapshot per interval to a bucket or a directory
   benchmarking/
     bench/               # Composable RL benchmark CLI (scenario lifecycle subcommands)
     swebench-loader/     # Benchmark driver: SWE-bench trajectories, placement, preflight, event recording, reports
@@ -21,6 +22,7 @@ internal/
   inventory/             # Fleet inventory snapshot: v1 JSON Schema, strict decoder, Substrate state vocabulary
   mcp/                   # Streamable HTTP MCP server: maps shell and file tools to guest gRPC
   portproxy/             # HTTP/CONNECT reverse proxy: tunnels ports inside actors via atenet
+  reporter/              # Fleet inventory snapshot writer: control-plane and Kubernetes lists, bucket and directory stores
   routertls/             # TLS config: dynamic SPIFFE client certificate and CA reload
   sidecarenv/            # Sidecar-only env: ATE_SIDECAR_ENV_<NAME> on the container; Take strips it for the sidecars
   telemetry/             # OpenTelemetry tracing setup and Prometheus metric collectors

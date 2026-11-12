@@ -97,8 +97,8 @@ var (
 	}
 )
 
-// credentialWords are the words an actor label key must not contain, in any
-// letter case. A snapshot is published to a shared bucket, and a label key
+// credentialWords are the words a label or selector key must not contain, in
+// any letter case. A snapshot is published to a shared bucket, and a label key
 // that names a credential is the usual sign that its value is one.
 // TestSchemaHasNoCredentialFields holds the schema's own property names to the
 // same list.
@@ -107,9 +107,14 @@ var credentialWords = []string{"token", "password", "authorization", "secret", "
 // labelKeyPattern matches a label key that names a credential. It is spelled
 // with character classes instead of (?i) so the same text is a valid pattern
 // in Go's RE2 and in the ECMA-262 dialect JSON Schema uses; the propertyNames
-// rule on Actor.labels in snapshot.schema.json carries the identical pattern,
+// rule on $defs/Labels in snapshot.schema.json carries the identical pattern,
 // and TestLabelKeyPatternMatchesSchema keeps the two equal.
 var labelKeyPattern = regexp.MustCompile(caseInsensitivePattern(credentialWords))
+
+// CredentialKey reports whether a label or selector key names a credential.
+// Validate refuses a snapshot that carries such a key, so a writer leaves the
+// key out.
+func CredentialKey(key string) bool { return labelKeyPattern.MatchString(key) }
 
 func caseInsensitivePattern(words []string) string {
 	var b strings.Builder
@@ -203,34 +208,41 @@ type Resources struct {
 }
 
 // Worker is one worker pod as the control plane registers it. Name is the
-// control plane's opaque worker name; never parse it.
+// control plane's opaque worker name; never parse it. Labels are the labels
+// the control plane mirrors from the WorkerPool object, the ones a worker
+// selector matches: the labels every schedulable worker of a pool carries are
+// that pool's placement domain.
 type Worker struct {
-	Name      string    `json:"name"`
-	Namespace string    `json:"namespace"`
-	Pool      string    `json:"pool"`
-	Pod       string    `json:"pod"`
-	Node      string    `json:"node,omitempty"`
-	State     string    `json:"state"`
-	Capacity  Resources `json:"capacity"`
-	Allocated Resources `json:"allocated"`
+	Name      string            `json:"name"`
+	Namespace string            `json:"namespace"`
+	Pool      string            `json:"pool"`
+	Pod       string            `json:"pod"`
+	Node      string            `json:"node,omitempty"`
+	State     string            `json:"state"`
+	Capacity  Resources         `json:"capacity"`
+	Allocated Resources         `json:"allocated"`
+	Labels    map[string]string `json:"labels,omitempty"`
 }
 
 // Actor is one Substrate actor, the entity behind an ate-env environment.
-// Labels are the actor's labels as data; Validate refuses a key that names a
-// credential (see credentialWords).
+// Labels are the actor's labels as data. WorkerSelector is the actor's own
+// placement constraint, which Substrate ANDs with its template's. Validate
+// refuses a key that names a credential in either map and in Worker.Labels
+// (see credentialWords).
 type Actor struct {
-	UID          string            `json:"uid"`
-	Atespace     string            `json:"atespace"`
-	Name         string            `json:"name"`
-	Template     string            `json:"template,omitempty"`
-	SourceTag    string            `json:"source_tag,omitempty"`
-	State        string            `json:"state"`
-	AssignedNode string            `json:"assigned_node,omitempty"`
-	Worker       string            `json:"worker,omitempty"`
-	CreateTime   time.Time         `json:"create_time"`
-	UpdateTime   time.Time         `json:"update_time"`
-	Crash        *Crash            `json:"crash,omitempty"`
-	Labels       map[string]string `json:"labels,omitempty"`
+	UID            string            `json:"uid"`
+	Atespace       string            `json:"atespace"`
+	Name           string            `json:"name"`
+	Template       string            `json:"template,omitempty"`
+	SourceTag      string            `json:"source_tag,omitempty"`
+	State          string            `json:"state"`
+	AssignedNode   string            `json:"assigned_node,omitempty"`
+	Worker         string            `json:"worker,omitempty"`
+	WorkerSelector map[string]string `json:"worker_selector,omitempty"`
+	CreateTime     time.Time         `json:"create_time"`
+	UpdateTime     time.Time         `json:"update_time"`
+	Crash          *Crash            `json:"crash,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
 }
 
 // Crash is the control plane's crash record, ActorStatus.crash. Substrate sets
@@ -345,10 +357,22 @@ func (s *Snapshot) Sort() {
 
 func key2(a, b string) string { return a + "\x00" + b }
 
+// CheckPathSegment refuses a project or cluster that is not one path
+// segment. Each is one segment of the snapshot's object name,
+// v1/inventory/<project>/<cluster>/latest.json: a separator adds a segment
+// that the one-level listing and a prefix condition do not expect, and "."
+// or ".." names another object's place.
+func CheckPathSegment(field, value string) error {
+	if value == "." || value == ".." || strings.ContainsAny(value, `/\`) {
+		return fmt.Errorf("inventory: %s %q is not one path segment (no \"/\", no \"\\\", not \".\" or \"..\")", field, value)
+	}
+	return nil
+}
+
 // Validate checks what the JSON Schema requires and what it cannot express:
 // the version, non-null lists and counts maps, the identity and timestamps of
 // the snapshot and of each object, the state vocabularies, the numeric bounds,
-// unique keys in every list, label keys that name no credential, and Counts
+// unique keys in every list, label and selector keys that name no credential, and Counts
 // matching Actors. It does not tie Crash to a state; see Crash. A snapshot
 // that passes Validate encodes to a document that validates against
 // snapshot.schema.json.
@@ -361,6 +385,12 @@ func (s *Snapshot) Validate() error {
 	}
 	if s.Project == "" || s.Cluster == "" {
 		return errors.New("inventory: project and cluster are required")
+	}
+	if err := CheckPathSegment("project", s.Project); err != nil {
+		return err
+	}
+	if err := CheckPathSegment("cluster", s.Cluster); err != nil {
+		return err
 	}
 	if s.Reporter.Version == "" {
 		return errors.New("inventory: reporter.version is required")
@@ -455,6 +485,9 @@ func (s *Snapshot) Validate() error {
 		if err := unique("workers", w.Name, i); err != nil {
 			return err
 		}
+		if err := checkKeys(w.Labels); err != nil {
+			return fmt.Errorf("inventory: workers[%d]: labels: %w", i, err)
+		}
 	}
 	for i, a := range s.Actors {
 		if a.UID == "" || a.Atespace == "" || a.Name == "" {
@@ -472,10 +505,11 @@ func (s *Snapshot) Validate() error {
 		if a.Crash != nil && a.Crash.CrashTime.IsZero() {
 			return fmt.Errorf("inventory: actors[%d]: crash.crash_time is required", i)
 		}
-		for k := range a.Labels {
-			if labelKeyPattern.MatchString(k) {
-				return fmt.Errorf("inventory: actors[%d]: label key %q names a credential (%s); a snapshot carries none", i, k, strings.Join(credentialWords, ", "))
-			}
+		if err := checkKeys(a.Labels); err != nil {
+			return fmt.Errorf("inventory: actors[%d]: labels: %w", i, err)
+		}
+		if err := checkKeys(a.WorkerSelector); err != nil {
+			return fmt.Errorf("inventory: actors[%d]: worker_selector: %w", i, err)
 		}
 	}
 	for i, d := range s.Deployments {
@@ -499,6 +533,16 @@ func (s *Snapshot) Validate() error {
 	}
 	if want := ComputeCounts(s.Actors); !countsEqual(want, s.Counts) {
 		return errors.New("inventory: counts do not match actors")
+	}
+	return nil
+}
+
+// checkKeys refuses a label or selector key that names a credential.
+func checkKeys(m map[string]string) error {
+	for k := range m {
+		if CredentialKey(k) {
+			return fmt.Errorf("key %q names a credential (%s); a snapshot carries none", k, strings.Join(credentialWords, ", "))
+		}
 	}
 	return nil
 }

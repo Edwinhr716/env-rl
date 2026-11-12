@@ -1,7 +1,7 @@
 # Sandbox fleet site: design
 
 Status: accepted plan (#223); pull request 1, `internal/inventory`, merged as #226. Last checked
-2026-11-09 against `ai-on-gke/sandboxenv-rl` at `f10c68c` and the Substrate `go.mod` requires,
+2026-11-10 against `ai-on-gke/sandboxenv-rl` at `3dd8bab2` and the Substrate `go.mod` requires,
 `274605f1`; the audit is in [research.md](./research.md), which first read `3b03b03` and `28520c0d`
 on 2026-10-30. The decisions taken so far are in [decisions.md](./decisions.md). Companions:
 [prd.md](./prd.md), [execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
@@ -23,7 +23,7 @@ per cluster                                                     central project
 ───────────                                                     ───────────────
 ateapi ─ actor events (stdout, later OTLP) ─► Cloud Logging sink ─► Pub/Sub topic ─┬─► BigQuery subscription ─► actor_events table
                                             (phase 2: collector ─► Pub/Sub)        └─► Cloud Storage subscription ─► gs://…/v1/events/
-reporter (Deployment) ─ ListActors, ListWorkers, K8s informers ─► gs://…/v1/inventory/<project>/<cluster>/latest.json
+reporter (Deployment) ─ ListActors, ListWorkers, K8s lists ─────► gs://…/v1/inventory/<project>/<cluster>/latest.json
 ate-env-api :metrics ─ PodMonitoring 5 to 15 s ─► Managed Prometheus ─► Cloud Monitoring
 Substrate components ─ OTLP push via the GKE managed collector ─► Cloud Monitoring, Cloud Trace
 trainers, ate-env-api, guests ─ OTLP ─► telemetry collector ─┬─► Cloud Trace
@@ -37,7 +37,7 @@ users ─► IAP ─► Cloud Run site ─ reads ─► GCS, BigQuery, Cloud Mon
 
 | Signal            | Produced by                                                                                                                         | Path                                                                                                                                                                                                                                                                                                                                                                   | Freshness                                                                                           | Store                                                                                            | Identity keys                                                                             |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
-| Current inventory | reporter, one per cluster                                                                                                           | `ListActors` across all atespaces, `ListWorkers`, `ListAtespaces`, `ListActorTemplates`, `ListTags`; Kubernetes informers for WorkerPools, worker pods, `ate-env-api` Deployments                                                                                                                                                                                      | poll interval, 5 s default                                                                          | GCS `latest.json` per cluster, hourly snapshots kept 30 days                                     | `ate.actor.uid`, atespace, name, template, `update_time`                                  |
+| Current inventory | reporter, one per cluster                                                                                                           | `ListActors` across all atespaces, `ListWorkers`, `ListAtespaces`, `ListActorTemplates`, `ListTags`; Kubernetes lists of WorkerPools and `ate-env-api` Deployments                                                                                                                                                                                                     | poll interval, 5 s default                                                                          | GCS `latest.json` per cluster, hourly snapshots kept 30 days                                     | `ate.actor.uid`, atespace, name, template, `update_time`                                  |
 | Transitions       | `ateapi`: `Actor state changed`, `Actor crashed`, one record per committed transition                                               | phase 1: pod stdout, Cloud Logging sink, Pub/Sub; phase 2: `OTEL_LOGS_EXPORTER=otlp,console`, collector, Pub/Sub                                                                                                                                                                                                                                                       | seconds; 99% under 60 s on the Logging path                                                         | BigQuery table via a Pub/Sub BigQuery subscription; GCS archive via a Cloud Storage subscription | the five `ate.*` identity keys, `ate.actor.operation.name`, `ate.actor.state`, `trace_id` |
 | Time series       | `ate-env-api` (`ate_env_api_*`), `ate-env-guest`, Substrate (`ate.actor.*`, `ate.scheduler.*`, `ate.workerpool.*`, atelet families) | PodMonitoring for `ate-env-api`; Substrate pushes OTLP through the managed collector                                                                                                                                                                                                                                                                                   | 5 s scrape floor; Substrate's push interval is 60 s unless `OTEL_METRIC_EXPORT_INTERVAL` is lowered | Cloud Monitoring, full resolution one week                                                       | none, by the cardinality rule                                                             |
 | Traces            | Python and Go clients, `ate-env-api`, guest, swebench loader, Substrate `ateapi`, router, atelet, ateworker                         | OTLP to the per-cluster collector; Substrate through the managed collector                                                                                                                                                                                                                                                                                             | SDK batch flush, 5 s default                                                                        | Cloud Trace, 30 days; raw OTLP/JSON in GCS                                                       | `ate.actor.name`, `ate.atespace`, `ate.template.name`, `ate_env.run_id`, `trace_id`       |
@@ -65,8 +65,8 @@ Per cluster, applied by `ate-env manifest` or the fleet's Config Sync repository
   `v1/inventory/` and `v1/snapshots/` prefixes (an overwrite needs `storage.objects.delete`, which
   `objectCreator` lacks); its principal merged into the global AccessPolicy's `viewer` binding, the
   binding `ate-env manifest access-policy --global` already renders for `ate-env-api`'s
-  `ListPlacementDomains` (#235), because the global policy is one object; a ClusterRole with `get`,
-  `list`, `watch` on WorkerPools, SandboxConfigs, Deployments, Services and Pods.
+  `ListPlacementDomains` (#235), because the global policy is one object; a ClusterRole with `list`
+  on WorkerPools and Deployments, the two kinds the reporter reads.
 - PodMonitoring for `ate-env-api`'s metrics port, rendered by `ate-env manifest --metrics-port`.
 - Substrate configuration: `OTEL_LOGS_EXPORTER=otlp,console` and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`
   on the `ate-api-server` Deployment (phase 2; not in the shared `ate-otel-config`, because the
@@ -143,7 +143,7 @@ section of [research.md](./research.md) and update the last-checked line above (
    `ate_actor_crashes_total`) exists in Substrate's `docs/metrics/registry/metrics.yaml` at the
    version `go.mod` requires, under the OTLP-to-Prometheus naming: dots become underscores and a
    counter gains `_total`, so the entries to find are `ate.workerpool.workers` and
-   `ate.actor.crashes`. The automated form of this step is `TestFS13DriftCheckStep4`.
+   `ate.actor.crashes`.
 5. Manifest: `ate-env manifest` still has `access-policy --global`, `--metrics-port`,
    `--enable-tracing`, `--otlp-endpoint` and `--otlp-insecure`.
 6. Benchmark bundles: `cmd/benchmarking/bench/bundle.go` still names the folder form and the
