@@ -94,7 +94,10 @@ Select the trajectory profile with `--workload`:
 
 ## 2. Build digest-pinned manifests outside the repository
 
-Write manifests and run outputs outside the git checkout so `ko build` reads a clean working tree:
+Install `ko` (`go install github.com/google/ko@latest`), `crane`
+(`go install github.com/google/go-containerregistry/cmd/crane@latest`), and an out-of-repo Python
+`3.10+` virtual environment (`/tmp/swe-venv`) before generating manifests so `ko build` reads a
+clean working tree:
 
 ```bash
 export ENV_REPO=/path/to/sandboxenv-rl
@@ -104,48 +107,68 @@ export DOCKERHUB_REMOTE="${REGION}-docker.pkg.dev/${PROJECT}/dockerhub-remote"
 export SWEBENCH_REPO="${REGION}-docker.pkg.dev/${PROJECT}/swebench/swebench-verified"
 export MANIFEST_DIR=/tmp/r2eswe-manifests
 mkdir -p "${MANIFEST_DIR}"
+
+python3 -m venv /tmp/swe-venv
+SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 /tmp/swe-venv/bin/pip install \
+  -e "${ENV_REPO}/clients/python" datasets 'swebench>=5'
+export PYTHON_BIN=/tmp/swe-venv/bin/python3
 ```
 
 Set `R2E_LIMIT` to at least your chosen `--r2e-images` count. Build the digest-pinned R2E-Gym
 `CommandAdapter` manifest with [`../make-r2e-dataset.py`](../make-r2e-dataset.py) and
 [`../../../integrations/uni-agent/scripts/resolve_images.sh`](../../../integrations/uni-agent/scripts/resolve_images.sh).
-The first pass lists every candidate image, not the first `R2E_LIMIT`: the manifest pass skips a tag
-whose digest an earlier tag already has, so it reads past the first `R2E_LIMIT` candidates, and
-every tag it reads must be in `r2e-images.json`. Set `MODE=hubapi` on `resolve_images.sh` to resolve
-thousands of tags in minutes; the mapping serves any later `R2E_LIMIT`.
+The first pass lists every candidate image because the manifest pass skips any tag whose digest an
+earlier tag already uses, so it reads past the first `R2E_LIMIT` candidates and expects every read
+tag in `r2e-images.json`. Set `MODE=hubapi` on `resolve_images.sh` to query Docker Hub's tags API
+directly and rewrite output references to an Artifact Registry Docker Hub remote repository
+(`DOCKERHUB_REMOTE`, configured with upstream Docker Hub credentials for node pulls). That mapping
+serves any later `R2E_LIMIT`:
 
 ```bash
 R2E_LIMIT=20
 
-"${ENV_REPO}/benchmarking/swebench/make-r2e-dataset.py" \
+"${PYTHON_BIN}" "${ENV_REPO}/benchmarking/swebench/make-r2e-dataset.py" \
   --source r2e_gym_easy \
   --images-out "${MANIFEST_DIR}/r2e-images.txt"
 
-"${ENV_REPO}/integrations/uni-agent/scripts/resolve_images.sh" \
+MODE=hubapi "${ENV_REPO}/integrations/uni-agent/scripts/resolve_images.sh" \
   "${MANIFEST_DIR}/r2e-images.txt" \
   "${DOCKERHUB_REMOTE}" \
   "${MANIFEST_DIR}/r2e-images.json"
 
-"${ENV_REPO}/benchmarking/swebench/make-r2e-dataset.py" \
+"${PYTHON_BIN}" "${ENV_REPO}/benchmarking/swebench/make-r2e-dataset.py" \
   --source r2e_gym_easy \
   --limit "${R2E_LIMIT}" \
   --image-digests "${MANIFEST_DIR}/r2e-images.json" \
   --out "${MANIFEST_DIR}/r2e.jsonl"
 ```
 
-Set `MODE=mirror` on `resolve_images.sh` when copying into a standard Artifact Registry repository
-instead of a Docker Hub remote repository.
+Default `MODE=proxy` resolves digests through `DOCKERHUB_REMOTE` (`crane digest`). Set `MODE=mirror`
+on `resolve_images.sh` when copying images by digest into a standard Artifact Registry repository.
 
 Build the SWE-bench Verified manifest with [`../make-dataset.py`](../make-dataset.py). Request extra
 rows above `--swe-images` (for example `SWE_IMAGES + 10`, up to `500`) because
 [`../offline-exclusions.txt`](../offline-exclusions.txt) removes instances whose tests require
-internet access:
+internet access. Pass `--registry "${SWEBENCH_REPO}"` when copying from a single-repository mirror
+with [`../mirror-images.sh`](../mirror-images.sh) (see
+[`../README.md#prepare-once-per-project`](../README.md#prepare-once-per-project)), or pass
+`--registry "${DOCKERHUB_REMOTE}/swebench"` with
+`--image-ref '{registry}/sweb.eval.x86_64.{instance_id_1776}:latest'` when pulling from public
+Docker Hub's per-instance repositories through the remote repository:
 
 ```bash
 SWE_LIMIT=30
 
-"${ENV_REPO}/benchmarking/swebench/make-dataset.py" \
+# Option A: single-repository mirror populated via mirror-images.sh
+"${PYTHON_BIN}" "${ENV_REPO}/benchmarking/swebench/make-dataset.py" \
   --registry "${SWEBENCH_REPO}" \
+  --limit "${SWE_LIMIT}" \
+  --out "${MANIFEST_DIR}/swebench.jsonl"
+
+# Option B: Docker Hub remote repository (no prior mirror)
+"${PYTHON_BIN}" "${ENV_REPO}/benchmarking/swebench/make-dataset.py" \
+  --registry "${DOCKERHUB_REMOTE}/swebench" \
+  --image-ref '{registry}/sweb.eval.x86_64.{instance_id_1776}:latest' \
   --limit "${SWE_LIMIT}" \
   --out "${MANIFEST_DIR}/swebench.jsonl"
 ```
@@ -153,7 +176,12 @@ SWE_LIMIT=30
 ## 3. Validate the plan offline (`dry-run`)
 
 Run `dry-run` before touching the cluster to verify manifest schemas, rendered Go and Python
-trajectories, arm matrix expansion, shard widths, and the 63-character actor name limit:
+trajectories, arm matrix expansion, shard widths, and the 63-character actor name limit. Size
+`--window-size` with two bounds for `sliding` and `pipelined`: keep `window_size < shard_images`
+(`10 < 20` below, creating `2` windows) so both strategies span multiple windows
+(`window_size >= shard_images` collapses to one window and matches `naive`), and keep
+`window_size * rollouts_per_image >= shard_width` (`10 * 10 >= 100` when `--concurrency 200` splits
+across both shards) so every worker slot stays busy:
 
 ```bash
 "${ENV_REPO}/benchmarking/swebench/run-r2e-swebench.sh" dry-run \
@@ -161,9 +189,10 @@ trajectories, arm matrix expansion, shard widths, and the 63-character actor nam
   --swe-dataset "${MANIFEST_DIR}/swebench.jsonl" \
   --concurrency 200 \
   --images 20 \
-  --rollouts-per-image 5 \
+  --rollouts-per-image 10 \
   --client all \
   --strategy all \
+  --window-size 10 \
   --artifact-dir /tmp/r2eswe-dry
 ```
 
@@ -179,6 +208,7 @@ snapshot bake to complete, warms node caches, and writes prewarm events under
 
 ```bash
 export KO_DOCKER_REPO="${REGION}-docker.pkg.dev/${PROJECT}/bench"
+export AUTH_TOKEN_SECRET=ate-env-api-token
 export ARTIFACT_DIR=/tmp/r2eswe-run
 
 "${ENV_REPO}/benchmarking/swebench/run-r2e-swebench.sh" prewarm \
@@ -186,7 +216,7 @@ export ARTIFACT_DIR=/tmp/r2eswe-run
   --swe-dataset "${MANIFEST_DIR}/swebench.jsonl" \
   --concurrency 200 \
   --images 20 \
-  --rollouts-per-image 5 \
+  --rollouts-per-image 10 \
   --artifact-dir "${ARTIFACT_DIR}"
 ```
 
@@ -200,9 +230,10 @@ SAMPLE_CACHE=1 HARVEST_RESTORES=1 \
   --swe-dataset "${MANIFEST_DIR}/swebench.jsonl" \
   --concurrency 200 \
   --images 20 \
-  --rollouts-per-image 5 \
+  --rollouts-per-image 10 \
   --client all \
   --strategy all \
+  --window-size 10 \
   --artifact-dir "${ARTIFACT_DIR}"
 ```
 
@@ -218,11 +249,15 @@ Common parameter variations:
 - **20 total images (`10` R2E + `10` SWE-bench) at `200` concurrency (`10` rollouts per image)**:
   pass `--concurrency 200 --images 10 --rollouts-per-image 10`.
 - **Rootfs I/O probe without `pytest`**: pass `--workload io --mode eval`.
+- **Private GKE nodes without Cloud NAT**: `in-cluster` `Job`s start a `keep` sidecar from
+  `busybox:1.36` on Docker Hub, and `--client python` builds `FROM python:3.12-slim` unless
+  `--python-image` supplies a prebuilt image in Artifact Registry. Enable Cloud NAT on the pool's
+  subnet (and pass `--python-image` when the workstation cannot pull from Docker Hub).
 - **Local port-forward execution**: omit `KO_DOCKER_REPO` (or pass `--execution local`) with
   `ENDPOINT=localhost:7777` (pass `--auth-token-file` when `ate-env-api` requires bearer auth, and
-  `--python-bin /path/to/venv/bin/python3` when the host `python3` lacks `grpcio>=1.84` and
-  `protobuf>=7.35`). Override `BASE_TEMPLATE` and `--api-service` when the cluster uses non-default
-  template or `ate-env-api` Service names.
+  `--python-bin /tmp/swe-venv/bin/python3` when the host `python3` lacks `ate-env-rl` with
+  `grpcio>=1.85.1` and `protobuf>=7.35`). Override `BASE_TEMPLATE` and `--api-service` when the
+  cluster uses non-default template or `ate-env-api` `Service` names.
 
 ## 5. Verify outputs in `$ARTIFACT_DIR`
 

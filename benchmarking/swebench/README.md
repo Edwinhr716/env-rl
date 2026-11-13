@@ -55,9 +55,11 @@ nodes, 30 on hundreds), a start arm and a read arm. A quick run is:
 
 ```bash
 kubectl -n ate-env port-forward svc/ate-env-api 7777:7777 &
-go run ./cmd/benchmarking/swebench-loader run -dataset swebench-verified.jsonl \
-  -images 5 -tasks-per-image 1 -width 5 -run-id smoke
-go run ./cmd/benchmarking/swebench-loader report smoke.jsonl
+export SUBSTRATE_ENV_AUTH_TOKEN="$(kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d)"
+go run ./cmd/benchmarking/swebench-loader run -dataset /tmp/swebench-verified.jsonl \
+  -exclude-file benchmarking/swebench/offline-exclusions.txt \
+  -images 5 -tasks-per-image 1 -width 5 -run-id smoke -out /tmp/smoke.jsonl
+go run ./cmd/benchmarking/swebench-loader report /tmp/smoke.jsonl
 ```
 
 ## Where things are
@@ -232,46 +234,130 @@ per cluster, so the first run on a fresh cluster pays the bake for every
 image).
 One run never spans clusters.
 
-Telemetry is the JSONL file only. There is no OpenTelemetry export yet; the
-events map one to one onto spans and that export is planned, with the file
-staying the source of truth so a run does not depend on a collector.
+The JSONL events file is the source of truth so a run works without a
+collector. Passing `-enable-tracing` also exports every event as an
+OpenTelemetry span over OTLP/gRPC under one `swebench-loader.run` span per run,
+configured by `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_INSECURE`.
 
 ## Prepare once per project
 
-1. Put the task images in a registry the nodes can pull from. If the nodes
-   can read your mirror directly, skip this step. Otherwise copy them by
-   digest with crane; `tags.txt` has one tag per line, for example every
-   `sweb.eval.x86_64.*` tag of the source repository without the `-zran`
-   variants:
+1. Install workstation tools and verify `ate-env` on the cluster. On the
+   workstation, install Go (`1.27` or later, matching `go.mod`), `kubectl`,
+   `kubectl-ate`, `ko`, `crane`, Docker registry credentials, `docker`
+   ([`./run-r2e-swebench.sh`](./run-r2e-swebench.sh) uses `docker` to build the
+   `in-cluster` `--client python` image when `--python-image` is omitted), and a
+   Python `3.10+` virtual environment outside the git checkout so generated
+   files keep the working tree clean for `ko build`:
 
    ```bash
-   SRC=SOURCE_REGISTRY/swebench-verified
-   DST=us-central1-docker.pkg.dev/PROJECT/swebench/swebench-verified
-   crane ls $SRC | grep -v -- '-zran$' > tags.txt
-   benchmarking/swebench/mirror-images.sh $SRC $DST tags.txt 8
+   go install github.com/google/ko@latest
+   go install github.com/google/go-containerregistry/cmd/crane@latest
+   gcloud auth configure-docker us-central1-docker.pkg.dev
+   python3 -m venv /tmp/swe-venv
+   SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 /tmp/swe-venv/bin/pip install \
+     -e ./clients/python datasets 'swebench>=5'
    ```
 
-2. Build the manifest: gold patch, test patch, harness eval script, log
-   parser and the digest-pinned image per instance. `--registry` is the
-   repository the images live in, the same `$DST` as above (or the source
-   repository when the nodes can read it).
+   `./clients/python` installs `ate-env-rl` (`ate_env_rl`, `grpcio>=1.85.1`,
+   `protobuf>=7.35`) for `dry-run` and `--client python`.
+   `SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0` supplies a release version in shallow
+   clones without git tags. `datasets` and `swebench>=5` drive
+   [`./make-dataset.py`](./make-dataset.py) and
+   [`./make-r2e-dataset.py`](./make-r2e-dataset.py).
+
+   On the cluster (see [`../../README.md#deployment-guide`](../../README.md#deployment-guide)),
+   ensure Agent Substrate includes `spiffe://cluster.local/ns/ate-env/sa/ate-env-api`
+   in `--ingress-allowed-spiffe-ids` and runs worker images from
+   `go run ./cmd/ate-setup publish worker-images` in the Substrate checkout.
+   Ensure the `ate-env` atespace has its editor policy
+   (`ate-env manifest access-policy`), plus the global viewer binding
+   (`ate-env manifest access-policy --global` merged into the global policy)
+   when calling `ListPlacementDomains` (`ate-env placement-domains`) or
+   `WarmImage` (`ate-env warm-image` with `--nodes 0`). Deploy `ate-env-api`
+   with its `ate-env-api-token` `Secret` (`ate-env manifest auth-secret`) and
+   register a base `ActorTemplate` (`ate-env manifest template`) with CPU and
+   memory limits. Per task image, `ate-env-api` derives one template from that
+   base on first use and bakes its golden snapshot.
+
+2. Set up an image mirror source in the cluster's region. Worker nodes pull
+   task images under their node service account. Public Docker Hub rate-limits
+   unauthenticated pulls, and cross-region pulls add latency to cold starts and
+   golden bakes. Store or proxy task images in a regional Artifact Registry
+   repository and grant the node service account
+   `roles/artifactregistry.reader`:
+   - **Existing single-repository mirror**: when a source repository already
+     stores every instance as a `sweb.eval.x86_64.<instance_id>` tag in one
+     repository, list its tags to `/tmp/tags.txt` (excluding `-zran` variants)
+     and copy them by digest into a regional standard repository with
+     [`./mirror-images.sh`](./mirror-images.sh):
+
+     ```bash
+     SRC=SOURCE_REGISTRY/swebench-verified
+     DST=us-central1-docker.pkg.dev/PROJECT/swebench/swebench-verified
+     crane ls "${SRC}" | grep -v -- '-zran$' > /tmp/tags.txt
+     benchmarking/swebench/mirror-images.sh "${SRC}" "${DST}" /tmp/tags.txt 8
+     ```
+
+   - **Public Docker Hub source**: upstream SWE-bench Verified publishes 500
+     separate repositories
+     (`docker.io/swebench/sweb.eval.x86_64.<instance_id_1776>:latest`, one
+     repository per instance), so `crane ls` on one repository cannot list
+     them. Create a regional Artifact Registry remote repository backed by
+     Docker Hub:
+
+     ```bash
+     gcloud artifacts repositories create dockerhub-remote \
+       --repository-format=docker \
+       --mode=remote-repository \
+       --location=us-central1 \
+       --remote-docker-repo=docker-hub
+     ```
+
+     Attach upstream Docker Hub credentials (`--remote-username` and
+     `--remote-password-secret-version`) before pulling hundreds of distinct
+     images. The remote repository resolves digests on demand and caches layers
+     in the region on first pull. For R2E-Gym tags,
+     [`../../integrations/uni-agent/scripts/resolve_images.sh`](../../integrations/uni-agent/scripts/resolve_images.sh)
+     supports default `MODE=proxy` (resolves digests through the remote
+     repository), `MODE=hubapi` (queries Docker Hub's tags API directly and
+     prefixes the remote repository path), and `MODE=mirror` (copies images by
+     digest into a standard Artifact Registry repository).
+   - **In-cluster loader helper images**:
+     [`./run-in-cluster.sh`](./run-in-cluster.sh) and
+     [`./run-r2e-swebench.sh`](./run-r2e-swebench.sh) start a `keep` sidecar
+     from `busybox:1.36` (pinned by digest on Docker Hub), and `--client python`
+     builds `FROM python:3.12-slim` unless `--python-image` provides a prebuilt
+     image. Private GKE pools without Cloud NAT need egress for Docker Hub
+     pulls (plus `--python-image` when the workstation cannot pull
+     `python:3.12-slim`).
+
+3. Build the manifest outside the git tree: gold patch, test patch, harness
+   eval script, log parser, and the digest-pinned image per instance. Pass
+   `--registry "${DST}"` for a single-repository mirror, or pass
+   `--image-ref '{registry}/sweb.eval.x86_64.{instance_id_1776}:latest'` against
+   the Docker Hub remote repository:
 
    ```bash
-   pip install datasets 'swebench>=5'
-   benchmarking/swebench/make-dataset.py --registry $DST \
-     --revision <dataset commit> --out swebench-verified.jsonl
+   # From a single-repository mirror:
+   /tmp/swe-venv/bin/python3 benchmarking/swebench/make-dataset.py \
+     --registry "${DST}" \
+     --revision <dataset commit> \
+     --out /tmp/swebench-verified.jsonl
+
+   # Or directly through the Docker Hub remote repository:
+   /tmp/swe-venv/bin/python3 benchmarking/swebench/make-dataset.py \
+     --registry us-central1-docker.pkg.dev/PROJECT/dockerhub-remote/swebench \
+     --image-ref '{registry}/sweb.eval.x86_64.{instance_id_1776}:latest' \
+     --revision <dataset commit> \
+     --out /tmp/swebench-verified.jsonl
    ```
 
-   `--image-ref` sets how an instance maps to an image reference (default:
-   one tag per instance, `sweb.eval.x86_64.<instance_id>`, in one
-   repository); the script lists instances whose image it cannot resolve. It
-   loads the dataset at a resolved commit (`--revision`, else the current
-   head) and writes that commit (`resolved_revision`; the file's sha256 for a
-   local dataset) and the swebench version to `OUT.meta.json`.
-
-3. Install ate-env with a base template (`ate-env manifest template`). Per
-   image, the API derives one template from it on first use and bakes the
-   golden snapshot then; the first create of each image pays that.
+   `--image-ref` sets how an instance maps to an image reference (default
+   `{registry}:sweb.eval.x86_64.{instance_id}`). The script reports and skips
+   instances whose image `crane` cannot resolve. It loads the dataset at a
+   resolved commit (`--revision`, else the current head) and writes that commit
+   (`resolved_revision`, or the file's `sha256` for a local dataset) and the
+   `swebench` version to `OUT.meta.json`.
 
 4. Optional: plan where the images go. Placement is image-blind, so the
    first boot of an image on a node pays its pull and unpack wherever the
@@ -282,14 +368,16 @@ staying the source of truth so a run does not depend on a collector.
    domains once per cluster shape, then plan:
 
    ```bash
-   cat > domains.json <<'EOF'
+   cat > /tmp/domains.json <<'EOF'
    {"domains": [
      {"name": "d0", "selector": {"ate-env/domain": "d0"}, "nodes": 4, "node_cache_bytes": 400000000000, "node_slots": 16},
      {"name": "d1", "selector": {"ate-env/domain": "d1"}, "nodes": 4, "node_cache_bytes": 400000000000, "node_slots": 16}
    ]}
    EOF
-   swebench-loader plan-placement -dataset swebench-verified.jsonl -schedule schedule.json \
-     -domains domains.json -replication 1 -hot-demand 8 -hot-replication 2 -out image-placement.json
+   go run ./cmd/benchmarking/swebench-loader plan-placement \
+     -dataset /tmp/swebench-verified.jsonl \
+     -exclude-file benchmarking/swebench/offline-exclusions.txt \
+     -domains /tmp/domains.json -replication 1 -out /tmp/image-placement.json
    ```
 
    `node_cache_bytes` is the unpacked bytes one node may hold for the plan:
@@ -358,8 +446,10 @@ staying the source of truth so a run does not depend on a collector.
    indexes of the pairs the pass warms, in base 36):
 
    ```bash
-   swebench-loader preflight -plan image-placement.json -events-dir runs/pf-$(date +%s) \
-     -endpoint 127.0.0.1:7777 -auth-token-file token -probes-per-node 2 -max-rounds 3
+   export SUBSTRATE_ENV_AUTH_TOKEN="$(kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d)"
+   go run ./cmd/benchmarking/swebench-loader preflight \
+     -plan /tmp/image-placement.json -events-dir /tmp/runs/pf-$(date +%s) \
+     -endpoint 127.0.0.1:7777 -probes-per-node 2 -max-rounds 3
    ```
 
    It writes `preflight-events.jsonl` (a `preflight_template` and a
@@ -384,15 +474,17 @@ loop):
 
 ```bash
 kubectl -n ate-env port-forward svc/ate-env-api 7777:7777 &
-go run ./cmd/benchmarking/swebench-loader run -dataset swebench-verified.jsonl \
-  -images 5 -tasks-per-image 1 -width 5 -run-id smoke
-go run ./cmd/benchmarking/swebench-loader report smoke.jsonl
+export SUBSTRATE_ENV_AUTH_TOKEN="$(kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d)"
+go run ./cmd/benchmarking/swebench-loader run -dataset /tmp/swebench-verified.jsonl \
+  -exclude-file benchmarking/swebench/offline-exclusions.txt \
+  -images 5 -tasks-per-image 1 -width 5 -run-id smoke -out /tmp/smoke.jsonl
+go run ./cmd/benchmarking/swebench-loader report /tmp/smoke.jsonl
 ```
 
 `-dry-run` loads and renders everything and prints the plan without touching
 the API. `-keep` leaves the fleet in place for inspection.
 
-After a pre-flight (step 5 above), `-placement image-placement.json` makes
+After a pre-flight (step 5 above), `-placement /tmp/image-placement.json` makes
 every create carry the worker selector of one of its image's domains,
 round-robin per image, so the environments land on the nodes that already
 hold the image; images the plan left unplaced get no selector. It needs the
@@ -416,12 +508,20 @@ the loader the same token: `-auth-token-file PATH`, or the
 reads. The file wins when both are set. Without either, the loader sends no
 token.
 
-For the 500-wide shapes run inside the cluster so the loader sits next to the
-API and spreads over its replicas (`-connections`, default 4):
+For the 500-wide shapes, invoke [`./run-in-cluster.sh`](./run-in-cluster.sh)
+from an output directory outside the repository in a subshell so the copied
+events file keeps the git tree clean, and run the loader next to `ate-env-api`
+across its replicas (`-connections`, default 4):
 
 ```bash
-KO_DOCKER_REPO=gcr.io/PROJECT/repo benchmarking/swebench/run-in-cluster.sh swe-eval500x6 swebench-verified.jsonl \
-  -mode eval -images 500 -tasks-per-image 6 -width 500 -connections 8
+export ENV_REPO="${PWD}"
+(
+  mkdir -p /tmp/swe-runs && cd /tmp/swe-runs
+  AUTH_TOKEN_SECRET=ate-env-api-token \
+  KO_DOCKER_REPO=us-central1-docker.pkg.dev/PROJECT/bench \
+    "${ENV_REPO}/benchmarking/swebench/run-in-cluster.sh" swe-eval500x6 /tmp/swebench-verified.jsonl \
+    -mode eval -images 500 -tasks-per-image 6 -width 500 -connections 8
+)
 ```
 
 The script bakes the dataset, the exclusion list, any `-placement` plan and
@@ -612,6 +712,8 @@ for the report template):
 
 ```bash
 export KO_DOCKER_REPO=us-central1-docker.pkg.dev/PROJECT/bench
+export AUTH_TOKEN_SECRET=ate-env-api-token
+export PYTHON_BIN=/tmp/swe-venv/bin/python3
 export MANIFEST_DIR=/tmp/r2eswe-manifests
 export ARTIFACT_DIR=/tmp/r2eswe-run
 
@@ -621,9 +723,10 @@ benchmarking/swebench/run-r2e-swebench.sh dry-run \
   --swe-dataset "${MANIFEST_DIR}/swebench.jsonl" \
   --concurrency 200 \
   --images 20 \
-  --rollouts-per-image 5 \
+  --rollouts-per-image 10 \
   --client all \
   --strategy all \
+  --window-size 10 \
   --artifact-dir /tmp/r2eswe-dry
 
 # 2. Bake derived ActorTemplate golden snapshots and warm node caches once before timing:
@@ -632,7 +735,7 @@ benchmarking/swebench/run-r2e-swebench.sh prewarm \
   --swe-dataset "${MANIFEST_DIR}/swebench.jsonl" \
   --concurrency 200 \
   --images 20 \
-  --rollouts-per-image 5 \
+  --rollouts-per-image 10 \
   --artifact-dir "${ARTIFACT_DIR}"
 
 # 3. Run the timed benchmark, collect 4-scope telemetry, validate, and optionally upload to GCS:
@@ -641,10 +744,10 @@ benchmarking/swebench/run-r2e-swebench.sh run \
   --swe-dataset "${MANIFEST_DIR}/swebench.jsonl" \
   --concurrency 200 \
   --images 20 \
-  --rollouts-per-image 5 \
+  --rollouts-per-image 10 \
   --client all \
   --strategy all \
-  --window-size 0 \
+  --window-size 10 \
   --workload graded \
   --mode steps \
   --steps 1 \
@@ -656,6 +759,16 @@ benchmarking/swebench/run-r2e-swebench.sh run \
   ${GCS_BENCHMARK_BUCKET:+--gcs-bucket "${GCS_BENCHMARK_BUCKET}"} \
   --artifact-dir "${ARTIFACT_DIR}"
 ```
+
+Size `--window-size` with two bounds when comparing `sliding` and `pipelined`:
+keep `window_size < shard_images` (`10 < 20` above, creating `2` windows) so
+both strategies advance across multiple windows (`window_size >= shard_images`
+creates one window and matches `naive`), and keep
+`window_size * rollouts_per_image >= shard_width` (`10 * 10 >= 100` when
+`--concurrency 200` splits across two shards) so every worker slot stays busy
+(`--window-size 0` clamps `DefaultWindowSize` to `8` images).
+`LOADER_NODEPOOL` and `LOADER_TOLERATION_KEY` apply only to single-dataset
+[`./run-in-cluster.sh`](./run-in-cluster.sh) `Job`s.
 
 ### `run-r2e-swebench.sh` subcommands and flags
 
@@ -690,7 +803,7 @@ forward to `--client python`).
 | `--run-id ID` | `RUN_ID` | `r2eswe` | DNS-label prefix (`<= 14` characters) for `Job` and actor names. |
 | `--api-service NAME` | `API_SERVICE` | `ate-env-api` | In-cluster `ate-env-api` Kubernetes `Service` name (`<API_SERVICE>.<NAMESPACE>.svc:7777`). |
 | `--auth-token-file PATH` | `AUTH_TOKEN_FILE` | unset | Bearer token file for `ate-env-api` in `--execution local` mode (in-cluster `Job`s use `AUTH_TOKEN_SECRET`). |
-| `--python-bin PATH` | `PYTHON_BIN` | `python3` | Python interpreter for `dry-run` and `--execution local --client python` (`grpcio>=1.84`, `protobuf>=7.35`). |
+| `--python-bin PATH` | `PYTHON_BIN` | `python3` | Python interpreter for `dry-run` and `--execution local --client python` (`grpcio>=1.85.1`, `protobuf>=7.35`). |
 | `--python-image IMAGE` | `PYTHON_LOADER_IMAGE` | built via `KO_DOCKER_REPO` | Prebuilt container image for in-cluster `--client python` `Job`s. |
 | `--control-addr ADDR` | `CONTROL_ADDR` | unset | Substrate `ateapi` gRPC `host:port` (required for `--client go-direct`). |
 | `--router-addr ADDR` | `ROUTER_ADDR` | unset | Substrate `atenet-router` `host:port` override for `--client go-direct`. |

@@ -70,21 +70,18 @@ Always execute all five phases so no telemetry section (`restores`, `cache`, `re
 ```
 
 ### Phase 3: Sample Live Cluster & Substrate Telemetry During Active Steps
-**Critical**: You must run `bench measure -k8s -ate-endpoint ...` *while sandboxes are actively running* (not just after the job finishes), otherwise `active_sandboxes` and live pod CPU/memory WSS will read `0`:
+**Critical**: You must run `bench measure -k8s` *while sandboxes are actively running* (not just after the job finishes), otherwise `active_sandboxes` and live pod CPU/memory WSS will read `0`:
 ```bash
-kubectl -n ate-env port-forward deploy/ate-env-api 18443:8443 &
-PF_PID=$!
-
 # Run periodically (e.g. every 5-10 minutes) while the RL job is in flight:
 go run ./cmd/benchmarking/bench measure \
   -k8s \
-  -ate-endpoint 127.0.0.1:18443 \
   -atespace ate-env \
   -run-id "<run-id>" \
   -dest "$ARTIFACT_DIR"
 cp "$ARTIFACT_DIR/measurements.json" \
    "$ARTIFACT_DIR/measurements_snapshots/meas_$(date -u +%Y%m%dT%H%M%SZ).json"
 ```
+Without `-ate-endpoint`, `active_sandboxes` is the count of worker pods and `parked_sandboxes` is `0`. Do not pass `-ate-endpoint`: Substrate's `ateapi` (`svc/api` port `443` in `ate-system`) requires a client certificate or a bearer token on each call, and `bench measure` and `bench reap` send no credential. `bench measure` then ignores the `Unauthenticated` reply and writes the same pod-count values, and `bench reap` fails (Phase 4).
 
 ### Phase 4: Harvest Logs/Traces, Reap Orphans, & Capture Post-Run Counters
 Once the head pod logs `=== DONE rc=0 ===`:
@@ -94,12 +91,8 @@ kubectl -n default cp "$HEAD_POD:/workspace/results/train.log" "$ARTIFACT_DIR/ve
 kubectl -n default cp "$HEAD_POD:/workspace/results/traces" "$ARTIFACT_DIR/traces"
 kubectl -n default exec "$HEAD_POD" -- touch /tmp/harvested
 
-# Post-run orphan check (writes $ARTIFACT_DIR/events/reap.jsonl)
-go run ./cmd/benchmarking/bench reap \
-  -ate-endpoint 127.0.0.1:18443 \
-  -atespace ate-env \
-  -prefix "<env-prefix>" \
-  -dest "$ARTIFACT_DIR"
+# Post-run orphan check: list the actors that remain in the atespace (expect none with the run's prefix)
+kubectl ate get actor -a ate-env
 
 # Post-run node image-cache snapshot, restore sub-phases, & WorkerPool spin-down (N -> 0)
 go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_after.prom"
@@ -108,8 +101,8 @@ go run ./cmd/benchmarking/bench spindown \
   -namespace ate-env \
   -workerpool default-template-workerpool \
   -dest "$ARTIFACT_DIR"
-kill "$PF_PID" 2>/dev/null || true
 ```
+`bench reap -ate-endpoint <ateapi host:port> -atespace ate-env -prefix "<env-prefix>" -dest "$ARTIFACT_DIR"` deletes the environments that remain and writes `$ARTIFACT_DIR/events/reap.jsonl`, the source of `reap_seen: true` in `report.json`. It sends no credential, thus it exits `1` with `Unauthenticated` and writes a `reap` event with `ok: false` (`reap_failed` in `report.json`).
 `bench spindown` scales `workerpool/default-template-workerpool` to `0`, waits until all `ateworker` pods terminate, and records `workerpool_spindown_wall_ms`, `worker_pod_terminate_ms`, and `workerpool_drained_pods` into `$ARTIFACT_DIR/measurements.json` and `$ARTIFACT_DIR/events/substrate_lifecycle.jsonl`.
 
 ### Phase 5: Build & Validate the Report and Bundle
@@ -164,6 +157,11 @@ Whenever a cluster RL run uses a non-baseline lifecycle policy (`lifecycle_polic
 ---
 
 ## 4. End-to-End Execution Protocol (Synthetic / Scenario Run)
+
+`bench run -scenario` executes in process against an in-memory stub without creating sandboxes or
+calling a cluster. For live simulated cluster runs with real task images, use
+[`./swebench/SKILL.md`](./swebench/SKILL.md) or
+[`./swebench/r2e-swebench/SKILL.md`](./swebench/r2e-swebench/SKILL.md).
 
 For synthetic scale-ladder runs driven by `scenario.yaml`:
 ```bash

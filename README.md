@@ -180,20 +180,26 @@ supported means for each path.
 ## Get started
 
 You need a cluster with Agent Substrate at or after
-[`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c), a snapshots bucket,
-`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. The
-latest release is
+[`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c) (with
+`spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in `--ingress-allowed-spiffe-ids`), a snapshots
+bucket, `kubectl` with `kubectl-ate`, Go (`1.27` or later), [ko](https://ko.build), and Python
+`3.10` or later for the SDK. The latest
+release is
 [`v0.1.0`](https://github.com/ai-on-gke/sandboxenv-rl/releases/tag/v0.1.0) (2026-11-07);
 [docs/release.md](./docs/release.md) lists what a release publishes. `main` has changed after it,
 thus the steps below build the CLI and images from source:
 
 ```bash
 git clone https://github.com/ai-on-gke/sandboxenv-rl && cd sandboxenv-rl
+go install github.com/google/ko@latest
 go install ./cmd/ate-env
 make images ATE_ENV_IMAGE_REPO=<registry>   # prints --guest-image and --api-image
 ```
 
-Deploy, and register a template ([deployment guide](#deployment-guide) explains each step):
+Deploy, and register a template ([deployment guide](#deployment-guide) explains each step, including
+publishing `<ateworker-gvisor-image>` with `go run ./cmd/ate-setup publish worker-images` in the
+Substrate checkout and merging `ate-env manifest access-policy --global` for `ListPlacementDomains`
+and `WarmImage`):
 
 ```bash
 kubectl ate create atespace ate-env
@@ -213,8 +219,9 @@ ate-env dev1 shell 'echo hello from $(hostname)'
 ate-env delete dev1
 ```
 
-Drive environments from Python with the fleet SDK (`pip install ./clients/python`). Leaving the
-`with` block deletes everything the fleet created:
+Drive environments from Python with the fleet SDK (`pip install ./clients/python`, or
+`SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 pip install ./clients/python` in a shallow clone without git
+tags). Leaving the `with` block deletes everything the fleet created:
 
 ```python
 import os

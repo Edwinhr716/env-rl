@@ -152,13 +152,11 @@ go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_
 # 2. Launch the RL recipe (with ATE_ENV_TRACE_DIR=/workspace/results/traces enabled in the Job)
 (cd examples/Qwen3-1.7B-verl && ./deploy.sh up)
 
-# 3. Sample live K8s + Substrate state while training steps are active
-kubectl -n ate-env port-forward deploy/ate-env-api 18443:8443 &
-go run ./cmd/benchmarking/bench measure -k8s -ate-endpoint 127.0.0.1:18443 \
-  -atespace ate-env -dest "$ARTIFACT_DIR"
+# 3. Sample live K8s state while training steps are active
+go run ./cmd/benchmarking/bench measure -k8s -atespace ate-env -dest "$ARTIFACT_DIR"
 
-# 4. After training completes, copy train.log + traces/*.jsonl into $ARTIFACT_DIR, then reap, sample post-cache, & spin down WorkerPool (N -> 0)
-go run ./cmd/benchmarking/bench reap -ate-endpoint 127.0.0.1:18443 -atespace ate-env -prefix verl- -dest "$ARTIFACT_DIR"
+# 4. After training completes, copy train.log + traces/*.jsonl into $ARTIFACT_DIR, then list leftover actors, sample post-cache, & spin down WorkerPool (N -> 0)
+kubectl ate get actor -a ate-env
 go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_after.prom"
 benchmarking/swebench/harvest-restore-timings.sh <run-id> "$ARTIFACT_DIR/restore_timings.jsonl"
 go run ./cmd/benchmarking/bench spindown -namespace ate-env -workerpool default-template-workerpool -dest "$ARTIFACT_DIR"
@@ -167,6 +165,14 @@ go run ./cmd/benchmarking/bench spindown -namespace ate-env -workerpool default-
 go run ./cmd/benchmarking/bench report -dest "$ARTIFACT_DIR"
 go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
 ```
+
+`bench measure -ate-endpoint` and `bench reap -ate-endpoint` read Substrate's `ateapi` (`svc/api` port
+`443` in `ate-system`) and send no credential. `ateapi` requires a client certificate or a bearer
+token on each call and rejects them. `bench measure` ignores the
+`Unauthenticated` reply and writes the values it writes without the flag: `active_sandboxes` is the
+count of worker pods and `parked_sandboxes` is `0`. `bench reap` exits `1` and writes a `reap` event
+with `ok: false` to `events/reap.jsonl`. Thus the steps above do not pass `-ate-endpoint`, and step 4
+lists the leftover actors with `kubectl ate`.
 
 ### 3. Archiving Results & Further Guides
 

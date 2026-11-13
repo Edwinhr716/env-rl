@@ -67,6 +67,10 @@ is one command.
 
 ## 2. Run
 
+Install `ko` and `crane`, configure a regional image mirror source, and generate the digest-pinned
+manifest outside the git checkout first (see
+[`./README.md#prepare-once-per-project`](./README.md#prepare-once-per-project)).
+
 From the directory where results should land, never from inside the repository (the events
 file must not dirty the tree ko builds from). The scripts are addressed through the checkout,
 and `run-in-cluster.sh` builds the loader image with ko, so the `report` binary is built
