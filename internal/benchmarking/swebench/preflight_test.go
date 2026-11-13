@@ -792,7 +792,13 @@ func TestPreflightCancellationSkipsUnstartedProbes(t *testing.T) {
 	// what the stream showed, with no empty node.
 	inner, innerCancel := context.WithCancel(context.Background())
 	api.mu.Lock()
-	api.onCreate = func(string) { innerCancel() }
+	api.onCreate = func(srvCtx context.Context, _ string) {
+		innerCancel()
+		select {
+		case <-srvCtx.Done():
+		case <-time.After(5 * time.Second):
+		}
+	}
 	api.mu.Unlock()
 	ic := w.coverImage(inner, 0, 0, plan.Domains[0], pfImgA)
 	for _, n := range ic.Nodes {
@@ -821,7 +827,13 @@ func TestPreflightCancellationSkipsUnstartedProbes(t *testing.T) {
 	// Cancel mid-round during Run via CreateEnvironment callback.
 	ctx, cancel := context.WithCancel(context.Background())
 	api.mu.Lock()
-	api.onCreate = func(string) { cancel() }
+	api.onCreate = func(srvCtx context.Context, _ string) {
+		cancel()
+		select {
+		case <-srvCtx.Done():
+		case <-time.After(5 * time.Second):
+		}
+	}
 	api.mu.Unlock()
 	report, runErr := w.Run(ctx)
 	if !errors.Is(runErr, context.Canceled) {

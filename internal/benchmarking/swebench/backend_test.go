@@ -130,7 +130,9 @@ type fakeAPI struct {
 	images map[string]string
 	// inflight and maxInflight count the environments alive per domain.
 	inflight, maxInflight map[string]int
-	onCreate              func(id string)
+	// onCreate, when set, runs after a create is recorded and f.mu is
+	// released; it receives the server RPC context and environment ID.
+	onCreate func(ctx context.Context, id string)
 
 	// WarmImage: warmHold keeps a round's probes alive that long before the
 	// fake deletes them (so concurrent calls overlap); warmUnavailableFirst
@@ -334,40 +336,51 @@ func (f *fakeAPI) GetServerInfo(context.Context, *ateenvv1alpha.GetServerInfoReq
 	return &ateenvv1alpha.GetServerInfoResponse{Server: "sandboxenv-rl", Version: "test", Features: f.features}, nil
 }
 
-func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.createFailAfter > 0 && len(f.created) >= f.createFailAfter {
-		if f.createFailCode != codes.OK && f.createFailCode != codes.ResourceExhausted {
-			return nil, status.Error(f.createFailCode, "the control plane cut the create off")
+func (f *fakeAPI) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
+	resp, cb, err := func() (*ateenvv1alpha.CreateEnvironmentResponse, func(context.Context, string), error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.createFailAfter > 0 && len(f.created) >= f.createFailAfter {
+			if f.createFailCode != codes.OK && f.createFailCode != codes.ResourceExhausted {
+				return nil, nil, status.Error(f.createFailCode, "the control plane cut the create off")
+			}
+			return nil, nil, status.Error(codes.ResourceExhausted, "no worker has room for the actor")
 		}
-		return nil, status.Error(codes.ResourceExhausted, "no worker has room for the actor")
-	}
-	if f.existing[req.GetId()] {
-		return nil, status.Errorf(codes.AlreadyExists, "environment %q already exists", req.GetId())
-	}
-	f.created = append(f.created, req.GetId())
-	f.selectors[req.GetId()] = req.GetWorkerSelector()
-	f.images[req.GetId()] = req.GetRootfsImage()
-	domain := req.GetWorkerSelector()["ate-env/domain"]
-	node := "node-any"
-	if list := f.domainNodes[domain]; len(list) > 0 {
-		idx := 0
-		if !f.sameNode {
-			key := domain + "\x00" + req.GetRootfsImage()
-			idx = f.domainCounter[key] % len(list)
-			f.domainCounter[key]++
+		if f.existing[req.GetId()] {
+			return nil, nil, status.Errorf(codes.AlreadyExists, "environment %q already exists", req.GetId())
 		}
-		node = list[idx]
+		f.created = append(f.created, req.GetId())
+		f.selectors[req.GetId()] = req.GetWorkerSelector()
+		f.images[req.GetId()] = req.GetRootfsImage()
+		domain := req.GetWorkerSelector()["ate-env/domain"]
+		node := "node-any"
+		if list := f.domainNodes[domain]; len(list) > 0 {
+			idx := 0
+			if !f.sameNode {
+				key := domain + "\x00" + req.GetRootfsImage()
+				idx = f.domainCounter[key] % len(list)
+				f.domainCounter[key]++
+			}
+			node = list[idx]
+		}
+		f.nodes[req.GetId()] = node
+		f.inflight[domain]++
+		f.maxInflight[domain] = max(f.maxInflight[domain], f.inflight[domain])
+		return &ateenvv1alpha.CreateEnvironmentResponse{
+			Environment: &ateenvv1alpha.Environment{
+				Id:             req.GetId(),
+				Atespace:       req.GetAtespace(),
+				WorkerSelector: req.GetWorkerSelector(),
+			},
+		}, f.onCreate, nil
+	}()
+	if err != nil {
+		return nil, err
 	}
-	f.nodes[req.GetId()] = node
-	f.inflight[domain]++
-	f.maxInflight[domain] = max(f.maxInflight[domain], f.inflight[domain])
-	cb := f.onCreate
 	if cb != nil {
-		cb(req.GetId())
+		cb(ctx, req.GetId())
 	}
-	return &ateenvv1alpha.CreateEnvironmentResponse{Environment: &ateenvv1alpha.Environment{Id: req.GetId(), Atespace: req.GetAtespace(), WorkerSelector: req.GetWorkerSelector()}}, nil
+	return resp, nil
 }
 
 func (f *fakeAPI) GetEnvironment(_ context.Context, req *ateenvv1alpha.GetEnvironmentRequest) (*ateenvv1alpha.GetEnvironmentResponse, error) {
