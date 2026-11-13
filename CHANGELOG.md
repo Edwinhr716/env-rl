@@ -579,6 +579,23 @@ user needs to know across them.
   When a pass fails and the teardown fails too, `run` raises the error of the
   pass (a `PreflightError`, a `KeyboardInterrupt`) and logs the teardown
   error; a teardown error after clean passes still raises.
+- Go and Python clients: the executable attribute (`ate_env.command.executable`)
+  splits shell operators (`;`, `&`, `|`, `&&`, `||`, redirections) and skips
+  comments, so an assignment after an operator or in a comment is never
+  recorded. It holds the first command of a compound line (`cmd1 && A=s cmd2`
+  gives `cmd1`) and records nothing when an assignment's value or a redirection
+  target holds `$` or a backtick (`A="$(echo my secret)" cmd`,
+  `<<<"$(echo my secret)" cmd`) or when a redirection has no target or is
+  followed by an operator (`2>&1<<<x cmd`). A quoted or escaped character is
+  never shell syntax (`"A=b" x` is not an assignment, `2''>out` has no fd
+  number, `'(' x` gives `(`), a carriage return is part of a word as in bash,
+  and a name longer than 255 bytes records nothing. An arithmetic command
+  (`((x+1))`), or a command word that holds `{` or `[` (a brace expansion
+  such as `{mysql,-pSEKRET}`, an array subscript), records nothing. Two
+  cases that recorded a name now record nothing: an argv list whose first
+  item is an assignment (`["API_KEY=s3cr3t", "python3", "x.py"]` gave
+  `python3`), and a first word that holds `=`, `$` or a backtick (`./a=b`
+  gave `a=b`).
 - `preflight-coverage.json` (schema v1) gains two optional fields per image,
   `undeleted_probes` and `waited_ms`, the ones `WarmImage`'s coverage already
   carries. `swebench-loader preflight` and `ate_env_rl.PreflightWarmer` list

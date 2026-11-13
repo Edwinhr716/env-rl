@@ -884,10 +884,17 @@ ate_env_fleet.run
 - **Spans.** `Client`, `SandboxHandle` and the Substrate backend emit
   `ate_env_client.<op>` spans, for example `create_environment`, `acquire`,
   `exec`, `write_file`, `read_file` and `release`. Their attributes (below)
-  hold ids, the executable name (leading `NAME=value` assignments are
-  skipped) and sizes. They never hold command arguments, file content or
-  image tags. A command that fails with `check=True` marks its `exec` span
-  as an error.
+  hold ids, the executable name and sizes. The executable name is the first
+  command word of the command line's first simple command, after leading
+  `NAME=value` assignments and redirections (`cmd1 && cmd2` records `cmd1`);
+  nothing is recorded when an assignment's value or a redirection target holds
+  `$` or a backtick, when a redirection has no target or is followed by an
+  operator, for an arithmetic command, when the command word holds `{` or `[`
+  (a brace expansion can expand into arguments), when the name is longer than
+  255 bytes, or for an argv list whose first item is an assignment. Quoted
+  characters are never shell syntax. They
+  never hold command arguments, file content or image tags. A command that
+  fails with `check=True` marks its `exec` span as an error.
 - **Propagation.** Every gRPC call on a channel the client creates carries
   the W3C `traceparent` / `tracestate` (never baggage), so `ate-env-api`
   can continue the trace. A caller-owned `Client(channel=...)` gets spans

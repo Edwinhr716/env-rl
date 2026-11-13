@@ -42,10 +42,9 @@ import contextlib
 import logging
 import os
 import re
-import shlex
 import threading
 from collections.abc import Iterator, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import grpc
 import grpc.aio
@@ -395,24 +394,265 @@ def image_ref_attr(ref: str | None) -> str | None:
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 
 
+# "((" starts an arithmetic command, as in bash's lexer; "( (" is two subshells.
+_OPS = frozenset(["\n", "(", "((", ")", ";", ";;", "&", "&&", "|", "||",
+       "<", ">", ">>", "<<", "<<<", ">&", "<&", "&>", "&>>", "<>", ">|", "<<-"])
+_REDIR_BASES = frozenset(["<", ">", ">>", "<<", "<<<", ">&", "<&", "<>", ">|", "<<-"])
+
+
+def _is_ascii_digit(c: str) -> bool:
+    # An fd number is ASCII digits, as in the Go client; str.isdigit also
+    # takes "²" or "٣".
+    return "0" <= c <= "9"
+
+
+def _strip_ascii_digits(op: str) -> str:
+    for i, c in enumerate(op):
+        if not _is_ascii_digit(c):
+            return op[i:]
+    return ""
+
+
+def _is_op_prefix(op: str) -> bool:
+    base = _strip_ascii_digits(op)
+    if len(base) < len(op):
+        if not base:
+            return True
+        return any(r.startswith(base) for r in _REDIR_BASES)
+    return any(o.startswith(base) for o in _OPS)
+
+
+def _is_redirection_op(op: str) -> bool:
+    base = _strip_ascii_digits(op)
+    return base in _REDIR_BASES or op in ("&>", "&>>")
+
+
+# The longest executable name recorded, in UTF-8 bytes: a file name longer
+# than NAME_MAX (255 on Linux) cannot be a command, and the cap bounds the
+# attribute. The Go client's maxExecutableLen is the same.
+_MAX_EXECUTABLE_LEN = 255
+
+
+class _Token(NamedTuple):
+    """A word or an operator from _tokenize_sh.
+
+    ``quoted`` is the offset in ``text`` of the first character that was quoted
+    or escaped, or -1. A quoted character is never syntax: ``'('`` is a word,
+    ``"A=b"`` is not an assignment and ``2''>out`` does not make ``2`` an fd
+    number. The Go client's shellToken is the same.
+    """
+
+    text: str
+    op: bool
+    quoted: int
+
+
+def _tokenize_sh(s: str) -> list[_Token] | None:
+    tokens: list[_Token] = []
+    cur: list[str] = []
+    cur_len = 0
+    in_word = False
+    quoted = -1
+
+    def flush() -> None:
+        nonlocal cur_len, in_word, quoted
+        if in_word:
+            tokens.append(_Token("".join(cur), False, quoted))
+            cur.clear()
+            cur_len = 0
+            in_word = False
+            quoted = -1
+
+    def mark_quoted() -> None:
+        nonlocal in_word, quoted
+        in_word = True
+        if quoted < 0:
+            quoted = cur_len
+
+    def add(text: str) -> None:
+        nonlocal cur_len
+        cur.append(text)
+        cur_len += len(text)
+
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            if i + 1 >= n:
+                return None
+            if s[i + 1] == "\n":
+                i += 2
+                continue
+            mark_quoted()
+            add(s[i + 1])
+            i += 2
+        elif c == "'":
+            end = s.find("'", i + 1)
+            if end < 0:
+                return None
+            mark_quoted()
+            add(s[i + 1:end])
+            i = end + 1
+        elif c == '"':
+            mark_quoted()
+            i += 1
+            closed = False
+            while i < n:
+                if s[i] == '"':
+                    closed = True
+                    i += 1
+                    break
+                if s[i] == "\\" and i + 1 < n and s[i + 1] in ('"', "\\", "$", "\n", "`"):
+                    if s[i + 1] != "\n":
+                        add(s[i + 1])
+                    i += 2
+                else:
+                    add(s[i])
+                    i += 1
+            if not closed:
+                return None
+        elif c in " \t":
+            # A carriage return is part of a word, as in bash.
+            flush()
+            i += 1
+        elif c in "\n();&|<>":
+            cur_s = "".join(cur)
+            if c in "<>" and in_word and quoted < 0 and cur_s and not _strip_ascii_digits(cur_s):
+                op_str = cur_s + c
+                cur.clear()
+                cur_len = 0
+                in_word = False
+            else:
+                flush()
+                op_str = c
+
+            # Bash removes a backslash-newline pair before it reads an operator,
+            # so "<<", a line continuation and "-" are "<<-".
+            while True:
+                j = i + 1
+                while j + 1 < n and s[j] == "\\" and s[j + 1] == "\n":
+                    j += 2
+                if j >= n or not _is_op_prefix(op_str + s[j]):
+                    break
+                op_str += s[j]
+                i = j
+            tokens.append(_Token(op_str, True, -1))
+            if _strip_ascii_digits(op_str) in ("<&", ">&"):
+                j = i + 1
+                while j + 1 < n and s[j] == "\\" and s[j + 1] == "\n":
+                    j += 2
+                if j < n and s[j] == "-":
+                    tokens.append(_Token("-", False, -1))
+                    i = j
+            i += 1
+        elif c == "#" and not in_word:
+            end = s.find("\n", i)
+            if end < 0:
+                break
+            i = end
+        else:
+            in_word = True
+            add(c)
+            i += 1
+    flush()
+    return tokens
+
+
+def _command_name(w: str) -> str | None:
+    # The base name of the command word w, or None when w holds "=", "$" or a
+    # backtick or the name is longer than _MAX_EXECUTABLE_LEN.
+    if "=" in w or "$" in w or "`" in w:
+        return None
+    name = w.rsplit("/", 1)[-1]
+    if len(name.encode("utf-8", "surrogatepass")) > _MAX_EXECUTABLE_LEN:
+        return None
+    return name or None
+
+
 def executable_attr(command: str | list[str] | tuple[str, ...]) -> str | None:
     """The executable name of a command (never its arguments), for span attributes.
 
-    Leading ``NAME=value`` words are skipped so environment assignments such as
-    ``API_KEY=s3cr3t python x.py`` never reach the trace backend. A string
-    command that cannot be split like a shell would split it yields None.
+    A string is split like a POSIX shell splits it (quotes, backslashes,
+    comments, operators), and the result is the base name of the first
+    command word of its first simple command. Before that word, leading
+    ``NAME=value`` and ``NAME+=value`` assignments whose name and ``=`` are
+    unquoted (``API_KEY=s3cr3t python x.py`` gives ``python``), redirections
+    with their targets, and unquoted opening ``(``, ``{`` and newlines are
+    skipped; a quoted character is never syntax (``'(' x`` gives ``(``). A
+    control operator or an arithmetic command (``((x+1))``) before the command
+    word (``; A=s cmd``) gives None, and ``cmd1 && A=s cmd2`` gives ``cmd1``.
+    None also when an assignment's value or a redirection target holds ``$``
+    or a backtick (an expansion such as ``"$(echo my secret)"`` can span
+    words), when a redirection has no target or its target is an operator
+    (``2>&1<<<x``, ``A=>(x) cmd``), when the target of ``<&`` or ``>&`` starts
+    with a quoted ``-`` (``2>&'-'cmd``), when the command word holds ``=``,
+    ``$`` or a backtick, when the command word is longer than one character and
+    holds ``{`` or ``[`` (a brace expansion such as ``{mysql,-pSEKRET}``
+    expands into arguments, and ``A[1 + 2]=x cmd`` is an array assignment),
+    when the name is longer than 255 UTF-8 bytes, or when the line cannot be
+    split. A reserved word that starts the line is recorded as the command
+    word: ``! cmd x`` gives ``!``, ``time cmd x`` gives ``time`` and
+    ``if cmd; then x; fi`` gives ``if`` (``[[ -f x ]]`` gives None because
+    ``[[`` holds ``[``). An argv list is not parsed: its first item is the command word, so a leading assignment
+    item gives None. The Go client's ``executable`` and ``executableWords``
+    give the same answers (proto/testdata/client-parity/executable.json).
     """
     if isinstance(command, (list, tuple)):
-        words = [str(w) for w in command]
-    else:
-        try:
-            words = shlex.split(command)
-        except ValueError:
+        if not command:
             return None
-    for word in words:
-        if _ENV_ASSIGNMENT.match(word):
+        return _command_name(str(command[0]))
+
+    tokens = _tokenize_sh(command)
+    if tokens is None:
+        return None
+
+    i = 0
+    in_command = False
+    while i < len(tokens):
+        w, is_op, quoted = tokens[i]
+        if is_op:
+            if w in ("\n", "("):
+                if in_command:
+                    return None
+                i += 1
+                continue
+            if _is_redirection_op(w):
+                if i + 1 >= len(tokens):
+                    return None
+                target = tokens[i + 1]
+                if target.op or "$" in target.text or "`" in target.text:
+                    return None
+                # _tokenize_sh splits an unquoted "-" off after "<&" and ">&",
+                # so a longer target starting with "-" had it quoted
+                # ("2>&'-'cmd"): bash rejects the redirection and runs nothing.
+                if (_strip_ascii_digits(w) in ("<&", ">&") and len(target.text) > 1
+                        and target.text.startswith("-")):
+                    return None
+                in_command = True
+                i += 2
+                continue
+            # ";", "&", "|", "&&", "||", ";;", ")"
+            return None
+        if w == "{" and quoted < 0:
+            if in_command:
+                return None
+            i += 1
             continue
-        return word.rsplit("/", 1)[-1] or None
+        m = _ENV_ASSIGNMENT.match(w)
+        if m and (quoted < 0 or quoted >= m.end()):
+            # An expansion in the value can span words, so the next word may
+            # be the value's rest, not the command.
+            if "$" in w or "`" in w:
+                return None
+            in_command = True
+            i += 1
+            continue
+        # A brace expansion expands into the command and its arguments, and a
+        # "[" in a longer word may be an array subscript with spaces.
+        if len(w) > 1 and ("{" in w or "[" in w):
+            return None
+        return _command_name(w)
     return None
 
 

@@ -36,7 +36,7 @@ Conventions:
 | AC-15 | Warm-pool accounting under concurrent acquire, recycle, `warm_pool` and teardown    | #221, #238, #239, #240, #242, #276 | pass: 15.1 to 15.10 (`test_warm_pool_accounting.py`, `verify/*.dfy`)                                                                                  |
 | AC-16 | The span and attribute inventory in `interfaces.md` matches the code, checked in CI | follow-up                          | not met: the table is hand-written; last checked against `c0c41ac`                                                                                    |
 | AC-17 | The Go and Python clients emit the same span names and keys for shared operations   | 7                                  | pass: 17.1 to 17.4 on shared vectors (#329, #362) with documented differences                                                                         |
-| AC-18 | No command line, secret or file content in any span attribute value                 | follow-up                          | partial: example tests in both clients; no property test                                                                                              |
+| AC-18 | No command line, secret or file content in any span attribute value                 | follow-up                          | pass: example tests and property tests in both clients (#368)                                                                                         |
 | AC-19 | Several fleets in one process share the warm-replica gauge                          | 2                                  | pass: `test_warm_gauge_adds_up_across_observers_and_resets_only_own_share`                                                                            |
 | AC-20 | CI verifies the Dafny models with the documented counts                             | follow-up                          | pass: `Dafny models` job, `hack/verify/dafny.py`                                                                                                      |
 
@@ -451,9 +451,19 @@ Conventions:
   or absent, never an argument or an assignment value, in both clients.
 - 18.2: no span attribute value contains file content, an auth token, or an image tag
   (`image_ref_attr` keeps the repository and digest and drops the tag).
-- Status: partial. Example tests: `test_executable_attr_skips_env_assignments`,
-  `TestExecutableNeverRecordsAssignments`, the `executable.json` vector. No property test; the
-  `NAME+=value` case was found in review of #150.
+- Status: pass. Example tests: `test_executable_attr_skips_env_assignments` and the
+  `executable.json` vector. Property tests in both clients (`TestExecutableNeverRecordsAssignments`,
+  `test_executable_never_records_assignments_prop`) draw assignment values, redirection prefixes,
+  and command arguments with spaces inside `$(...)`, `${...}`, backticks and `$'...'`, unspaced
+  chained digit or close-fd redirections (`2>&1<<<...`, `2>&-cmd ...`, `<&-cmd ...`), a
+  here-document operator split by a line continuation (`<<\<newline>- ...`), arithmetic commands
+  (`((...))`), brace expansions (`{cmd,-p...}`, `cmd{,-p...}`) and array subscripts with spaces
+  (`A[... +1]=x`) (#368); an assignment or redirection target whose value holds `$` or a backtick,
+  or a redirection with no target or an operator target, records nothing. Quoted or escaped
+  characters are never syntax (`"A=b" x`, `2''>out x`, `'(' x`), a carriage return is part of a
+  word, and a name longer than 255 bytes records nothing. An arithmetic command, or a command word
+  longer than one character that holds `{` or `[`, records nothing. A reserved word that starts the
+  line (`!`, `time`, `if`) is recorded as the executable; it is not an argument (`executable.json`).
 - Properties: P-21.
 
 ## AC-19: Several fleets share the warm-replica gauge

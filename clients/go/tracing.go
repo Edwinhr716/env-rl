@@ -305,91 +305,329 @@ func endSpan(span trace.Span, err error) {
 // pattern as the Python client's _ENV_ASSIGNMENT.
 var envAssignment = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*\+?=`)
 
+// ops are the shell control and redirection operators the tokenizer splits
+// out of a word, longest match first; redirBases are the redirection ones,
+// which may follow an fd number ("2>", "3>&"). "((" starts an arithmetic
+// command, as in bash's lexer; "( (" is two subshells.
+var (
+	ops = []string{"\n", "(", "((", ")", ";", ";;", "&", "&&", "|", "||",
+		"<", ">", ">>", "<<", "<<<", ">&", "<&", "&>", "&>>", "<>", ">|", "<<-"}
+	redirBases = []string{"<", ">", ">>", "<<", "<<<", ">&", "<&", "<>", ">|", "<<-"}
+)
+
+// stripASCIIDigits removes a leading ASCII fd number ("2>&" -> ">&").
+func stripASCIIDigits(op string) string {
+	i := 0
+	for i < len(op) && op[i] >= '0' && op[i] <= '9' {
+		i++
+	}
+	return op[i:]
+}
+
+// isOpPrefix reports whether op starts an operator; shellWords uses it to find the longest operator.
+func isOpPrefix(op string) bool {
+	base := stripASCIIDigits(op)
+	if len(base) < len(op) {
+		if len(base) == 0 {
+			return true
+		}
+		for _, r := range redirBases {
+			if strings.HasPrefix(r, base) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, o := range ops {
+		if strings.HasPrefix(o, base) {
+			return true
+		}
+	}
+	return false
+}
+
+// isRedirectionOp reports whether op is a shell redirection operator, with an optional ASCII fd number.
+func isRedirectionOp(op string) bool {
+	base := stripASCIIDigits(op)
+	for _, r := range redirBases {
+		if r == base {
+			return true
+		}
+	}
+	return op == "&>" || op == "&>>"
+}
+
+// maxExecutableLen is the longest executable name recorded, in bytes: a file
+// name longer than NAME_MAX (255 on Linux) cannot be a command, and the cap
+// bounds the attribute.
+const maxExecutableLen = 255
+
+// shellToken is a word or an operator from shellWords. quoted is the byte
+// offset in text of the first character that was quoted or escaped, or -1. A
+// quoted character is never syntax: "'('" is a word, "\"A=b\"" is not an
+// assignment and a quoted "2" before ">" is not an fd number.
+type shellToken struct {
+	text   string
+	op     bool
+	quoted int
+}
+
 // executable returns the executable name of a shell command line, as the
-// Python client's executable_attr does: the base name of its first word
-// after any leading NAME=value assignments, which can carry secrets. The
-// line is split like a POSIX shell splits it (quotes and backslashes), so
-// "'my prog' arg" gives "my prog". A line that cannot be split (an
-// unterminated quote, a trailing backslash) gives "", which records no
-// attribute. The rest of the line is never recorded.
+// Python client's executable_attr does: the base name of the first command
+// word of the line's first simple command, never an argument. The line is
+// split like a POSIX shell splits it (quotes, backslashes, comments), so
+// "'my prog' arg" gives "my prog" and "cmd # A=s" gives "cmd". Before the
+// command word it skips:
+//   - leading NAME=value and NAME+=value assignments whose name and "=" are
+//     unquoted, which can carry secrets;
+//   - redirections and their targets ("2>/dev/null", ">|f", "3>&-",
+//     "2>&-cmd", "<<<input"), with an optional unquoted ASCII fd number;
+//   - unquoted opening "(", "{" and newlines.
+//
+// Only the first simple command counts: a control operator (";", "&",
+// "|", "&&", "||", ";;", ")") or an arithmetic command ("((x+1))") before
+// the command word gives "", so
+// "cmd1 && A=s cmd2" gives "cmd1" and "; A=s cmd" gives "". It also gives
+// "" when an assignment's value or a redirection target holds "$" or a
+// backtick (an expansion such as "$(echo my secret)" can span words, and
+// its rest would read as the command), when a redirection has no target or
+// its target is an operator ("2>&1<<<x", "A=>(x) cmd"), when the target of
+// "<&" or ">&" starts with a quoted "-" ("2>&'-'cmd"), when the command word
+// holds "=", "$" or a backtick, when the command word is longer than one
+// character and holds "{" or "[" (a brace expansion such as
+// "{mysql,-pSEKRET}" or "mysql{,-pSEKRET}" expands into arguments, and
+// "A[1 + 2]=x cmd" is an array assignment), when the name is longer than
+// maxExecutableLen, and when the line cannot be split (an unterminated
+// quote, a trailing backslash). "" records no attribute. A reserved word
+// that starts the line is recorded as the command word: "! cmd x" gives
+// "!", "time cmd x" gives "time" and "if cmd; then x; fi" gives "if"
+// ("[[ -f x ]]" gives no attribute because "[[" holds "[").
 func executable(commandLine string) string {
-	words, ok := shellWords(commandLine)
+	tokens, ok := shellWords(commandLine)
 	if !ok {
 		return ""
 	}
-	return executableWords(words)
+	return executableWordsFromShell(tokens)
 }
 
-// executableWords returns the base name of the first word in words after any
-// leading NAME=value assignments, matching executable_attr on a sequence in
-// Python.
-func executableWords(words []string) string {
-	for _, w := range words {
-		if envAssignment.MatchString(w) {
+// executableWordsFromShell returns the executable name of the first simple command in tokens, or "".
+func executableWordsFromShell(tokens []shellToken) string {
+	inCommand := false
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		w := tok.text
+		if tok.op {
+			switch {
+			case w == "\n" || w == "(":
+				if inCommand {
+					return ""
+				}
+			case isRedirectionOp(w):
+				if i+1 >= len(tokens) {
+					return ""
+				}
+				target := tokens[i+1]
+				if target.op || strings.ContainsAny(target.text, "$`") {
+					return ""
+				}
+				// shellWords splits an unquoted "-" off after "<&" and
+				// ">&", so a longer target starting with "-" had it quoted
+				// ("2>&'-'cmd"): bash rejects the redirection and runs
+				// nothing.
+				if base := stripASCIIDigits(w); (base == "<&" || base == ">&") &&
+					len(target.text) > 1 && target.text[0] == '-' {
+					return ""
+				}
+				inCommand = true
+				i++ // skip target
+			default: // ";", "&", "|", "&&", "||", ";;", ")"
+				return ""
+			}
 			continue
 		}
-		return w[strings.LastIndex(w, "/")+1:]
+		if w == "{" && tok.quoted < 0 {
+			if inCommand {
+				return ""
+			}
+			continue
+		}
+		if loc := envAssignment.FindStringIndex(w); loc != nil && (tok.quoted < 0 || tok.quoted >= loc[1]) {
+			// An expansion in the value can span words, so the next
+			// word may be the value's rest, not the command.
+			if strings.ContainsAny(w, "$`") {
+				return ""
+			}
+			inCommand = true
+			continue
+		}
+		// A brace expansion expands into the command and its arguments, and
+		// a "[" in a longer word may be an array subscript with spaces.
+		if len(w) > 1 && strings.ContainsAny(w, "{[") {
+			return ""
+		}
+		return commandName(w)
 	}
 	return ""
 }
 
-// shellWords splits s into words like Python's shlex.split in POSIX mode:
-// blanks separate words; single quotes keep everything literal; inside
-// double quotes a backslash escapes only '"' and '\\'; outside quotes a
-// backslash escapes the next character. ok is false for an unterminated
-// quote or a trailing backslash.
-func shellWords(s string) (words []string, ok bool) {
+// commandName returns the base name of the command word w, or "" when w
+// holds "=", "$" or a backtick or the name is longer than maxExecutableLen.
+func commandName(w string) string {
+	if strings.ContainsAny(w, "=$`") {
+		return ""
+	}
+	name := w[strings.LastIndex(w, "/")+1:]
+	if len(name) > maxExecutableLen {
+		return ""
+	}
+	return name
+}
+
+// executableWords returns the base name of words[0], or "" when words is
+// empty, words[0] holds "=", "$" or a backtick (so a leading assignment
+// item records nothing) or the name is longer than maxExecutableLen,
+// matching executable_attr on a sequence in Python.
+func executableWords(words []string) string {
+	if len(words) == 0 {
+		return ""
+	}
+	return commandName(words[0])
+}
+
+// isASCIIDigits reports whether s is a non-empty run of ASCII digits.
+func isASCIIDigits(s string) bool {
+	return s != "" && stripASCIIDigits(s) == ""
+}
+
+// shellWords splits s into shell words and operator tokens, matching the
+// Python client's _tokenize_sh: spaces and tabs separate words (a carriage
+// return is part of a word, as in bash); unquoted control and redirection
+// operators (ops, with an optional leading unquoted ASCII fd number on
+// redirections, plus "-" as its own token after "<&" or ">&") become their
+// own tokens; '#' outside a word starts a comment to the next newline; single
+// quotes keep everything literal; inside double quotes a backslash escapes
+// '"', '\\', '$', '`' and '\n'; outside quotes a backslash escapes the next
+// character (joining lines on "\\\n"). Each word records where its first
+// quoted or escaped character is. ok is false for an unterminated quote or a
+// trailing backslash.
+func shellWords(s string) (tokens []shellToken, ok bool) {
 	var cur strings.Builder
 	inWord := false
+	quoted := -1
+	flush := func() {
+		if inWord {
+			tokens = append(tokens, shellToken{text: cur.String(), quoted: quoted})
+			cur.Reset()
+			inWord = false
+			quoted = -1
+		}
+	}
+	markQuoted := func() {
+		inWord = true
+		if quoted < 0 {
+			quoted = cur.Len()
+		}
+	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		switch {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
-			if inWord {
-				words = append(words, cur.String())
+		switch c {
+		case ' ', '\t':
+			flush()
+		case '\n', '(', ')', ';', '&', '|', '<', '>':
+			var opStr string
+			if (c == '<' || c == '>') && inWord && quoted < 0 && isASCIIDigits(cur.String()) {
+				opStr = cur.String() + string(c)
 				cur.Reset()
 				inWord = false
+			} else {
+				flush()
+				opStr = string(c)
 			}
-		case c == '\\':
+
+			// Bash removes a backslash-newline pair before it reads an operator,
+			// so "<<", a line continuation and "-" are "<<-".
+			for {
+				j := i + 1
+				for j+1 < len(s) && s[j] == '\\' && s[j+1] == '\n' {
+					j += 2
+				}
+				if j >= len(s) || !isOpPrefix(opStr+string(s[j])) {
+					break
+				}
+				opStr += string(s[j])
+				i = j
+			}
+			tokens = append(tokens, shellToken{text: opStr, op: true, quoted: -1})
+			if base := stripASCIIDigits(opStr); base == "<&" || base == ">&" {
+				j := i + 1
+				for j+1 < len(s) && s[j] == '\\' && s[j+1] == '\n' {
+					j += 2
+				}
+				if j < len(s) && s[j] == '-' {
+					tokens = append(tokens, shellToken{text: "-", quoted: -1})
+					i = j
+				}
+			}
+		case '\\':
 			if i+1 >= len(s) {
 				return nil, false
 			}
+			if s[i+1] == '\n' {
+				i++
+				continue
+			}
+			markQuoted()
+			cur.WriteByte(s[i+1])
 			i++
-			cur.WriteByte(s[i])
-			inWord = true
-		case c == '\'':
+		case '\'':
 			end := strings.IndexByte(s[i+1:], '\'')
 			if end < 0 {
 				return nil, false
 			}
+			markQuoted()
 			cur.WriteString(s[i+1 : i+1+end])
 			i += end + 1
-			inWord = true
-		case c == '"':
+		case '"':
+			markQuoted()
 			closed := false
 			for i++; i < len(s); i++ {
 				if s[i] == '"' {
 					closed = true
 					break
 				}
-				if s[i] == '\\' && i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\\') {
-					i++
+				if s[i] == '\\' && i+1 < len(s) {
+					next := s[i+1]
+					if next == '"' || next == '\\' || next == '$' || next == '\n' || next == '`' {
+						if next != '\n' {
+							cur.WriteByte(next)
+						}
+						i++
+						continue
+					}
 				}
 				cur.WriteByte(s[i])
 			}
 			if !closed {
 				return nil, false
 			}
-			inWord = true
+		case '#':
+			if !inWord {
+				end := strings.IndexByte(s[i:], '\n')
+				if end < 0 {
+					i = len(s)
+				} else {
+					i += end - 1
+				}
+			} else {
+				cur.WriteByte(c)
+			}
 		default:
-			cur.WriteByte(c)
 			inWord = true
+			cur.WriteByte(c)
 		}
 	}
-	if inWord {
-		words = append(words, cur.String())
-	}
-	return words, true
+	flush()
+	return tokens, true
 }
 
 // spanReader counts the bytes read through it and ends its span on EOF, on a

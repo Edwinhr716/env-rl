@@ -22,16 +22,17 @@ a minimal counter-example, which then becomes an `@example` regression.
 
 State on `main` with #221:
 
-| Item            | Requirement  | State                                                                                                                                                                                                         |
-| --------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P-9, P-10, P-11 | AC-15        | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.                     |
-| P-14            | AC-3.4       | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env_rl/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.      |
-| P-24            | AC-15.7      | Fixed by #239. Before it, a warm claim whose `get()` succeeded after an overlapping reap deleted the actor returned a deleted environment.                                                                    |
-| P-10            | AC-15.8      | Fixed by #240. Before it, a `warm_pool` call cancelled during its `create()` calls leaked the actors already created: they were neither pooled nor tracked.                                                   |
-| P-10            | AC-15.9      | Fixed by #238. Before it, a delete cancelled after the run's reap, or a `release` whose delete failed or was cancelled while a reap ran, left the actor under the reaped run id, so no later reap deleted it. |
-| P-10            | AC-15.2      | Fixed by #276. Before it, a cold `acquire` cancelled while its `create()` was in flight (by its own `timeout_s` or its caller) left an actor whose create landed alive and untracked, so no reap deleted it.  |
-| P-10            | AC-15.10     | Fixed by #242. Before it, an `acquire` whose cold create overlapped its own run's reap returned an environment owned under the reaped run id; unless the caller released it, no later reap deleted it.        |
-| P-21, P-22      | AC-17, AC-18 | Partial. Shared vectors in `proto/testdata/client-parity/` (#329, #362) replace the hand-copied tables and close AC-17; no property test yet for P-21 or P-22.                                                |
+| Item            | Requirement | State                                                                                                                                                                                                                                                                   |
+| --------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P-9, P-10, P-11 | AC-15       | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.                                                                               |
+| P-14            | AC-3.4      | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env_rl/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.                                                                |
+| P-24            | AC-15.7     | Fixed by #239. Before it, a warm claim whose `get()` succeeded after an overlapping reap deleted the actor returned a deleted environment.                                                                                                                              |
+| P-10            | AC-15.8     | Fixed by #240. Before it, a `warm_pool` call cancelled during its `create()` calls leaked the actors already created: they were neither pooled nor tracked.                                                                                                             |
+| P-10            | AC-15.9     | Fixed by #238. Before it, a delete cancelled after the run's reap, or a `release` whose delete failed or was cancelled while a reap ran, left the actor under the reaped run id, so no later reap deleted it.                                                           |
+| P-10            | AC-15.2     | Fixed by #276. Before it, a cold `acquire` cancelled while its `create()` was in flight (by its own `timeout_s` or its caller) left an actor whose create landed alive and untracked, so no reap deleted it.                                                            |
+| P-10            | AC-15.10    | Fixed by #242. Before it, an `acquire` whose cold create overlapped its own run's reap returned an environment owned under the reaped run id; unless the caller released it, no later reap deleted it.                                                                  |
+| P-21            | AC-18       | AC-18 closed by #368: `TestExecutableNeverRecordsAssignments` (Go `rapid`) and `test_executable_never_records_assignments_prop` (Python Hypothesis) cover 18.1 alongside `executable.json`, with example tests for 18.2; generative coverage for 18.2 remains proposed. |
+| P-22            | AC-17       | Partial (AC-17 closed by #329, #362). Shared vectors in `proto/testdata/client-parity/` replace the hand-copied tables; no property test yet for P-22.                                                                                                                  |
 
 ## Labels and cardinality (AC-9)
 
@@ -315,8 +316,11 @@ content or an image tag. `ate_env.command.executable` is the executable's base n
   `st.binary()` for content; `rapid` equivalents in Go.
 - Proposed test: Hypothesis `test_attribute_values_hold_no_secret`; Go `rapid`
   `TestAttributeValuesHoldNoSecret`.
-- Example coverage on `main`: `test_executable_attr_skips_env_assignments`,
-  `TestExecutableNeverRecordsAssignments`, `TestExecutableMatchesPythonClient`.
+- Coverage on `main`: `TestExecutableNeverRecordsAssignments` (Go `rapid`) and
+  `test_executable_never_records_assignments_prop` (Python Hypothesis) for command-line assignments,
+  redirections and arguments (#368); `test_executable_attr_skips_env_assignments`, `executable.json`
+  (`TestExecutableParity`, `test_executable_parity`), and example tests for file content and image
+  tags.
 
 ### P-22: The Go and Python clients agree
 

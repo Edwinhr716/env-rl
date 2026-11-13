@@ -30,6 +30,8 @@ from datetime import timedelta
 import grpc
 import grpc.aio
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from ate_env_rl import AsyncSandboxFleet, Client, FleetConfig, SandboxFleet, Task
 from ate_env_rl._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
@@ -391,14 +393,18 @@ def test_carrier_never_carries_baggage(spans):
         ("A=1 B=two /usr/bin/env python", "env"),
         ('TOKEN="a secret" ./run.sh --flag', "run.sh"),
         ("TOKEN='a b' X=y", None),
-        (["API_KEY=s3cr3t", "python3", "x.py"], "python3"),
+        (["API_KEY=s3cr3t", "python3", "x.py"], None),
         ('TOKEN="unterminated python', None),
         ("", None),
         ([], None),
-        ("./a=b", "a=b"),  # a path, not an assignment
+        ("./a=b", None),  # not an assignment, but a command word with "=" records nothing
         ("X+=s3cr3t cmd", "cmd"),  # bash appends with NAME+=value
         ("PATH+=:/opt/bin A=1 make", "make"),
-        ("./a+=b", "a+=b"),  # a path, not an assignment
+        ("./a+=b", None),  # likewise
+        ("A=>(s3cr3t x) cmd", None),  # redirection op followed by "(" records nothing
+        ("A=<(cat s3cr3t) cmd", None),
+        ("2>&1<<<s3cr3t", None),
+        ("2>&-2>&-cmd s3cr3t", "cmd"),
     ],
 )
 def test_executable_attr_skips_env_assignments(command, want):
@@ -1015,3 +1021,57 @@ async def test_shell_span_records_timed_out(spans, fake_stack):
     shells = [s for s in spans.get_finished_spans() if s.name == "ate_env_client.shell"]
     shells.sort(key=lambda s: s.start_time)
     assert [s.attributes["ate_env.timed_out"] for s in shells] == [c[2] for c in cases]
+
+
+# Values whose expansion holds a space, so the secret lands in a later word
+# than the assignment's own (TestExecutableNeverRecordsAssignments draws the
+# same shapes).
+_ASSIGNMENT_VALUES = ["{}", '"$(echo "my {}")"', "${{B:-my {}}}", "`echo {} x`", "$'a\\' {}'", '"my {}"']
+
+
+@settings(max_examples=300)
+@given(
+    prefix=st.sampled_from(
+        [
+            "",
+            " ",
+            "\n",
+            "(",
+            "{ ",
+            ">out ",
+            "2>&1 ",
+            "<<<input ",
+            "<<<${{B:-my {}}} ",
+            "2>&1<<<{} ",
+            "2>&-cmd {} ",
+            "<&-cmd {} ",
+            "(({}+1)) ",
+            "(( {} > 3 )) ",
+            "<<\\\n- {} ",
+        ]
+    ),
+    name=st.sampled_from(["API_KEY", "TOKEN", "A", "X+"]),
+    secret=st.text(alphabet="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", min_size=6, max_size=20),
+    value=st.sampled_from(_ASSIGNMENT_VALUES),
+    cmd=st.sampled_from(
+        [
+            "",
+            " python x.py",
+            " 'unterminated",
+            " cmd",
+            " cmd {}",
+            " 2>&-cmd -p{}",
+            " {{cmd,-p{}}}",
+            " cmd{{,-p{}}}",
+            " A[{} +1]=x cmd",
+        ]
+    ),
+)
+def test_executable_never_records_assignments_prop(prefix, name, secret, value, cmd):
+    prefix_str = prefix.format(secret) if "{}" in prefix else prefix
+    cmd_str = cmd.format(secret) if "{}" in cmd else cmd
+    line = f"{prefix_str}{name}={value.format(secret)}{cmd_str}"
+    got = tracing.executable_attr(line)
+    if got is not None:
+        assert secret not in got
+        assert "=" not in got
