@@ -516,6 +516,14 @@ user needs to know across them.
   60 s. The pre-flight needs an
   `ate-env-api` with the `warm_image` feature (every release since #235).
 
+- The two examples outside `examples/` moved there: `internal/examples/env` is
+  `examples/env-lifecycle` (`go run ./examples/env-lifecycle`) and
+  `clients/python/examples/quickstart.py` is
+  `examples/python-quickstart/quickstart.py`. `make verify-layers`
+  (`hack/verify/layers.py`, in the Go CI job) fails a change that puts an
+  example outside `examples/`, a third-party framework import outside
+  `integrations/` and `examples/`, an undeclared import in the Python client,
+  or a Go import across the layers of `docs/dev/code-layout.md`.
 - Python client: `server.address` drops a `dns:///` or `passthrough:///`
   scheme, as the Go client does.
 - Python client: `SubstrateEnvClientRuntime.exec_async` and `exec` raise a

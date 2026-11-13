@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command env demonstrates the gRPC EnvironmentService API lifecycle:
+// Command env-lifecycle demonstrates the gRPC EnvironmentService API lifecycle:
 // creating, getting, suspending, and deleting an environment.
 //
 // It expects a running ate-env-api service (or port-forward):
 //
 //	kubectl port-forward -n ate-env svc/ate-env-api 7777:7777
+//
+// It sends no bearer token, so the service must be deployed with
+// `ate-env manifest --insecure-no-auth`.
 package main
 
 import (

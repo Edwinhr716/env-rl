@@ -251,6 +251,7 @@ let
       make verify-gofmt
       make verify-boilerplate
       make verify-go-client-deps
+      make verify-layers
       make PRETTIER=prettier verify-docs
       echo "--> Protobuf stub verification..."
       make verify-protos
@@ -318,7 +319,7 @@ let
       base_env="$(nix build --no-link --print-out-paths .#python-env-base)"
       uni_agent_env="$(nix build --no-link --print-out-paths .#python-env-uni-agent)"
       echo "--> Python ruff check..."
-      ruff check clients/python examples/verl_swebench hack/release hack/ci
+      ruff check clients/python examples/python-quickstart examples/verl_swebench hack/release hack/ci hack/verify
       ruff check --config clients/python/pyproject.toml examples/Qwen3-1.7B-verl
       ruff check benchmarking/telemetry_report
       # The base-env suites only mean something if the base env really lacks

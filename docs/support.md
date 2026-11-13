@@ -47,10 +47,9 @@ report JSON is called out in the PR description; that is notice, not a compatibi
 (CI, Dependabot, code owners) and [`docs/`](.) are maintained with the code that they build, test or
 describe. They are not an API: they change whenever that code needs it.
 
-## Not supported: `examples/` and `internal/examples/`
+## Not supported: `examples/`
 
-[`examples/`](../examples) and [`internal/examples/`](../internal/examples) (a program that walks
-through the `EnvironmentService` lifecycle) are provided as is. Examples get no support, no
+[`examples/`](../examples) is provided as is. Examples get no support, no
 compatibility promise and no security fixes, and they can break or be removed at any time. Do not
 depend on them; copy what you need. The Go examples are packages of the root module, thus CI compiles and tests them with
 the rest of the module; that is not a support commitment.

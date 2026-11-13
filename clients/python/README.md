@@ -1025,7 +1025,7 @@ await client.close()
 Lifecycle calls (`create`, `get`, …) are unavailable in this mode — only
 `ate-env-api` implements them.
 
-See [examples/quickstart.py](examples/quickstart.py) for a complete
+See [examples/python-quickstart](../../examples/python-quickstart/README.md) for a complete
 program against a real ate-env-api.
 
 ## Development

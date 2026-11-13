@@ -109,7 +109,7 @@ Request-path zoom:
 | [`integrations/`](./integrations/README.md) | Framework integrations: E2B, Harbor, NeMo Gym, OpenHands, uni-agent. |
 | [`examples/`](./examples/README.md) | Runnable examples, from a Go MCP client to multi-node agentic GRPO recipes. Not supported. |
 | [`benchmarking/`](./benchmarking/README.md) | The SWE-bench loader scripts, the `bench` scenarios, the telemetry report tool and the benchmarking skills. |
-| [`internal/`](./internal) | The packages the binaries are built from: `apiservice` (the gRPC server), `ate` (the Substrate client), `inventory` (fleet inventory snapshot schema), `reporter` (the snapshot writer), `mcp`, `portproxy`, `routertls`, `hostcheck`, `sidecarenv`, `telemetry`, `tool`, `unknownfields`, `benchmarking/*`, the test doubles and helpers in `internaltest` (`fakecontrol`, `fakerouter`, `synctestrapid`, `testcerts`) and a lifecycle walkthrough in `examples/env`. |
+| [`internal/`](./internal) | The packages the binaries are built from: `apiservice` (the gRPC server), `ate` (the Substrate client), `inventory` (fleet inventory snapshot schema), `reporter` (the snapshot writer), `mcp`, `portproxy`, `routertls`, `hostcheck`, `sidecarenv`, `telemetry`, `tool`, `unknownfields`, `benchmarking/*`, and the test doubles and helpers in `internaltest` (`fakecontrol`, `fakerouter`, `synctestrapid`, `testcerts`). |
 | [`proto/ateenv/v1alpha`](./proto/ateenv/v1alpha) | The `ateenv.v1alpha` API: `env.proto` (`EnvironmentService`) and `guest.proto` (`ProcessService`, `FileSystemService`), with the generated Go stubs. |
 | [`proto/testdata/client-parity`](./proto/testdata/client-parity) | Shared Go and Python client conformance vectors (errors, executable names, image refs, metric families, RPC attributes, RPC coverage, semconv). |
 | [`docs/`](./docs) | [Architecture](./docs/architecture.md), [glossary](./docs/glossary.md), [observability](./docs/observability.md), the [metrics reference](./docs/metrics.md), [rootfs images and runtime layers](./docs/rootfs-images/README.md), the [threat model](./docs/security/threat-model.md), [support](./docs/support.md), [releases](./docs/release.md), the developer guides in [`docs/dev`](./docs/dev), the maintenance chores in [`docs/chores`](./docs/chores), and the plans in [`docs/plans`](./docs/plans). |
@@ -175,7 +175,7 @@ system; [`benchmarking/README.md`](./benchmarking/README.md) lists the scripts a
 ## Support
 
 The components, the clients, the integrations and the `ateenv.v1alpha` API are supported;
-`examples/` and `internal/examples/` are not. [docs/support.md](./docs/support.md) says what
+`examples/` is not. [docs/support.md](./docs/support.md) says what
 supported means for each path.
 
 ## Get started

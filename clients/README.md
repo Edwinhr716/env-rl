@@ -14,7 +14,7 @@ over gRPC and send the caller token when one is configured.
 - [`go/README.md`](./go/README.md): install, connect, environment lifecycle, process execution, and observability.
 - [`python/README.md`](./python/README.md): install, connect, the fleet SDK, pool sizing, errors, and observability ([docs/observability.md](../docs/observability.md)).
 - [`python/USER_GUIDE.md`](./python/USER_GUIDE.md): RL rollouts and benchmark adapters (`ate_env_rl.adapters`), overlapping claims with policy decoding on VeRL and Ray.
-- [`python/examples/quickstart.py`](./python/examples/quickstart.py): the Python client end to end against a running `ate-env-api`.
+- [`examples/python-quickstart`](../examples/python-quickstart/README.md): the Python client end to end against a running `ate-env-api`.
 - [`python/src/ate_env_rl/_gen/README.md`](./python/src/ate_env_rl/_gen/README.md): generated protobuf and gRPC stubs (`make python-protos`).
 - [`docs/dev/code-layout.md`](../docs/dev/code-layout.md): subpackage placement rules (`backend/`, `runtime/`, `adapters/`, `telemetry/`) and test doubles.
 

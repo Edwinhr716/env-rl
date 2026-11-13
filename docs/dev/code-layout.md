@@ -48,7 +48,7 @@ clients/
 integrations/            # Framework integrations: e2b (envd runtime layer), harbor (Harbor), nemo-gym (NeMo Gym), openhands, uni-agent (R2E-Gym)
 benchmarking/            # Benchmark scenarios (scenarios/), SWE-bench (swebench/), telemetry report (telemetry_report/)
 docs/                    # Architecture, glossary, release, rootfs images, security, dev guides
-examples/                # Examples: grpo, harbor, harbor-tools-layer, openhands, verl_swebench, Qwen3-1.7B-verl, Qwen3.5-35B-A3B-verl, Qwen3.5-397B-A17B-verl, runtime-layers, guest-daemon, mcp
+examples/                # Examples: env-lifecycle, grpo, harbor, harbor-tools-layer, openhands, python-quickstart, verl_swebench, Qwen3-1.7B-verl, Qwen3.5-35B-A3B-verl, Qwen3.5-397B-A17B-verl, runtime-layers, guest-daemon, mcp
 hack/                    # Repository scripts: CI (ci/), release (release/), verification (verify/, boilerplate/)
 ```
 
@@ -76,6 +76,8 @@ or `k8s.io/`); shared values like `DefaultAtespace` are copied and tested equal,
 Put code in `internal/` if only this repository's binaries use it, and in-actor services in `guest/`
 (`guest/` imports `internal/unknownfields`; `cmd/ate-env-guest` imports `internal/sidecarenv` and
 `internal/telemetry`). Neither must import `internal/ate` or `go.ate.dev/substrate`.
+`hack/verify/layers.py` enforces this, and that `internal/`, `clients/` and `cmd/` (the guest's own
+binary aside) do not import `guest/` outside tests, in the Go CI job.
 
 ### New binary vs. new package
 
@@ -105,6 +107,22 @@ Put CLI entrypoints in `cmd/benchmarking/bench` and `cmd/benchmarking/swebench-l
 Go benchmark packages in `internal/benchmarking/` (`job`, `measure`, `overlay`, `schema`, `sut`,
 `swebench`, `trace`). Put scenario manifests in `benchmarking/scenarios/`, report tools in
 `benchmarking/telemetry_report/`, and shell scripts in `benchmarking/swebench/`.
+
+### Integrations and examples
+
+Put an integration with a third-party framework in `integrations/<framework>/`: its own Python
+distribution (`pyproject.toml`, `src/`, `tests/`, `README.md`), a uv workspace member, and a row in
+`integrations/README.md`. It imports `ate_env_rl`; `ate_env_rl` never imports it. Only that
+integration and `examples/` import the framework; nothing under `clients/`, `benchmarking/`,
+`internal/` or `hack/` imports a framework, an integration or an example.
+
+Put a runnable example in `examples/<name>/` with a `README.md` and a row in `examples/README.md`. A
+Go example is a `main` package that imports no `internal/` package; no other directory is named
+`examples`, and an example has no `pyproject.toml`. `ate_env_rl` imports only the dependencies its
+`pyproject.toml` declares, the optional ones and `r2egym` (`CORE_LAZY_OPTIONAL`) lazily; only the
+packages the script lists import `go.ate.dev/`. `hack/verify/layers.py` enforces this section and
+the top-level directory list (`make verify-layers`, Go CI job); add a new top-level directory to the
+tree above and to the script in the same pull request.
 
 ### Test doubles and fixtures
 

@@ -17,6 +17,22 @@ tools, and Python fleet scheduling. See [README.md](./README.md) and
 - Be brief. Reviewer time and context windows are limited. Write short, direct sentences, subject
   first, active voice. Avoid em-dashes, chains of semicolons, and contrast pairs ("X, not Y").
 
+## Workflow
+
+- Before you change behavior, find the plan that owns the code under `docs/plans/` and read its
+  `acceptance-criteria.md`. If none owns it, write the criteria first, in their own pull request:
+  `docs/plans/<name>/acceptance-criteria.md` with the four-column table of `ate-env-api`, `nemo-gym`
+  and `port-proxy` (`ID`, `Criterion`, `Status`, `Tests`) and a status line naming the commit it
+  describes.
+- Write or update the rows before the code. One row is one observable behavior: the input, the
+  expected result, a stable ID with the plan's prefix, and the tests that will check it. A test that
+  checks a criterion names the ID in its name or its doc comment.
+- In the pull request, list the criteria under `## Criteria`: the ID and what changed (`AE-4 met`,
+  `NG-12 partial`, `PP-2 added`), or `None: <reason>` for a chore, a dependency bump, a docs-only or
+  a test-only change. Mark each met row with the pull request number in the same pull request.
+- A pull request that changes behavior under a plan's scope and names no criterion is not ready for
+  review.
+
 ## Code
 
 - Search the repository and its dependencies before writing a helper, cache, client, flag set, or
@@ -49,7 +65,8 @@ tools, and Python fleet scheduling. See [README.md](./README.md) and
 - `proto/ateenv/v1alpha` owns the contract between `ate-env-api` and `ate-env-guest`; `internal/`
   and `clients/` call generated stubs and must not import `guest/` in production (`guest/` and
   `cmd/ate-env-guest` must not import `internal/ate` or `go.ate.dev/substrate`); because
-  `ate-env-guest` runs inside task images without control-plane dependencies (not enforced).
+  `ate-env-guest` runs inside task images without control-plane dependencies (enforced by
+  `hack/verify/layers.py` in the Go CI job).
 - `clients/go` is the public Go SDK; outside tests it imports only `proto/ateenv/v1alpha` from this
   repository, and nothing under `internal/`, `go.ate.dev/` or `k8s.io/`; because an external module
   that imports the client must not pull the Substrate control-plane module (enforced by
@@ -90,6 +107,13 @@ RPC/tool), [maintain-docs](./.agents/skills/maintain-docs/SKILL.md) (sync/valida
 Python SDK: dir `clients/python`, package `ate-env-rl`, module `ate_env_rl`, handles
 `ate_env_rl.Env` and `ate_env_rl.SandboxHandle`.
 
+Layers: an integration with a third-party framework is `integrations/<framework>/`, a Python
+distribution of its own in the uv workspace with a row in `integrations/README.md`; a runnable usage
+example is `examples/<name>/` with a README and a row in `examples/README.md`; framework modules are
+imported only there, and nothing under `clients/`, `benchmarking/`, `internal/` or `hack/` imports
+an integration or an example (enforced by `hack/verify/layers.py`, which also holds the top-level
+directory set; rules in [docs/dev/code-layout.md](./docs/dev/code-layout.md)).
+
 ## Build, test, verify
 
 Run before opening a pull request:
@@ -100,6 +124,7 @@ make verify-gofmt
 make verify-go-client-deps
 make verify-docs
 make verify-protos
+make verify-layers
 make vet
 make test
 make python-test
@@ -108,7 +133,7 @@ make harbor-test
 make e2b-test
 make ci-dafny   # when touching docs/plans/telemetry/verify or modelled code
 python -m pytest integrations/openhands/tests benchmarking/swebench benchmarking/telemetry_report internal/benchmarking/swebench/trajectories examples/Qwen3-1.7B-verl/tests hack/release/test_create_release.py hack/ci/test_e2e_policy.py
-ruff check clients/python examples/verl_swebench benchmarking/telemetry_report hack/release hack/ci
+ruff check clients/python examples/python-quickstart examples/verl_swebench benchmarking/telemetry_report hack/release hack/ci hack/verify
 ruff check --config clients/python/pyproject.toml examples/Qwen3-1.7B-verl
 ```
 

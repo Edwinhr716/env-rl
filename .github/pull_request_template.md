@@ -14,6 +14,16 @@ What changes in this PR, and what intentionally stays the same?
 - Are there any behavior, configuration, or compatibility changes callers should know about?
 -->
 
+## Criteria
+
+<!--
+Which acceptance criteria does this PR meet, change or add? One per line, as IDs from
+docs/plans/*/acceptance-criteria.md with what changed, e.g. `AE-4 met`, `NG-12 partial`,
+`PP-2 added`. Write `None: <reason>` for a chore, a dependency bump, a docs-only or a test-only
+change. A PR that changes behavior under a plan's scope must name a criterion or say why none
+applies (see AGENTS.md, Workflow).
+-->
+
 ## Tests
 
 <!--
