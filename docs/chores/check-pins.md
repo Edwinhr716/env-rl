@@ -22,6 +22,9 @@ This repository pins development toolchains, language runtimes, package dependen
 | Protobuf tools and generator plugins | [`go.mod`](../../go.mod), [`go.sum`](../../go.sum) | Dependabot (`gomod`; `tool` directives) | [`hack/verify/protos.sh`](../../hack/verify/protos.sh) (`make verify-protos`) |
 | Substrate platform version | [`README.md`](../../README.md) ("Built against Substrate vX.Y.Z") | Manual (see [check-substrate-head.md](check-substrate-head.md)) | Manual verification |
 | E2E rootfs test image | [`hack/ci/targets.py`](../../hack/ci/targets.py) | Manual (refresh digest with `crane digest docker.io/library/python:3.13-slim`) | E2E (`test_create_from_image`) |
+| E2E musl test image | [`hack/ci/targets.py`](../../hack/ci/targets.py) | Manual (refresh digest with `crane digest docker.io/library/alpine:3.20`) | E2E (`integrations/e2b/tests/test_envd_e2e.py`) |
+| E2E non-root test image | [`hack/ci/targets.py`](../../hack/ci/targets.py) | Manual (refresh digest with `crane digest docker.io/curlimages/curl:<tag>`; its `USER` must stay non-root) | E2E (`integrations/e2b/tests/test_envd_e2e.py`) |
+| envd runtime layer (one envd version, the sha256 of its release binary for amd64 and for arm64, and the licence's commit and sha256) | [`integrations/e2b/layer/Dockerfile`](../../integrations/e2b/layer/Dockerfile) | Manual (the `envd.sha256` next to each binary in upstream's bucket; the Dockerfile names it). The SDK rarely forces a bump: the highest envd version gate in `e2b` 2.63.0 (`e2b/envd/versions.py` in the wheel) is 0.6.4, far below the pin | E2E (`integrations/e2b/tests/test_envd_e2e.py`) |
 
 ## When Dependabot opens a PR
 

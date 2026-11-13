@@ -29,6 +29,14 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `integrations/e2b`: a runtime layer with envd 0.10.2, the daemon the E2B
+  SDK talks to inside a sandbox, from upstream's release binary with a
+  checked sha256, and `hack/base-template.sh`, which prints the base template
+  that runs it as a sidecar on port 49983 with the capabilities it needs. The
+  task image must run as root (its `USER` is root or not set). The Kind E2E
+  job checks the layer in a glibc and a musl image, over a suspend, with a
+  file written for another user and without the API token, and records what
+  envd does in an image with a non-root `USER`. No Python package yet.
 - `ate-env manifest template --add-capability NAME` (repeatable): adds a
   Linux capability, named without the `CAP_` prefix, to the container of the
   template's actors, on top of Substrate's default set. A runtime layer whose

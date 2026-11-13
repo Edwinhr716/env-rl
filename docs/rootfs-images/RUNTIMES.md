@@ -18,7 +18,7 @@ A runtime layer is three things:
 | its readiness | a guest flag (`--sidecar-readyz http://127.0.0.1:PORT/health`) | the guest's `/readyz`, which is the actor's wakeup probe, answers 503 until every such URL has answered 2xx once |
 | its configuration | a template flag (`--env NAME=VALUE`) | sets a variable on the container; the guest passes its environment to sidecars and to the commands it starts |
 | its secrets | a template flag (`--sidecar-env NAME=VALUE`) | sets `ATE_SIDECAR_ENV_NAME` on the container; the guest removes it from its own environment at start and gives `NAME` to the sidecars only; the guest flag `-sidecar-env-required` makes an older guest exit at start |
-| its privileges | a template flag (`--add-capability NAME`) | adds a Linux capability to the container's set; the guest, the sidecars and each command get it; `ate-env manifest template --help` lists the accepted names |
+| its privileges | a template flag (`--add-capability NAME`) | adds a Linux capability to the container's set; the guest, the sidecars and each command hold it when the container runs as root, and a process of a non-root image `USER` has no effective capability; `ate-env manifest template --help` lists the accepted names |
 
 The guest is the container's only process by contract, which is why it is the
 one that supervises the others. Sidecars run without a shell or `PATH` lookup,
@@ -102,6 +102,20 @@ servers check no credential of their own, because their clients cannot send
 one; the API token is their only protection. The NeMo Gym provider hands the
 port out as `endpoint()`; see
 [integrations/nemo-gym](../../integrations/nemo-gym/README.md#services-inside-the-sandbox-the-nemo-runtime-layer).
+
+### envd layer (E2B)
+
+[`integrations/e2b/layer`](../../integrations/e2b/layer) is a layer with
+[envd](https://github.com/e2b-dev/runtime/tree/main/packages/envd), the daemon
+the E2B SDK talks to inside a sandbox: one static binary, started with
+`--sidecar '/opt/e2b/envd -isnotfc -no-cgroups -port 49983'` and gated with
+`--sidecar-readyz http://127.0.0.1:49983/health`. envd sets the user of each
+process it starts and the owner of each file it writes, thus the template also
+needs capabilities, and the image must run as root.
+[`integrations/e2b/hack/base-template.sh`](../../integrations/e2b/hack/base-template.sh)
+prints the whole template and is the source of the capability list;
+[integrations/e2b](../../integrations/e2b/README.md#capabilities) gives the
+reason for each.
 
 ## Who can reach the second runtime
 

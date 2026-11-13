@@ -23,8 +23,9 @@ What it does:
   5. Compiles container images (ateworker-gvisor, ate-env-api, ate-env-guest, ate-env-reporter) using ko to target registry.
   6. Applies Kubernetes manifests (atespace, access policy, caller auth Secret, WorkerPool, and ate-env-api with metrics).
   7. Registers the ActorTemplate (snapshots under the cluster snapshot location) with an environment marker, and waits for its golden snapshot.
-  8. Forwards a free local port and runs portable smoke test, Python SDK full-stack tests, Go SDK full-stack tests, NeMo Gym provider live test, swebench-loader Go SDK smoke test, and Harbor provider live trial test.
-  9. Grants ate-env-reporter the global viewer role, deploys it and waits for its first snapshot, then runs it on the host with -out-dir for three ticks and accepts the files with TestE2ESnapshotDir.
+  8. Builds the envd runtime layer (integrations/e2b/layer) and registers the E2B base template with it on the rootfs image.
+  9. Forwards a free local port and runs portable smoke test, Python SDK full-stack tests, Go SDK full-stack tests, NeMo Gym provider live test, envd runtime layer live test, swebench-loader Go SDK smoke test, and Harbor provider live trial test.
+  10. Grants ate-env-reporter the global viewer role, deploys it and waits for its first snapshot, then runs it on the host with -out-dir for three ticks and accepts the files with TestE2ESnapshotDir.
 
 When it runs:
   - CI: .github/workflows/ci.yaml in job `e2e-kind` on PR and push to main.
@@ -52,7 +53,8 @@ Environment variables:
   NAMESPACE                       ate-env             Kubernetes namespace for ate-env deployment
   LOCAL_PORT                      (free port)         Local port on host for ate-env-api port-forward (free port by default)
   TEMPLATE_NAME                   default-template    Name of ActorTemplate to register and test
-  ATE_ENV_ROOTFS_IMAGE            (target default)    Rootfs image for create-from-image E2E and swebench-loader; empty skips them
+  ATE_ENV_ROOTFS_IMAGE            (target default)    Rootfs image for create-from-image E2E, the envd layer E2E and swebench-loader; empty skips them
+  E2B_E2E_MUSL_IMAGE              (target default)    Digest-pinned musl image for the envd layer E2E
   ATE_INGRESS_ALLOWED_SPIFFE_IDS  (auto)              Allowed SPIFFE IDs for router TLS ingress
   PYTEST_BIN                      (auto)              Path to pytest binary or python test runner
   HARBOR_PYTEST_BIN               (auto)              Path to pytest binary with harbor installed (defaults to .#python-env-harbor or host PATH)
@@ -72,6 +74,7 @@ See also:
   hack/ci/targets.py, hack/ci/test_smoke.py, hack/ci/ensure-substrate.sh,
   clients/python/tests/e2e/test_full_stack.py, clients/go/e2e_test.go,
   integrations/nemo-gym/tests/test_e2e.py, integrations/harbor/tests/test_e2e.py,
+  integrations/e2b/tests/test_envd_e2e.py, integrations/e2b/hack/base-template.sh,
   cmd/benchmarking/swebench-loader, Makefile, nix/ci.nix.
 """
 
@@ -95,6 +98,7 @@ import lib
 from targets import KindTarget
 
 TEMPLATE_MARKER = "injected"
+E2B_TEMPLATE = "e2b-base"
 
 
 def locate_substrate(root: Path) -> Path:
@@ -300,19 +304,7 @@ def deploy_manifests(
         )
 
     lib.step(f"Cleaning stale templates and registering {tmpl} ActorTemplate in Substrate...")
-    list_res = lib.run(
-        ctl_str, f"--context={target.context}", "get", "actor-template", "-a", ns, "-o", "json",
-        check=True, capture=True,
-    )
-    templates = json.loads(list_res.stdout or "{}").get("actorTemplates", [])
-    derived_re = re.compile(rf"{re.escape(tmpl)}-[0-9a-f]{{12}}")
-    for item in templates:
-        name = item.get("metadata", {}).get("name")
-        if name and (name == tmpl or derived_re.fullmatch(name)):
-            lib.run(
-                ctl_str, f"--context={target.context}", "delete", "actor-template",
-                "-a", ns, name, check=True,
-            )
+    delete_templates(target, ate_ctl, ns, tmpl)
 
     lib.pipe(
         [
@@ -334,11 +326,34 @@ def deploy_manifests(
         check=True,
     )
 
+    wait_golden(target, ate_ctl, ns, tmpl)
+    return auth_token
+
+
+def delete_templates(target: KindTarget, ate_ctl: Path, ns: str, tmpl: str) -> None:
+    """Deletes the template and the templates derived from it, when they exist."""
+    ctl_str = str(ate_ctl)
+    list_res = lib.run(
+        ctl_str, f"--context={target.context}", "get", "actor-template", "-a", ns, "-o", "json",
+        check=True, capture=True,
+    )
+    templates = json.loads(list_res.stdout or "{}").get("actorTemplates", [])
+    derived_re = re.compile(rf"{re.escape(tmpl)}-[0-9a-f]{{12}}")
+    for item in templates:
+        name = item.get("metadata", {}).get("name")
+        if name and (name == tmpl or derived_re.fullmatch(name)):
+            lib.run(
+                ctl_str, f"--context={target.context}", "delete", "actor-template",
+                "-a", ns, name, check=True,
+            )
+
+
+def wait_golden(target: KindTarget, ate_ctl: Path, ns: str, tmpl: str) -> None:
     lib.step(f"Waiting for {tmpl} golden snapshot...")
 
     def check_golden():
         r = lib.run(
-            ctl_str,
+            str(ate_ctl),
             f"--context={target.context}",
             "get",
             "actor-template",
@@ -357,7 +372,45 @@ def deploy_manifests(
 
     tag = lib.wait_until(check_golden, timeout=180.0, interval=2.0, what=f"{tmpl} golden snapshot")
     lib.step(f"Golden snapshot ready: {tag}")
-    return auth_token
+
+
+def register_e2b_template(
+    root: Path, target: KindTarget, ate_ctl: Path, ate_env: Path, ns: str, tmpl: str, guest_image: str
+) -> None:
+    """Builds the envd runtime layer and registers the E2B base template with it."""
+    lib.step("Building the envd runtime layer (integrations/e2b/layer)...")
+    repo = f"{target.registry}/ate-env-e2b-envd"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        metadata = Path(tmp_dir) / "metadata.json"
+        lib.run(
+            "docker", "buildx", "build", "--platform", target.platform, "--push",
+            "--provenance=false", "--metadata-file", str(metadata), "-t", repo,
+            str(root / "integrations/e2b/layer"),
+            capture=False,
+        )
+        layer_image = f"{repo}@{json.loads(metadata.read_text())['containerimage.digest']}"
+    lib.step(f"  envd-layer-image: {layer_image}")
+
+    lib.step(f"Registering {E2B_TEMPLATE} ActorTemplate in Substrate...")
+    delete_templates(target, ate_ctl, ns, E2B_TEMPLATE)
+    lib.pipe(
+        [
+            str(root / "integrations/e2b/hack/base-template.sh"),
+            layer_image,
+            "--atespace",
+            ns,
+            "--workerpool",
+            f"{tmpl}-workerpool",
+            "--guest-image",
+            guest_image,
+            "--rootfs-image",
+            target.rootfs_image,
+        ],
+        [str(ate_ctl), f"--context={target.context}", "create", "actor-template", "-f", "-"],
+        env=dict(os.environ, ATE_ENV=str(ate_env)),
+        check=True,
+    )
+    wait_golden(target, ate_ctl, ns, E2B_TEMPLATE)
 
 
 REPORTER_NS = "ate-env-reporter"
@@ -612,6 +665,22 @@ def run_tests(
         )
 
         if target.rootfs_image:
+            lib.step("Running envd runtime layer live E2E tests...")
+            lib.run(
+                *py,
+                str(root / "integrations/e2b/tests/test_envd_e2e.py"),
+                "-v",
+                env={
+                    **test_env,
+                    "SUBSTRATE_E2E_API_URL": f"127.0.0.1:{port}",
+                    "E2B_E2E_TEMPLATE": E2B_TEMPLATE,
+                    "E2B_E2E_ATESPACE": ns,
+                    "E2B_E2E_MUSL_IMAGE": target.musl_image,
+                    "E2B_E2E_NONROOT_IMAGE": target.nonroot_image,
+                },
+                capture=False,
+            )
+
             lib.step("Running swebench-loader Go SDK live smoke test...")
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_path = Path(tmp_dir)
@@ -728,6 +797,8 @@ def main() -> None:
         ate_ctl, ate_env = build_cli_tools(root, sub_dir)
         imgs = build_images(root, sub_dir, target)
         auth_token = deploy_manifests(target, ate_ctl, ate_env, ns, tmpl, imgs)
+        if target.rootfs_image:
+            register_e2b_template(root, target, ate_ctl, ate_env, ns, tmpl, imgs["guest"])
         if harbor_future is not None:
             harbor_py, harbor_bin_dir = harbor_future.result()
         run_tests(root, target, ate_env, ns, tmpl, port, auth_token, harbor_py, harbor_bin_dir)

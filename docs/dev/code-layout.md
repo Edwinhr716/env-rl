@@ -45,7 +45,7 @@ clients/
     src/ate_env_rl/backend/ # Fleet drivers: SubstrateBackendDriver, MockBackendDriver
     src/ate_env_rl/runtime/ # Guest hooks: SubstrateEnvClientRuntime, MockRuntimeHook
     src/ate_env_rl/telemetry/ # Telemetry: Prometheus metric collectors and OpenTelemetry tracer
-integrations/            # Framework integrations: harbor (Harbor), nemo-gym (NeMo Gym), openhands, uni-agent (R2E-Gym)
+integrations/            # Framework integrations: e2b (envd runtime layer), harbor (Harbor), nemo-gym (NeMo Gym), openhands, uni-agent (R2E-Gym)
 benchmarking/            # Benchmark scenarios (scenarios/), SWE-bench (swebench/), telemetry report (telemetry_report/)
 docs/                    # Architecture, glossary, release, rootfs images, security, dev guides
 examples/                # Examples: grpo, harbor, harbor-tools-layer, openhands, verl_swebench, Qwen3-1.7B-verl, Qwen3.5-35B-A3B-verl, Qwen3.5-397B-A17B-verl, runtime-layers, guest-daemon, mcp

@@ -47,6 +47,16 @@ DEFAULT_KIND_ROOTFS_IMAGE = (
     "docker.io/library/python:3.13-slim@sha256:d3449c0493345868b09708d7056dce5edda3a75233ea86008fc80c934d355a10"
 )
 
+# Digest resolved 2026-11-11, the envd layer test needs a musl image with sh, refresh manually; see docs/chores/check-pins.md
+DEFAULT_KIND_MUSL_IMAGE = (
+    "docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+)
+
+# Digest resolved 2026-11-12, the envd layer test needs an image with sh whose USER is not root (curl_user), refresh manually; see docs/chores/check-pins.md
+DEFAULT_KIND_NONROOT_IMAGE = (
+    "docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93"
+)
+
 
 class KindTarget:
     """Manages the lifecycle of a local Kind cluster with Agent Substrate."""
@@ -55,6 +65,8 @@ class KindTarget:
     registry: str
     platform: str
     rootfs_image: str | None
+    musl_image: str
+    nonroot_image: str
 
     def __init__(
         self,
@@ -96,6 +108,9 @@ class KindTarget:
             self.rootfs_image = os.environ["ATE_ENV_ROOTFS_IMAGE"] or None
         else:
             self.rootfs_image = DEFAULT_KIND_ROOTFS_IMAGE
+        # More rootfs images of the envd layer test, on the E2B base template.
+        self.musl_image = os.environ.get("E2B_E2E_MUSL_IMAGE") or DEFAULT_KIND_MUSL_IMAGE
+        self.nonroot_image = DEFAULT_KIND_NONROOT_IMAGE
 
         self.created = False
         self._existing_clusters_before: set[str] = set()

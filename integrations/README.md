@@ -13,15 +13,19 @@ to the framework. They are supported ([docs/support.md](../docs/support.md)).
 | [`openhands/`](./openhands/README.md) | [OpenHands](https://github.com/OpenHands/software-agent-sdk) | `ate-env-openhands` / `ate_env_openhands` | `AteEnvWorkspace`, an OpenHands `RemoteWorkspace` that mirrors `AgentSandboxWorkspace` and runs the agent-server in any unmodified task image (glibc 2.31 or newer); fleet adapters (`make_handle_workspace`, `make_fleet_workspace`); `ate_env_openhands.r2egym`, a re-export of the R2E-Gym adapter in `ate_env_rl.adapters.r2egym`; agent-sandbox-rl's fleet API on ate-env (`agent_sandbox_rl/`). | `pip install -e integrations/openhands` |
 | [`uni-agent/`](./uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | `uni-agent-substrate` / `uni_agent_substrate` | Sandbox provider `ate_env` (one environment per episode) and the `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. | `pip install -e integrations/uni-agent` |
 
-Each integration's `README.md` covers its configuration, runtime layers (`nemo-gym/layer`
-and `openhands/layer`; see [docs/rootfs-images/RUNTIMES.md](../docs/rootfs-images/RUNTIMES.md)),
+[`e2b/`](./e2b/README.md) has no distribution: it holds the envd runtime layer of
+[E2B](https://github.com/e2b-dev/E2B), the script that prints its base template, and a live test of
+envd in an environment.
+
+Each integration's `README.md` covers its configuration, runtime layers (`e2b/layer`,
+`nemo-gym/layer` and `openhands/layer`; see [docs/rootfs-images/RUNTIMES.md](../docs/rootfs-images/RUNTIMES.md)),
 template helper scripts, unit fakes, and, for `harbor`, `nemo-gym` and `openhands`, live
 `tests/test_e2e.py` targets. See
 [docs/dev/code-layout.md](../docs/dev/code-layout.md) for repository placement rules.
 
 ## Tests in CI
 
-Three jobs of [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) run the integration
+Four jobs of [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) run the integration
 tests, each in a Nix `devShell` whose Python environment [`nix/python.nix`](../nix/python.nix)
 builds from `uv.lock`:
 
@@ -29,6 +33,8 @@ builds from `uv.lock`:
   for `nemo-gym`, and `pytest` and `ruff` for `uni-agent` on Python 3.12 in the
   `python-env-uni-agent` environment, with `uni-agent` itself from git at the commit
   [`uni-agent/pyproject.toml`](./uni-agent/pyproject.toml) pins.
+- `E2E Kind and Smoke Test` builds the `e2b` layer, registers its base template and runs
+  [`e2b/tests/test_envd_e2e.py`](./e2b/tests/test_envd_e2e.py) on the Kind cluster.
 - `OpenHands integration` runs `pytest` and `ruff` for `openhands` in the `.#openhands` shell.
 - `Harbor integration` runs `pytest` and `ruff` for `harbor` in the `.#harbor` shell; its trial
   test starts containers through Docker.
