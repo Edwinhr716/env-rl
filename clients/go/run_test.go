@@ -55,6 +55,10 @@ type fakeProcesses struct {
 	// pollEntered, when set, makes each GetProcess signal it, then wait
 	// for the call's ctx to end.
 	pollEntered chan struct{}
+	// startEntered and outputEntered, when set, make StartProcess and
+	// StreamProcessOutput signal them, then wait for the call's ctx to end.
+	startEntered  chan struct{}
+	outputEntered chan struct{}
 	// outputDelay delays each StreamProcessOutput; outputCode, when set,
 	// fails it with that code.
 	outputDelay    time.Duration
@@ -71,7 +75,12 @@ type fakeProcesses struct {
 	outputReqs []*ateenvv1alpha.StreamProcessOutputRequest
 }
 
-func (f *fakeProcesses) StartProcess(context.Context, *ateenvv1alpha.StartProcessRequest) (*ateenvv1alpha.Process, error) {
+func (f *fakeProcesses) StartProcess(ctx context.Context, _ *ateenvv1alpha.StartProcessRequest) (*ateenvv1alpha.Process, error) {
+	if f.startEntered != nil {
+		f.startEntered <- struct{}{}
+		<-ctx.Done()
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextID++
@@ -115,6 +124,11 @@ func (f *fakeProcesses) GetProcess(ctx context.Context, req *ateenvv1alpha.GetPr
 }
 
 func (f *fakeProcesses) StreamProcessOutput(req *ateenvv1alpha.StreamProcessOutputRequest, stream grpc.ServerStreamingServer[ateenvv1alpha.ProcessOutput]) error {
+	if f.outputEntered != nil {
+		f.outputEntered <- struct{}{}
+		<-stream.Context().Done()
+		return status.FromContextError(stream.Context().Err()).Err()
+	}
 	f.mu.Lock()
 	f.outputReqs = append(f.outputReqs, req)
 	stdout, stderr, exited, code, delay, tOut := f.stdout, f.stderr, f.exited[req.GetProcessId()], f.exitCode, f.outputDelay, f.timedOut
@@ -276,6 +290,59 @@ func TestRunPollCancelDuringPoll(t *testing.T) {
 	}
 	if killed, _ := f.snapshot(); len(killed) != 1 {
 		t.Fatalf("an abandoned process must be killed once, got %v", killed)
+	}
+}
+
+// A cancel or a deadline that lands while StartProcess is in flight comes
+// back from gRPC as a Canceled or DeadlineExceeded status; Run returns
+// ctx.Err() for it, in both modes (#333).
+func TestRunContextEndsDuringStartProcess(t *testing.T) {
+	for _, poll := range []bool{false, true} {
+		t.Run(fmt.Sprintf("poll=%v/cancel", poll), func(t *testing.T) {
+			f := &fakeProcesses{startEntered: make(chan struct{}, 1)}
+			e := newFakeProcessEnv(t, f)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			errc := make(chan error, 1)
+			go func() {
+				_, err := e.Run(ctx, env.ShellRequest{Command: "sleep 100", Poll: poll})
+				errc <- err
+			}()
+			<-f.startEntered
+			cancel()
+			if err := <-errc; !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run cancelled during StartProcess = %v, want context.Canceled", err)
+			}
+		})
+		t.Run(fmt.Sprintf("poll=%v/deadline", poll), func(t *testing.T) {
+			f := &fakeProcesses{startEntered: make(chan struct{}, 1)}
+			e := newFakeProcessEnv(t, f)
+			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			defer cancel()
+			_, err := e.Run(ctx, env.ShellRequest{Command: "sleep 100", Poll: poll})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Run past its deadline during StartProcess = %v, want context.DeadlineExceeded", err)
+			}
+		})
+	}
+}
+
+// A cancel while the streaming Run follows the output returns
+// context.Canceled, as the polled Run does (#333).
+func TestRunStreamCancelDuringOutput(t *testing.T) {
+	f := &fakeProcesses{outputEntered: make(chan struct{}, 1)}
+	e := newFakeProcessEnv(t, f)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := e.Run(ctx, env.ShellRequest{Command: "sleep 100"})
+		errc <- err
+	}()
+	<-f.outputEntered
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("streaming Run cancelled during the output = %v, want context.Canceled", err)
 	}
 }
 
@@ -465,6 +532,10 @@ func TestRunPollCancelKillsGuestProcess(t *testing.T) {
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Fatalf("process %d is not running before the cancel: %v", pid, err)
 	}
+	// The command can write its pid before StartProcess returns. Cancel
+	// only once Run polls, so it has the process ID it needs for the kill
+	// (#333; a cancel during StartProcess is TestRunContextEndsDuringStartProcess).
+	f.calls.waitFor(t, "/ateenv.v1alpha.ProcessService/GetProcess")
 	cancel()
 	if err := <-errc; !errors.Is(err, context.Canceled) {
 		t.Fatalf("a cancelled Run = %v, want context.Canceled", err)

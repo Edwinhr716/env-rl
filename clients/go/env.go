@@ -131,7 +131,9 @@ func (e *Env) Run(ctx context.Context, req ShellRequest) (_ *ShellResponse, err 
 	}
 	proc, err := e.startProcess(ctx, start)
 	if err != nil {
-		return nil, err
+		// The guest may have started the command already; with no process
+		// ID there is nothing to kill.
+		return nil, ctxErr(ctx, err)
 	}
 
 	var res *ShellResponse
@@ -142,7 +144,7 @@ func (e *Env) Run(ctx context.Context, req ShellRequest) (_ *ShellResponse, err 
 		res, guestTimedOut, err = runStreamed(ctx, proc, req.Stdin, began)
 	}
 	if err != nil {
-		return nil, err
+		return nil, ctxErr(ctx, err)
 	}
 	if guestTimedOut != nil {
 		res.TimedOut = *guestTimedOut
@@ -152,6 +154,24 @@ func (e *Env) Run(ctx context.Context, req ShellRequest) (_ *ShellResponse, err 
 	}
 	span.SetAttributes(AttrExitCode.Int(res.ExitCode), AttrTimedOut.Bool(res.TimedOut))
 	return res, nil
+}
+
+// ctxErr returns ctx.Err() for an error that a cancel or a deadline of ctx
+// caused. gRPC reports those as a Canceled or DeadlineExceeded status, which
+// errors.Is does not match to context.Canceled or context.DeadlineExceeded.
+// gRPC can report the deadline before the context's own timer sets
+// ctx.Err(), so a passed ctx.Deadline() counts as well.
+func ctxErr(ctx context.Context, err error) error {
+	switch status.Code(err) {
+	case codes.Canceled, codes.DeadlineExceeded:
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+			return context.DeadlineExceeded
+		}
+	}
+	return err
 }
 
 // writeStdin feeds data to the process's stdin and closes it; nil leaves

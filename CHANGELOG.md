@@ -533,6 +533,12 @@ user needs to know across them.
   stays as a re-export of the new module, with the same names.
 
 ### Fixed
+- Go client: `Env.Run` returns `ctx.Err()` (`context.Canceled` or
+  `context.DeadlineExceeded`) when the context ends while `StartProcess` is in
+  flight or while the streaming output is followed, as the polled run already
+  did. Before, those paths returned the gRPC `Canceled` or `DeadlineExceeded`
+  status, which `errors.Is(err, context.Canceled)` does not match; this also
+  made `TestRunPollCancelKillsGuestProcess` flaky (#333).
 - Python client: `SandboxFleet.run()` keeps the error of a failed run when the
   teardown at its end also fails. Before, the teardown's
   `InfrastructureError` replaced it in each strategy (`none`, `naive`,

@@ -96,6 +96,22 @@ func (l *callLog) mark() int {
 	return len(l.calls)
 }
 
+// waitFor waits up to 10 seconds for a call to method.
+func (l *callLog) waitFor(t *testing.T, method string) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		l.mu.Lock()
+		for _, c := range l.calls {
+			if c.method == method {
+				l.mu.Unlock()
+				return
+			}
+		}
+		l.mu.Unlock()
+	}
+	t.Fatalf("no %s call within 10s", method)
+}
+
 // peers returns, from the call at index from on, the connections each
 // environment's calls used, and all connections used.
 func (l *callLog) peers(from int) (perEnv map[string]map[string]bool, all map[string]bool) {
