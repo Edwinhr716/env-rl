@@ -524,6 +524,18 @@ func (t *Tracker) reap(state *ProcessState, cmd *exec.Cmd, stdoutFile, stderrFil
 	_ = stdoutFile.Close()
 	_ = stderrFile.Close()
 
+	// Release the concurrency slot before the exit becomes observable.
+	// Invariant: a process a caller has observed as PROCESS_STATE_EXITED
+	// never holds a slot. That state is observable once State reads EXITED
+	// under state.mu (GetProcess, the Exited check of the output stream) or
+	// once done closes, and a caller that chains a wait and a start at
+	// MaxConcurrentProcesses counts on the slot being free by then (#332).
+	// Nothing runs in the slot any more: Wait has reaped the process.
+	// Not covered: SignalProcess, WriteProcessInput and ResizeProcess can
+	// return ErrExited before this line, from the error of the system call
+	// (ESRCH, EPIPE, a closed PTY), while the slot is still held (#370).
+	t.decrementActive()
+
 	state.mu.Lock()
 	state.FinishedAt = finishedAt
 	state.State = ateenvv1alpha.ProcessState_PROCESS_STATE_EXITED
@@ -541,7 +553,6 @@ func (t *Tracker) reap(state *ProcessState, cmd *exec.Cmd, stdoutFile, stderrFil
 
 	close(state.done)
 	state.output.notify()
-	t.decrementActive()
 }
 
 // exitClassOf classifies a reaped process for TrackerConfig.OnExit.

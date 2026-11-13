@@ -590,6 +590,11 @@ user needs to know across them.
   The default run id is `pf-<6 random characters>`, unique per
   pass, as `WarmImage`'s is, instead of the fixed `pf`.
 
+- ate-env-guest: the concurrency slot of a process is released before its
+  exit is observable, through the exit message of the output stream or
+  `GetProcess`. A caller that chains a wait and a start at
+  `MaxConcurrentProcesses` no longer gets `ResourceExhausted` from the start
+  (#332).
 - `bench run -overlay`: every behavioral overlay field now takes effect.
   Before, only `prewarm_policy` (the footing) and `warm_pool_size` (the
   acquisition source) did; `park`, `park_policy`, `prefetch`,

@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -788,6 +789,134 @@ func TestTTYExitWhileDescendantHoldsTerminal(t *testing.T) {
 	}
 	if exit.GetExitCode() != 0 {
 		t.Fatalf("exit_code = %d, want 0", exit.GetExitCode())
+	}
+}
+
+// TestExitReleasesSlotBeforeItIsObservable chains a wait and a start at
+// MaxConcurrentProcesses = 1: once a caller has seen the exit message, the
+// slot of that process must be free, so the next StartProcess never gets
+// ResourceExhausted (#332).
+func TestExitReleasesSlotBeforeItIsObservable(t *testing.T) {
+	cfg := DefaultConfig(t.TempDir()) // not the shared default: the cleanup removes LogDir
+	cfg.MaxConcurrentProcesses = 1
+	client := setupTestServerWithConfig(t, cfg)
+	ctx := context.Background()
+
+	// 200 chains or 2 s, whichever comes first, and at least 2: a chain
+	// costs a few milliseconds on Linux and about 20 ms on macOS. The first
+	// chain starts before any process exited, so only the second one starts
+	// after an exit it observed. Under CPU contention the old ordering
+	// failed on the first start after an exit.
+	start := time.Now()
+	chains := 0
+	for ; chains < 2 || (chains < 200 && time.Since(start) < 2*time.Second); chains++ {
+		proc, err := client.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "true"}})
+		if status.Code(err) == codes.ResourceExhausted {
+			t.Fatalf("chain %d: the previous process was seen exited but still held its slot: %v", chains, err)
+		}
+		if err != nil {
+			t.Fatalf("chain %d: StartProcess failed: %v", chains, err)
+		}
+		wait(t, client, proc.GetProcessId())
+	}
+	if chains < 2 {
+		t.Fatalf("%d chains: no start followed an observed exit", chains)
+	}
+	t.Logf("%d chains in %s", chains, time.Since(start).Round(time.Millisecond))
+}
+
+// TestSlotIsFreeWhenExitIsReported starts a second process from OnExit, which
+// the reaper calls once the state reads EXITED and before done closes: at
+// MaxConcurrentProcesses = 1 that start succeeds only if the slot of the
+// exited process is already free (#332).
+func TestSlotIsFreeWhenExitIsReported(t *testing.T) {
+	cfg := DefaultConfig(t.TempDir())
+	cfg.MaxConcurrentProcesses = 1
+	var (
+		tracker  *Tracker
+		once     sync.Once
+		startErr = make(chan error, 1)
+	)
+	cfg.OnExit = func(time.Duration, string) {
+		once.Do(func() {
+			_, err := tracker.Start(StartOptions{Command: []string{"sh", "-c", "true"}})
+			startErr <- err
+		})
+	}
+	tracker, err := NewTracker(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(tracker.Close)
+
+	first, err := tracker.Start(StartOptions{Command: []string{"sh", "-c", "true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-first.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("first process did not exit")
+	}
+	select {
+	case err := <-startErr:
+		if err != nil {
+			t.Fatalf("start from OnExit of an exited process: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnExit was not called")
+	}
+}
+
+// TestConcurrencySlotRace is the RPC-level form of the invariant in #332: a
+// process that GetProcess reports as EXITED holds no concurrency slot, so the
+// next StartProcess at the cap succeeds. From #340 by sunnylovestiramisu.
+func TestConcurrencySlotRace(t *testing.T) {
+	cfg := DefaultConfig(t.TempDir())
+	cfg.MaxConcurrentProcesses = 1
+
+	// OnExit runs after reap marks the process EXITED and before it closes
+	// done; holding it open keeps reap at that point, so the second
+	// StartProcess below runs while the exit is already observable.
+	waitOnExit := make(chan struct{})
+	var release sync.Once
+	releaseReap := func() { release.Do(func() { close(waitOnExit) }) }
+	t.Cleanup(releaseReap)
+	cfg.OnExit = func(d time.Duration, exitClass string) {
+		<-waitOnExit
+	}
+
+	client := setupTestServerWithConfig(t, cfg)
+	ctx := context.Background()
+
+	proc, err := client.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{Command: []string{"true"}})
+	if err != nil {
+		t.Fatalf("StartProcess failed: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		p, err := client.GetProcess(ctx, &ateenvv1alpha.GetProcessRequest{ProcessId: proc.GetProcessId()})
+		if err != nil {
+			t.Fatalf("GetProcess failed: %v", err)
+		}
+		if p.GetState() == ateenvv1alpha.ProcessState_PROCESS_STATE_EXITED {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process not EXITED after 10 s: state %v", p.GetState())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, err = client.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{Command: []string{"true"}})
+	releaseReap()
+
+	if err != nil {
+		if status.Code(err) == codes.ResourceExhausted {
+			t.Fatalf("StartProcess after the previous process was reported EXITED: %v", err)
+		}
+		t.Fatalf("StartProcess failed with unexpected error: %v", err)
 	}
 }
 
