@@ -58,6 +58,13 @@ type PrewarmResult struct {
 // template exists and, when waited for, its golden settled ready or none.
 func (r PrewarmResult) OK() bool { return r.Err == nil }
 
+// deadlinePassed reports whether ctx has a deadline that the clock reached.
+// ctx.Err() can still be nil then: the timer of ctx runs a moment later.
+func deadlinePassed(ctx context.Context) bool {
+	d, ok := ctx.Deadline()
+	return ok && !time.Now().Before(d)
+}
+
 // PrewarmTemplates prepares images for a run without creating an
 // environment: it ensures each image's derived template, which starts its
 // golden bake, and with WaitGolden waits for the goldens to settle. The
@@ -114,7 +121,15 @@ func PrewarmTemplates(ctx context.Context, w ImageWarmer, images []string, opts 
 		for i := range pending {
 			st, err := w.ImageStatus(ctx, images[i])
 			if err != nil {
-				if ctx.Err() != nil {
+				// The call can end at ctx's deadline a moment before
+				// ctx.Err() says so (the server's timer, or the call's
+				// own, fires first). Such an error says nothing the
+				// deadline does not, so the clock decides too: an error
+				// seen at or after the deadline ends the polls and is
+				// not the last poll's error. Before the deadline a
+				// DeadlineExceeded or Canceled poll is a poll failure
+				// like any other.
+				if ctx.Err() != nil || deadlinePassed(ctx) {
 					break
 				}
 				// A poll the control plane refused is the image's fault; any

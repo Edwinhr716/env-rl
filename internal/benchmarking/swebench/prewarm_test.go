@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -148,6 +149,133 @@ func (s stubWarmer) EnsureImageTemplate(_ context.Context, image string) (ImageS
 
 func (s stubWarmer) ImageStatus(_ context.Context, image string) (ImageState, error) {
 	return s.status(image)
+}
+
+// lateCtx is a context at the moment its deadline passed and its timer did
+// not run yet: after expire(), Deadline() is in the past and Err() is still
+// nil for one more reading.
+type lateCtx struct {
+	context.Context
+	cancel   context.CancelFunc
+	deadline *atomic.Pointer[time.Time]
+	lag      *atomic.Int32
+}
+
+func newLateCtx() lateCtx {
+	inner, cancel := context.WithCancel(context.Background())
+	return lateCtx{Context: inner, cancel: cancel, deadline: new(atomic.Pointer[time.Time]), lag: new(atomic.Int32)}
+}
+
+func (c lateCtx) expire() {
+	d := time.Now()
+	c.deadline.Store(&d)
+	c.lag.Store(1)
+	c.cancel()
+}
+
+func (c lateCtx) Deadline() (time.Time, bool) {
+	if d := c.deadline.Load(); d != nil {
+		return *d, true
+	}
+	return time.Time{}, false
+}
+
+func (c lateCtx) Err() error {
+	if c.lag.Add(-1) >= 0 {
+		return nil
+	}
+	return c.Context.Err()
+}
+
+// A poll that the deadline cut, seen before ctx.Err() turns non-nil, does
+// not replace the error of the earlier poll: the timeout names the cause.
+func TestPrewarmTemplatesDeadlineCutPollKeepsTheEarlierError(t *testing.T) {
+	for _, code := range []codes.Code{codes.DeadlineExceeded, codes.Canceled} {
+		ctx := newLateCtx()
+		polls := 0
+		w := stubWarmer{
+			ensure: func(string) (ImageState, error) {
+				return ImageState{Template: "a", Exists: true, Golden: GoldenPending}, nil
+			},
+			status: func(string) (ImageState, error) {
+				if polls++; polls == 1 {
+					return ImageState{}, status.Error(codes.Unavailable, "api server restarting")
+				}
+				// The call ends with ctx; the check after the call still
+				// reads a nil ctx.Err().
+				ctx.expire()
+				return ImageState{}, status.Error(code, "cut at the deadline")
+			},
+		}
+		results, err := PrewarmTemplates(ctx, w, []string{pfImgA}, PrewarmOptions{WaitGolden: true, GoldenPoll: time.Millisecond})
+		ctx.cancel()
+		if polls != 2 {
+			t.Fatalf("%s: polls = %d, want 2", code, polls)
+		}
+		if err == nil || results[0].OK() || !strings.Contains(err.Error(), "(last poll: ") || !strings.Contains(err.Error(), "api server restarting") || strings.Contains(err.Error(), "cut at the deadline") {
+			t.Errorf("%s at the deadline after Unavailable: err=%v, want a timeout that names the Unavailable poll", code, err)
+		}
+	}
+}
+
+// A DeadlineExceeded or Canceled poll in the middle of the run is a poll
+// failure like any other: the timeout names the last one, and an older
+// Unavailable poll does not hide it.
+func TestPrewarmTemplatesMidRunDeadlineExceededReplacesTheEarlierError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	polls := 0
+	w := stubWarmer{
+		ensure: func(string) (ImageState, error) {
+			return ImageState{Template: "a", Exists: true, Golden: GoldenPending}, nil
+		},
+		status: func(string) (ImageState, error) {
+			switch polls++; {
+			case polls == 1:
+				return ImageState{}, status.Error(codes.Unavailable, "api server restarting")
+			case polls < 4:
+				return ImageState{}, status.Error(codes.DeadlineExceeded, "upstream timed out")
+			case polls == 4:
+				return ImageState{}, status.Error(codes.Canceled, "upstream gave up")
+			}
+			cancel()
+			return ImageState{}, status.Error(codes.Canceled, "cut at the deadline")
+		},
+	}
+	results, err := PrewarmTemplates(ctx, w, []string{pfImgA}, PrewarmOptions{WaitGolden: true, GoldenPoll: time.Millisecond})
+	if polls != 5 {
+		t.Fatalf("polls = %d, want 5", polls)
+	}
+	if err == nil || results[0].OK() || !strings.Contains(err.Error(), "(last poll: ") || !strings.Contains(err.Error(), "upstream gave up") || strings.Contains(err.Error(), "api server restarting") {
+		t.Errorf("DeadlineExceeded polls after Unavailable: err=%v, want a timeout that names the last poll before the deadline", err)
+	}
+}
+
+// A poll cut at the deadline after polls that succeeded adds no last-poll
+// text: the timeout already says all of it.
+func TestPrewarmTemplatesDeadlineCutPollAfterGoodPollsAddsNoText(t *testing.T) {
+	ctx := newLateCtx()
+	defer ctx.cancel()
+	polls := 0
+	w := stubWarmer{
+		ensure: func(string) (ImageState, error) {
+			return ImageState{Template: "a", Exists: true, Golden: GoldenPending}, nil
+		},
+		status: func(string) (ImageState, error) {
+			if polls++; polls < 3 {
+				return ImageState{Template: "a", Exists: true, Golden: GoldenPending}, nil
+			}
+			ctx.expire()
+			return ImageState{}, status.Error(codes.DeadlineExceeded, "cut at the deadline")
+		},
+	}
+	results, err := PrewarmTemplates(ctx, w, []string{pfImgA}, PrewarmOptions{WaitGolden: true, GoldenPoll: time.Millisecond})
+	if polls != 3 {
+		t.Fatalf("polls = %d, want 3", polls)
+	}
+	if err == nil || results[0].OK() || !strings.Contains(err.Error(), "still pending") || strings.Contains(err.Error(), "last poll") {
+		t.Errorf("a cut poll after good polls: err=%v, want the timeout alone", err)
+	}
 }
 
 // An ensure that answers without a template fails the image at once: there
