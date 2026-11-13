@@ -1,6 +1,6 @@
 # sandboxenv-rl
 
-<!-- Last full audit: 2026-11-10 (commit 2e44e1b) -->
+<!-- Last full audit: 2026-11-12 (commit 843a4b98) -->
 
 Isolated execution environments for reinforcement learning and evaluation on Agent Substrate. Each
 environment runs as a gVisor actor supporting on-demand rootfs derivation, PTYs, file streaming, MCP

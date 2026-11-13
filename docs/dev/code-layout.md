@@ -39,7 +39,7 @@ proto/testdata/client-parity/ # shared Go/Python client parity conformance JSON 
 clients/
   go/                    # Go SDK client: package env (Client, Env, Process, StartError)
   python/                # Python SDK: distribution package ate-env-rl, import name ate_env_rl
-    src/ate_env_rl/      # Core library: Client, Env, Process, SandboxFleet, AsyncSandboxFleet, sources.py
+    src/ate_env_rl/      # Core library: Client, Env, Process, SandboxFleet, AsyncSandboxFleet, config.py, sources.py
     src/ate_env_rl/_gen/ # [generated] Python protobuf and gRPC stubs; never hand-edit
     src/ate_env_rl/adapters/ # Benchmark task converters and evaluation adapters (SweBenchAdapter, r2egym)
     src/ate_env_rl/backend/ # Fleet drivers: SubstrateBackendDriver, MockBackendDriver
@@ -64,10 +64,10 @@ import `guest/`.
 ### `clients/go` vs. `internal/ate`
 
 Put public Go SDK code (`package env`) in `clients/go` and internal control-plane client code in
-`internal/ate` (`cmd/ate-env` imports `clients/go`, `apiservice`, `hostcheck`, and `routertls`).
-External clients talk to `ate-env-api`, never to Substrate directly. Outside tests, `clients/go`
-imports only `proto/ateenv/v1alpha` from this repo (never `internal/`, `go.ate.dev/`, or `k8s.io/`);
-shared values like `DefaultAtespace` are copied and tested equal, enforced by
+`internal/ate` (`cmd/ate-env` imports `clients/go`, `apiservice`, `hostcheck`, `routertls`, and
+`sidecarenv`). External clients talk to `ate-env-api`, never to Substrate directly. Outside tests,
+`clients/go` imports only `proto/ateenv/v1alpha` from this repo (never `internal/`, `go.ate.dev/`,
+or `k8s.io/`); shared values like `DefaultAtespace` are copied and tested equal, enforced by
 `hack/verify/go-client-deps.sh` in the Go CI job. A feature that one Go consumer needs goes into
 `clients/go` when a second consumer can use it.
 
@@ -92,14 +92,12 @@ files. Run `buf generate` for Go stubs and `make python-protos`
 
 ### Python SDK: low-level vs. fleet vs. adapters
 
-Put low-level gRPC wrappers in `clients/python/src/ate_env_rl/{client,env,handle}.py`. Put pool
-scheduling algorithms, warm pool maintenance, and batch rollout drivers in
-`clients/python/src/ate_env_rl/{fleet,async_fleet,strategies}.py`. Synchronous fleet methods must
-run coroutines through `LoopRunner.run()` to preserve shared HTTP/2 channels. Put benchmark task
-converters and handle-bound evaluation adapters without third-party SDK dependencies in
-`clients/python/src/ate_env_rl/adapters/` (`swebench.py`, `r2egym.py`, with
-`ate_env_openhands.r2egym` re-exporting `ate_env_rl.adapters.r2egym`). Put packages that pin
-external agent frameworks or ship container runtime layers under `integrations/`.
+Put low-level gRPC wrappers in `clients/python/src/ate_env_rl/{client,env,handle}.py`, and pool
+scheduling, warm pools, and rollout drivers in `ate_env_rl/{fleet,async_fleet,strategies}.py` (sync
+methods must run via `LoopRunner.run()` for HTTP/2 channels). Put task converters and handle-bound
+evaluation adapters without third-party SDK deps in `clients/python/src/ate_env_rl/adapters/`
+(`swebench.py`; `r2egym.py`, re-exported by `ate_env_openhands.r2egym`), and packages that pin
+external agent frameworks or ship runtime layers under `integrations/`.
 
 ### Benchmarking: `cmd/benchmarking` vs. `internal/benchmarking` vs. `benchmarking/`
 
@@ -110,16 +108,13 @@ Go benchmark packages in `internal/benchmarking/` (`job`, `measure`, `overlay`, 
 
 ### Test doubles and fixtures
 
-Never write custom Substrate mocks. Reuse `internal/internaltest`: `fakecontrol` (in-memory `ateapi`
-control plane), `fakerouter` (`atenet` router), `synctestrapid` (`rapid` in `testing/synctest`
-bubbles), and `testcerts` (SPIFFE client certificates).
+Never write custom Substrate mocks; reuse `internal/internaltest`: `fakecontrol` (in-memory
+`ateapi`), `fakerouter` (`atenet` router), `synctestrapid` (`rapid` in `testing/synctest`), and
+`testcerts` (SPIFFE certs).
 
 ### Agent workflows in `.agents/skills/`
 
-- Releases: [.agents/skills/create-release/SKILL.md](../../.agents/skills/create-release/SKILL.md)
-  (release notes, tags, signed assets, PyPI, GHCR).
-- Adding an RPC:
-  [.agents/skills/extend-env-surface/SKILL.md](../../.agents/skills/extend-env-surface/SKILL.md)
-  (proto, stubs, guest, `s.guestConn`/`ensureAwake`, SDKs).
-- Docs: [.agents/skills/maintain-docs/SKILL.md](../../.agents/skills/maintain-docs/SKILL.md) (style
-  and validation paths).
+- [create-release](../../.agents/skills/create-release/SKILL.md): release notes, tags, PyPI, GHCR.
+- [extend-env-surface](../../.agents/skills/extend-env-surface/SKILL.md): proto, stubs, guest,
+  `s.guestConn`/`ensureAwake`, and SDKs.
+- [maintain-docs](../../.agents/skills/maintain-docs/SKILL.md): style and validation paths.

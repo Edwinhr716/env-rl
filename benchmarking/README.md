@@ -19,7 +19,7 @@ the report JSON is called out in the PR description.
 
 | Path | What it is |
 |---|---|
-| [`cmd/benchmarking/swebench-loader`](../cmd/benchmarking/swebench-loader) | `run`, `resolve`, `plan-placement`, `convert-trace`, `report`, `compare` and `trajectory-assets`: the loader, its JSONL event recorder (`-enable-tracing` also exports each event as a span) and the report. |
+| [`cmd/benchmarking/swebench-loader`](../cmd/benchmarking/swebench-loader) | `run`, `render-plan`, `resolve`, `plan-placement`, `preflight`, `convert-trace`, `report`, `compare` and `trajectory-assets`: the loader, its JSONL event recorder (`-enable-tracing` also exports each event as a span) and the report. |
 | [`cmd/benchmarking/bench`](../cmd/benchmarking/bench) | The composable harness over a scenario file: `resolve`, `render`, `prewarm`, `spinup`, `spindown`, `measure`, `reap`, `report`, `validate`, `upload`, `compare` and `run`. Its page, [`cmd/benchmarking/bench/README.md`](../cmd/benchmarking/bench/README.md), says what scenario runs do (in process, no sandbox) and where Ray is (only the real RL path). |
 | [`internal/benchmarking`](../internal/benchmarking) | The packages behind both (`schema`, `swebench`, `job`, `sut`, `measure`, `overlay`, `trace`); see [`docs/dev/code-layout.md`](../docs/dev/code-layout.md) for package placement rules. |
 | [`internal/benchmarking/DESIGN.md`](../internal/benchmarking/DESIGN.md) | The system design and work spec; [`PLAN.md`](../internal/benchmarking/PLAN.md) the implementation plan; [`TELEMETRY_GUIDE.md`](../internal/benchmarking/TELEMETRY_GUIDE.md) the telemetry scopes and feature plugins. |

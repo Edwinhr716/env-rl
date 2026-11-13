@@ -11,9 +11,8 @@ Re-exec the process as a subreaper under PID 1 before starting the gRPC daemon.
 - **Location**: `cmd/ate-env-guest/init_linux.go` (`runIfPID1`, `supervise`).
 - **Why**: Direct `wait4(-1, ...)` calls inside the gRPC daemon race with `os/exec.Cmd.Wait()` in
   `guest/process.Tracker`, stealing exit codes.
-- **Mechanism**: `ate-env-guest` sets `prctl(PR_SET_CHILD_SUBREAPER, 1)` and re-execs via
-  `os.StartProcess`. The outer PID 1 process runs `syscall.Wait4(-1, &status, syscall.WNOHANG, nil)`
-  and forwards signals while the child runs `exec.Cmd`.
+- **Mechanism**: `ate-env-guest` sets `PR_SET_CHILD_SUBREAPER`, re-execs via `os.StartProcess`, and
+  the outer PID 1 runs `syscall.Wait4(-1, &status, syscall.WNOHANG, nil)` and forwards signals.
 
 ### 2. Process groups and negative-PID signal delivery
 
@@ -30,8 +29,7 @@ Start subprocesses in dedicated process groups and signal via negative PIDs (`-p
 Acquire `OutputChanged()` before reading from disk to avoid missed write notifications.
 
 - **Location**: `guest/process/service.go` (`StreamProcessOutput`), `guest/process/tracker.go`.
-- **Why**: Subscribing to `ProcessState.OutputChanged()` after reading misses concurrent disk
-  writes, stalling the stream until the next write or exit.
+- **Why**: Subscribing to `OutputChanged()` after reading misses concurrent disk writes and stalls.
 - **Mechanism**: `StreamProcessOutput` acquires `OutputChanged()` before reading and waits on it
   when zero bytes are read while running; writers close it under mutex after flushing.
 
@@ -44,13 +42,12 @@ Append `ate-target-actor` via interceptors and do not forward incoming caller me
 - **Location**: `internal/apiservice/server.go` (`guestConn`, `routerCredentials`),
   `internal/apiservice/wakeretry.go` (`ensureAwake`), `internal/ate/client.go` (`DialGuest`),
   `internal/routertls/routertls.go` (`TransportCredentials`, `RejectedCertificate`).
-- **Why**: Forwarding caller gRPC metadata duplicates `ate-target-actor: <atespace>/<id>`, which
-  `atenet-router` rejects (`agent-substrate/substrate#2308`).
+- **Why**: Forwarding caller metadata duplicates `ate-target-actor`, which `atenet-router` rejects.
 - **Mechanism**: `guestConn` and `DialGuest` append `ate-target-actor` without forwarding caller
   metadata. `internal/routertls` hot-reloads kubelet `-atenet-client-cert` and `servicedns`
   `-atenet-ca-file` on handshakes. `routertls.TransportCredentials` (`alertConn.Write`) reads TLS
   1.3 post-handshake alerts on initial HTTP/2 `EPIPE` writes, letting `ensureAwake` match
-  `routertls.RejectedCertificate` on first probe before any wait, while `DialGuest` gets the alert.
+  `routertls.RejectedCertificate` before any wait, while `DialGuest` gets the alert.
 
 ### 5. Actor wake budgets, fail-fast start errors, and actor deletion
 
@@ -63,12 +60,11 @@ Verify readiness within wake budgets, fail fast on unrecoverable errors, and evi
   (20s once `RUNNING`), returning `Canceled` or `DeadlineExceeded` probe errors immediately. The
   state read after an `Unavailable` probe gets the rest of `WakeBudget`, and of
   `WakeNoCapacityGrace` during a no-room run, but never more than `WakeStateReadCap`
-  (`-wake-state-read-cap`, default `DefaultWakeStateReadCap`, 5s): the control dial sets no
-  keepalive and no per-call timeout, so a read that hangs without an error is cut there.
-  `Unavailable`, `DeadlineExceeded` or `ResourceExhausted` from that read, or a read cut at its
-  deadline, leaves the state unknown, and the wait goes on. When all reads are cut, the wait probes
-  once per `-wake-state-read-cap` plus backoff and ends at `-wake-budget` with `Unavailable` "while
-  UNKNOWN".
+  (`-wake-state-read-cap`, `DefaultWakeStateReadCap` = 5s): the control dial sets no keepalive and
+  no per-call timeout, so a read that hangs without an error is cut there. `Unavailable`,
+  `DeadlineExceeded` or `ResourceExhausted` from that read, or one cut at its deadline, leaves the
+  state unknown, and the wait goes on. When all reads are cut, the wait probes once per
+  `-wake-state-read-cap` plus backoff, ending at `-wake-budget` with `Unavailable` "while UNKNOWN".
 - **Fail-fast start errors**: `ensureAwake` exits early on unrecoverable states:
   `routertls.RejectedCertificate` returns `codes.FailedPrecondition` with
   `routertls.RejectionAdvice` and no trailer, `CRASHED` returns `codes.FailedPrecondition` with
@@ -92,13 +88,14 @@ Serialize derived templates (`imageTemplateLocks`); `AlreadyExists` succeeds on 
 - **Why**: Concurrent workers race to create `<base>-<digest:12>` (`imageTemplateDigestLen = 12`),
   Substrate leaves terminal `golden_snapshot_status.error_message` failures unretried, and deleting
   an in-use template strips rootfs volumes upon resume.
-- **Mechanism**: `ensureImageTemplate` holds a per-template read lock, held in this process only
-  (`imageTemplateLocks`; see `docs/plans/ate-env-api/acceptance-criteria.md`), through
-  `CreateActor`. `getOrCreateImageTemplate` reuses on cross-path `sameImageDigest`, fails with
-  `codes.FailedPrecondition` on mismatch, and treats `codes.AlreadyExists` as success after the
-  winner's digest check. If a golden snapshot failed `>= failedTemplateRecreateAfter` (10m) ago,
-  `ensureImageTemplate` write-locks and calls `recreateFailedImageTemplate` (recreating by UID at
-  zero `templateUsers`).
+- **Mechanism**: `CreateEnvironment` takes `imageTemplateLock` only when `rootfs_image` is set;
+  direct `Template.Name` creates skip it. `ensureImageTemplate` holds a per-template read lock, held
+  in this process only (`imageTemplateLocks`), through `CreateActor` (see
+  `docs/plans/ate-env-api/acceptance-criteria.md`). `getOrCreateImageTemplate` reuses on cross-path
+  `sameImageDigest`, fails with `codes.FailedPrecondition` on mismatch, and treats
+  `codes.AlreadyExists` as success after the winner's digest check. If a golden failed
+  `>= failedTemplateRecreateAfter` (10m) ago, `ensureImageTemplate` write-locks and calls
+  `recreateFailedImageTemplate` (by UID at 0 `templateUsers`).
 
 ## Client connection pooling and event loops
 
@@ -110,23 +107,22 @@ Dispatch synchronous Python calls to a persistent `LoopRunner` background thread
   `clients/python/src/ate_env_rl/fleet.py`, `clients/python/src/ate_env_rl/backend/substrate.py`,
   `cmd/ate-env-api/main.go`.
 - **Why**: `asyncio.run()` creates short loops that destroy HTTP/2 gRPC channels on exit.
-- **Mechanism**: `LoopRunner` runs a daemon thread with a persistent event loop and dispatches
-  coroutines via `asyncio.run_coroutine_threadsafe`. `SandboxFleet` sizes connections via
-  `FleetConfig.connections` or `ceil(max_concurrent / 200)`, and `SubstrateBackendDriver` holds the
-  pooled gRPC channels against `DefaultMaxConcurrentStreams = 4096`.
+- **Mechanism**: `LoopRunner` runs a persistent daemon event loop and dispatches coroutines via
+  `asyncio.run_coroutine_threadsafe`. `SandboxFleet` sizes connections via `FleetConfig.connections`
+  or `ceil(max_concurrent / 200)`, and `SubstrateBackendDriver` pools gRPC channels against
+  `DefaultMaxConcurrentStreams = 4096`.
 
 ### 8. Python release error tracking and teardown retries
 
 Record release errors in `RunReport` and retry unreleased actors during `fleet.teardown()`.
 
-- **Location**: `clients/python/src/ate_env_rl/backend/substrate.py` (release errors, retries);
-  `clients/python/src/ate_env_rl/fleet.py`, `async_fleet.py` and `strategies.py` (which error is
-  raised).
+- **Location**: `clients/python/src/ate_env_rl/backend/substrate.py` (release errors, retries),
+  `clients/python/src/ate_env_rl/fleet.py`, `async_fleet.py`, `strategies.py` (error raised).
 - **Why**: Network errors during `delete` must not crash workers or leak orphan actors.
 - **Mechanism**: `SubstrateBackendDriver` logs failed deletes in `RunReport.release_errors` and
-  retains `_owned_actors`; `fleet.teardown()` retries, raising `InfrastructureError` if any fail. A
-  teardown error never replaces the error of the body: `SandboxFleet.run()` and `with fleet:` log it
-  and raise the body's error (also an interrupt); they raise it only when the body succeeded.
+  keeps `_owned_actors`; `fleet.teardown()` retries (`InfrastructureError` on failure), and a
+  teardown error never replaces the body's error: `SandboxFleet.run()` and `with fleet:` log it and
+  raise the body's error (or interrupt), raising the teardown error only when the body succeeded.
 
 ### 9. Python warm-pool bookkeeping across awaits
 

@@ -1,6 +1,6 @@
 # sandboxenv-rl architecture
 
-Status: describes `main` at `2e44e1b`. Re-check the claims in §Components when `internal/ate` or
+Status: describes `main` at `843a4b98`. Re-check the claims in §Components when `internal/ate` or
 `internal/apiservice` changes. Companion to [README.md](../README.md) (how to use it) and
 [docs/glossary.md](./glossary.md).
 
@@ -122,29 +122,33 @@ child processes, and serves `ProcessService` and `FileSystemService`.
   warming (`server-info`, `newServerInfoCommand`; `image-status`, `newImageStatusCommand`;
   `placement-domains`, `newPlacementDomainsCommand`; `warm-image`, `newWarmImageCommand`), `shell`,
   `read`/`write`, and `ate-env manifest`.
+- **`cmd/ate-env-reporter`**: Daemon (`internal/reporter`) writing cluster fleet inventory snapshots
+  (`internal/inventory`) on an interval to a bucket or directory.
 - **`clients/go`**: Public Go SDK client (`Client`, `ClientOptions` with `Connections`,
   `DialOptions`, and `MetricsRegisterer`, `Env`, `Process`, `StartError`).
-- **`clients/python`**: `ate-env-rl` (`ate_env_rl`): async `Client` and `Env`, sync `SandboxFleet`
-  (via `LoopRunner`), `AsyncSandboxFleet`, and `PreflightWarmer` (`preflight.py`).
-- **`integrations/harbor`**: Published as `ate-env-harbor`. Implements Harbor's environment provider
-  on `ate-env`.
-- **`integrations/nemo-gym`**: Published as `nemo-gym-substrate`. Implements NeMo Gym's
+- **`clients/python`**: `ate-env-rl` (`ate_env_rl`): async `Client` (with `credentials` TLS) and
+  `Env`, sync `SandboxFleet` (via `LoopRunner`), `AsyncSandboxFleet`, `FleetConfig` (`config.py`,
+  `preflight=True`), `PreflightWarmer` (`preflight.py`), and `adapters` (`swebench`, `r2egym`).
+- **`integrations/harbor`**: In-repo package `ate-env-harbor`. Implements `AteEnvEnvironment`, a
+  Harbor environment provider, and the dataset image warmer (`ate_env_harbor.warm`).
+- **`integrations/nemo-gym`**: In-repo package `nemo-gym-substrate`. Implements NeMo Gym's
   `SubstrateSandboxProvider`.
-- **`integrations/openhands`**: Published as `ate-env-openhands`. Implements OpenHands'
+- **`integrations/openhands`**: In-repo package `ate-env-openhands`. Implements OpenHands'
   `AteEnvWorkspace` and `FleetWorkspace` over the port proxy.
-- **`integrations/uni-agent`**: Published as `uni-agent-substrate`. Implements uni-agent's
+- **`integrations/uni-agent`**: In-repo package `uni-agent-substrate`. Implements uni-agent's
   `AteEnvSandbox` (`ate_env` provider) and `r2e_gym` task.
 
 ### Benchmarking (`cmd/benchmarking`, `internal/benchmarking`, `benchmarking/`)
 
 - **`cmd/benchmarking/bench`**: RL benchmark CLI (`resolve`, `render`, `prewarm`, `spinup`,
   `spindown`, `measure`, `reap`, `report`, `validate`, `upload`, `compare`, `run`) backed by
-  `internal/benchmarking/{job,measure,overlay,schema,sut,trace}` and `benchmarking/scenarios/`.
+  `internal/benchmarking/{job,measure,overlay,schema,sut,swebench}` and `benchmarking/scenarios/`.
 - **`cmd/benchmarking/swebench-loader`**: Runs trajectories in `eval`, `steps`, and `open-loop`
-  modes (`run`, with `-strategy`, `-placement`), resolves schedules (`resolve`), renders trajectory
-  mixes (`render-plan`, `swebench.BuildRenderedPlan`), plans image placement (`plan-placement`,
-  `swebench.PlanImagePlacement`), warms caches (`preflight`, `swebench.PreflightWarmer`), and
-  handles assets, traces, and reports (`trajectory-assets`, `convert-trace`, `report`, `compare`).
+  modes (`run`, with `-strategy`, `-placement`, `-preflight`), resolves schedules (`resolve`),
+  renders trajectory mixes (`render-plan`, `swebench.BuildRenderedPlan`), plans image placement
+  (`plan-placement`, `swebench.PlanImagePlacement`), warms caches (`preflight`,
+  `swebench.PreflightWarmer`), and handles assets, traces, and reports (`trajectory-assets`,
+  `convert-trace`, `report`, `compare`).
 - **`internal/benchmarking/swebench`**: Emits structured JSONL events (`EventRun`, `EventCreate`,
   `EventTTFI`, `EventWake`, `EventStep`, `EventTask`, `EventFork`, `EventSuspend`, `EventDelete`,
   `EventBarrier`, `EventPark`, `EventPrewarm`, `EventReap`, `EventThink`, `EventPhase`) plus

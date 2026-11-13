@@ -151,7 +151,7 @@ installed and tested.
 | [`integrations/nemo-gym`](./integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy, and [`layer/`](./integrations/nemo-gym/layer) is that daemon for NeMo: NeMo Skills' sandbox server and NeMo Gym's exec server injected into any task image. |
 | [`integrations/uni-agent`](./integrations/uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | Sandbox provider `ate_env` plus an `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. Used by `examples/Qwen3.5-397B-A17B-verl` and `examples/Qwen3.5-35B-A3B-verl`. |
 | [`integrations/openhands`](./integrations/openhands/README.md) | [OpenHands](https://github.com/OpenHands/software-agent-sdk) | `AteEnvWorkspace`, an OpenHands `RemoteWorkspace` that mirrors OpenHands' `AgentSandboxWorkspace` and runs the agent-server in any unmodified task image (glibc 2.31 or newer). |
-| [`integrations/harbor`](./integrations/harbor/README.md) | [Harbor](https://github.com/harbor-framework/harbor) | `AteEnvEnvironment`, a Harbor environment provider: `harbor run ... -e ate_env_harbor:AteEnvEnvironment` runs each trial in an ate-env environment from a digest-pinned task image, with no change to Harbor. |
+| [`integrations/harbor`](./integrations/harbor/README.md) | [Harbor](https://github.com/harbor-framework/harbor) | `AteEnvEnvironment`, a Harbor environment provider: `harbor run ... -e ate_env_harbor:AteEnvEnvironment` runs each trial in an ate-env environment from a digest-pinned task image (with optional `worker_selector` pool pinning and `ate_env_harbor.warm` pre-warming), with no change to Harbor. |
 
 ## Benchmarks
 
@@ -159,10 +159,10 @@ installed and tested.
 the API the way a simulated RL job does: `eval` mode creates, replays, grades and deletes each task,
 `steps` mode creates a fleet once and parks it between training steps, and `open-loop` fires Poisson
 task arrivals at `-arrival-rate`. `render-plan` renders a trajectory mix, `plan-placement` assigns
-task images under node cache budgets, `run -placement` steers each create into its image's domain,
-and `preflight` ensures derived templates and fills those node caches before a run. Image-delivery
-workloads compare image pull, image streaming and other loaders on the same images. The report breaks
-down what each phase cost.
+task images under node cache budgets, `run -placement` steers each create into its image's domain
+(with `-preflight` warming the plan before the run), and `preflight` ensures derived templates and
+fills those node caches before a run. Image-delivery workloads compare image pull, image streaming
+and other loaders on the same images. The report breaks down what each phase cost.
 The [`bench`](./cmd/benchmarking/bench) harness runs the scenarios in
 [`benchmarking/scenarios`](./benchmarking/scenarios) (`resolve`, `render`, `prewarm`, `spinup`,
 `spindown`, `measure`, `reap`, `report`, `validate`, `upload`, `compare` and `run`), and
