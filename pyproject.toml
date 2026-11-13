@@ -24,6 +24,7 @@ members = [
     "integrations/openhands",
     "integrations/uni-agent",
     "integrations/harbor",
+    "integrations/e2b",
 ]
 
 [tool.uv]

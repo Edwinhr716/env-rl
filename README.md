@@ -106,7 +106,7 @@ Request-path zoom:
 | [`cmd/ate-env-reporter`](./cmd/ate-env-reporter) | The fleet inventory reporter: on an interval it writes one cluster's snapshot (atespaces, templates, tags, workers, actors, WorkerPools and `ate-env-api` Deployments, the schema of `internal/inventory`) to a Cloud Storage bucket or a directory. It reads the control plane and the Kubernetes API and writes nothing to the cluster. |
 | [`cmd/benchmarking`](./cmd/benchmarking) | The benchmark binaries: `swebench-loader` and the `bench` harness. |
 | [`clients/`](./clients/README.md) | The Go client (package `env`) and the Python client `ate_env_rl` with the fleet SDK. |
-| [`integrations/`](./integrations/README.md) | Framework integrations: Harbor, NeMo Gym, OpenHands, uni-agent. |
+| [`integrations/`](./integrations/README.md) | Framework integrations: E2B, Harbor, NeMo Gym, OpenHands, uni-agent. |
 | [`examples/`](./examples/README.md) | Runnable examples, from a Go MCP client to multi-node agentic GRPO recipes. Not supported. |
 | [`benchmarking/`](./benchmarking/README.md) | The SWE-bench loader scripts, the `bench` scenarios, the telemetry report tool and the benchmarking skills. |
 | [`internal/`](./internal) | The packages the binaries are built from: `apiservice` (the gRPC server), `ate` (the Substrate client), `inventory` (fleet inventory snapshot schema), `reporter` (the snapshot writer), `mcp`, `portproxy`, `routertls`, `hostcheck`, `sidecarenv`, `telemetry`, `tool`, `unknownfields`, `benchmarking/*`, the test doubles and helpers in `internaltest` (`fakecontrol`, `fakerouter`, `synctestrapid`, `testcerts`) and a lifecycle walkthrough in `examples/env`. |
@@ -151,6 +151,7 @@ installed and tested.
 | [`integrations/nemo-gym`](./integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy, and [`layer/`](./integrations/nemo-gym/layer) is that daemon for NeMo: NeMo Skills' sandbox server and NeMo Gym's exec server injected into any task image. |
 | [`integrations/uni-agent`](./integrations/uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | Sandbox provider `ate_env` plus an `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. Used by `examples/Qwen3.5-397B-A17B-verl` and `examples/Qwen3.5-35B-A3B-verl`. |
 | [`integrations/openhands`](./integrations/openhands/README.md) | [OpenHands](https://github.com/OpenHands/software-agent-sdk) | `AteEnvWorkspace`, an OpenHands `RemoteWorkspace` that mirrors OpenHands' `AgentSandboxWorkspace` and runs the agent-server in any unmodified task image (glibc 2.31 or newer). |
+| [`integrations/e2b`](./integrations/e2b/README.md) | [E2B](https://github.com/e2b-dev/E2B) | `ate_env_e2b.Sandbox` and `AsyncSandbox`, subclasses of the E2B SDK's classes: an E2B program changes its import line and runs its sandboxes as environments, with upstream envd as a runtime layer. |
 | [`integrations/harbor`](./integrations/harbor/README.md) | [Harbor](https://github.com/harbor-framework/harbor) | `AteEnvEnvironment`, a Harbor environment provider: `harbor run ... -e ate_env_harbor:AteEnvEnvironment` runs each trial in an ate-env environment from a digest-pinned task image (with optional `worker_selector` pool pinning and `ate_env_harbor.warm` pre-warming), with no change to Harbor. |
 
 ## Benchmarks
@@ -1033,6 +1034,7 @@ make ci-go
 make ci-python
 make ci-openhands
 make ci-harbor
+make ci-e2b
 make ci-dafny
 make ci-e2e
 
@@ -1063,6 +1065,7 @@ make dev-shell
 nix develop .#openhands
 nix develop .#uni-agent
 nix develop .#harbor
+nix develop .#e2b
 
 # Without Nix: the same locked Python packages in .venv
 uv sync --all-packages --all-extras

@@ -15,7 +15,7 @@
 # Checks for pull requests and main: Go build, vet, test, protos, license
 # headers, Markdown formatting and the generated docs/metrics.md; Python
 # client (base install and telemetry extras), telemetry report tool and
-# integration tests; the OpenHands integration; release builds and
+# integration tests; the OpenHands, Harbor and E2B integrations; release builds and
 # distributions; the Dafny models in docs/plans/telemetry/verify; and Kind
 # E2E smoke tests. Release publishing lives in release.yaml. Actions are
 # pinned by commit SHA (version in the trailing comment), as the
@@ -182,6 +182,28 @@ jobs:
         run: |
           python -m pytest integrations/harbor/tests -q
           ruff check integrations/harbor
+
+  e2b:
+    # Its own job, like OpenHands and Harbor: the e2b SDK and its HTTP stack
+    # are a dependency set that no other Python check needs. The tests need no
+    # cluster and no Docker: a fake ate-env-api stands in. tests/test_envd_e2e.py
+    # and tests/test_sandbox_e2e.py are skipped here; the Kind E2E job runs them.
+    name: E2B integration
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run E2B tests and ruff
+        shell: nix develop .#e2b -c bash -eo pipefail {0}
+        run: |
+          python -m pytest integrations/e2b/tests -q
+          ruff check integrations/e2b
 
   dafny:
     # The hand-written Dafny models of the telemetry and warm-pool code

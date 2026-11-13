@@ -681,6 +681,31 @@ def run_tests(
                 capture=False,
             )
 
+            lib.step("Running E2B Sandbox class live E2E tests...")
+            # The class needs the e2b SDK: the pytest of .#python-env-e2b (nix/python.nix),
+            # E2B_PYTEST_BIN, or the pytest of this run when it has e2b installed.
+            e2b_py = [os.environ["E2B_PYTEST_BIN"]] if os.environ.get("E2B_PYTEST_BIN") else py
+            if not os.environ.get("E2B_PYTEST_BIN") and shutil.which("nix"):
+                e2b_env = lib.run(
+                    "nix", "build", "--no-link", "--print-out-paths", ".#python-env-e2b",
+                    cwd=str(root),
+                ).stdout.strip().splitlines()[-1]
+                e2b_py = [f"{e2b_env}/bin/pytest"]
+            lib.run(
+                *e2b_py,
+                str(root / "integrations/e2b/tests/test_sandbox_e2e.py"),
+                "-v",
+                env={
+                    **test_env,
+                    "SUBSTRATE_E2E_API_URL": f"127.0.0.1:{port}",
+                    "E2B_E2E_TEMPLATE": E2B_TEMPLATE,
+                    "E2B_E2E_ATESPACE": ns,
+                    "E2B_E2E_MUSL_IMAGE": target.musl_image,
+                    "E2B_E2E_NONROOT_IMAGE": target.nonroot_image,
+                },
+                capture=False,
+            )
+
             lib.step("Running swebench-loader Go SDK live smoke test...")
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_path = Path(tmp_dir)

@@ -82,6 +82,7 @@
               python-env-base = ci.pythonEnvBase;
               python-env-uni-agent = ci.uniAgentEnv;
               python-env-harbor = ci.harborEnv;
+              python-env-e2b = ci.e2bEnv;
             };
 
             devShells = {
@@ -114,6 +115,7 @@
               openhands = ci.openhandsShell;
               uni-agent = ci.uniAgentShell;
               harbor = ci.harborShell;
+              e2b = ci.e2bShell;
             };
           };
       }

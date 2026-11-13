@@ -70,6 +70,7 @@ let
     ate-env-openhands = "ate_env_openhands";
     uni-agent-substrate = "uni_agent_substrate";
     ate-env-harbor = "ate_env_harbor";
+    ate-env-e2b = "ate_env_e2b";
   };
   editableSources =
     _final: prev:
@@ -139,6 +140,12 @@ in
   harborEnv = pythonSet.mkVirtualEnv "sandboxenv-rl-python-harbor" {
     ate-env-rl = [ "dev" ];
     ate-env-harbor = [ "test" ];
+  };
+
+  # integrations/e2b with its test extra; the .#e2b devShell and `make ci-e2b`.
+  e2bEnv = pythonSet.mkVirtualEnv "sandboxenv-rl-python-e2b" {
+    ate-env-rl = [ "dev" ];
+    ate-env-e2b = [ "test" ];
   };
 
   # integrations/uni-agent with its test extra and the uni-agent dependency

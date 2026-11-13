@@ -53,6 +53,7 @@ let
     openhandsEnv
     uniAgentEnv
     harborEnv
+    e2bEnv
     ;
 
   diffCover = pkgs.runCommand "diff-cover" { } ''
@@ -292,6 +293,7 @@ let
   openhandsShell = mkPythonShell openhandsEnv;
   uniAgentShell = mkPythonShell uniAgentEnv;
   harborShell = mkPythonShell harborEnv;
+  e2bShell = mkPythonShell e2bEnv;
 
   ci-python = pkgs.writeShellApplication {
     name = "ci-python";
@@ -617,9 +619,11 @@ in
     openhandsShell
     uniAgentShell
     harborShell
+    e2bShell
     pythonEnvBase
     uniAgentEnv
     harborEnv
+    e2bEnv
     ;
   coverage = ci-coverage;
 }

@@ -29,6 +29,18 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `integrations/e2b`: the package `ate-env-e2b` (e2b 2.63 to below 3, Python
+  3.11 or newer). `ate_env_e2b.Sandbox` and `ate_env_e2b.AsyncSandbox` are
+  subclasses of `e2b.Sandbox` and `e2b.AsyncSandbox`: a program changes its
+  import line and its sandboxes are environments on the E2B base template.
+  `create`, `connect`, `pause`, `kill`, `get_info` and `is_running` go to
+  `ate-env-api`, each with a deadline; `commands`, `files` and `pty` are the
+  SDK's own code on envd. The classes override public SDK names only. Each
+  other public method, and each argument with no meaning on ate-env, raises
+  `SandboxException`, also one that a newer SDK adds. `create` refuses an
+  image that does not run as root. envd has no access token, and nothing ends
+  an environment after a time. The Kind E2E job runs the classes against real
+  envd (`integrations/e2b/tests/test_sandbox_e2e.py`).
 - `integrations/e2b`: a runtime layer with envd 0.10.2, the daemon the E2B
   SDK talks to inside a sandbox, from upstream's release binary with a
   checked sha256, and `hack/base-template.sh`, which prints the base template
@@ -36,7 +48,7 @@ user needs to know across them.
   task image must run as root (its `USER` is root or not set). The Kind E2E
   job checks the layer in a glibc and a musl image, over a suspend, with a
   file written for another user and without the API token, and records what
-  envd does in an image with a non-root `USER`. No Python package yet.
+  envd does in an image with a non-root `USER`.
 - `ate-env manifest template --add-capability NAME` (repeatable): adds a
   Linux capability, named without the `CAP_` prefix, to the container of the
   template's actors, on top of Substrate's default set. A runtime layer whose
