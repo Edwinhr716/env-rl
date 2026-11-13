@@ -1,11 +1,11 @@
 # Plan: E2B runtime support
 
-Status: proposal, 2026-11-09; last checked 2026-11-13 against `main` at `915894b6` and pull request
-2 (#365) at `2e8efa07`. Nothing in this plan is merged. Pull requests 0, 1 and 2 are open (#363,
-#364, #365), and section 5 has the results of its checks on Kind (2026-11-11). Checked against `e2b`
-2.63.0 and `e2b-code-interpreter` 2.11.9 (PyPI), envd 0.10.2 (`e2b-dev/runtime`, `packages/envd`),
-AgentENV `main` at `034ea2c`, and `kubernetes-sigs/agent-sandbox` `main` at `580cb3e6`. The criteria
-are in [acceptance-criteria.md](./acceptance-criteria.md).
+Status: the design after the review of 2026-11-13, checked on 2026-11-13 against `main` at
+`891160ac`. This plan is merged (#326); no implementation is. Pull requests 0, 1 and 2 are open and
+have this design: #363 at `d6a657dd`, #364 at `e266fcbb` and #365 at `f4260135`. The core pull
+request for the wake hold is #384 at `885f8490` (issue #382). Checked against `e2b` 2.63.0 (PyPI)
+and envd 0.10.2 (`e2b-dev/runtime`, `packages/envd`). The criteria are in
+[acceptance-criteria.md](./acceptance-criteria.md).
 
 ## 1. Goal
 
@@ -13,17 +13,12 @@ A program written for the E2B Python SDK runs its sandboxes as ate-env environme
 to the program is the import of the sandbox class:
 
 ```python
-# before
-from e2b import Sandbox
-
-# after
-from ate_env_e2b import Sandbox
+from ate_env_e2b import Sandbox  # was: from e2b import Sandbox
 ```
 
 `sandbox.commands`, `sandbox.files` and `sandbox.pty` keep E2B's signatures, return types and
-exceptions. The endpoint, the token and the atespace come from the environment variables the other
-integrations already use (`SUBSTRATE_ENV_API`, `SUBSTRATE_ENV_AUTH_TOKEN`,
-`SUBSTRATE_ENV_ATESPACE`).
+exceptions. The endpoint, the token and the atespace come from `SUBSTRATE_ENV_API`,
+`SUBSTRATE_ENV_AUTH_TOKEN` and `SUBSTRATE_ENV_ATESPACE`, as in the other integrations.
 
 Non-goals:
 
@@ -31,61 +26,28 @@ Non-goals:
   in section 3).
 - E2B's template build API (`Template.build`), forks, named snapshots, volumes and the MCP gateway.
 - E2B's cloud as a backend for `SandboxFleet`.
+- The code interpreter (`e2b_code_interpreter`), in this series (D-6).
 
 ## 2. Research
 
 ### 2.1 E2B
 
-- The SDK has two planes. The control plane is REST (`POST /v2/sandboxes`, `DELETE /sandboxes/{id}`,
-  `POST /sandboxes/{id}/pause`, `POST /v2/sandboxes/{id}/connect`, `GET /v2/sandboxes`) with an
-  `X-API-KEY` header. The data plane is `envd`, a daemon inside each sandbox on port 49983.
-- `envd` serves two Connect-RPC services (`process.Process`, `filesystem.Filesystem`) and HTTP
-  routes (`/files`, `/health`, `/init`, `/metrics`). The SDK's `Commands`, `Pty` and `Filesystem`
-  classes are built on these and have no transport seam: replacing envd means rewriting them.
-- `envd` is one static Go binary (`CGO_ENABLED=0`), Apache-2.0. With `-isnotfc` it runs as a plain
-  container process without Firecracker; `-no-cgroups` removes the cgroup dependency.
-- `/init` sets the access token, the environment variables, the default user and the default working
-  directory. E2B's orchestrator calls it; the SDK never does.
-- The SDK reaches envd at `https://49983-<sandbox_id>.<domain>`, or, when
-  `ConnectionConfig.sandbox_url` is set, at that one URL with the routing in headers. The config
-  also takes `extra_sandbox_headers`, sent on each envd call.
-- `Sandbox.__init__(sandbox_id, envd_version, envd_access_token, connection_config, ...)` builds a
-  working object without any REST call. The lifecycle lives in classmethods (`_create`,
-  `_cls_connect_sandbox`, `_cls_kill`, `_cls_pause`, `_cls_get_info`, `_cls_set_timeout`, `list`).
-  Instance methods call `SandboxApi._cls_*` by class name, thus a subclass must override the
-  instance methods too.
-- `e2b_code_interpreter.Sandbox` subclasses `e2b.Sandbox`. `run_code` posts to a FastAPI server on
-  port 49999 that drives a Jupyter server; it does not use envd.
-- The SDK is MIT, needs Python 3.11 or newer, and marks `sandbox_url` and `api_url` as deprecated
-  for removal in the next major version.
+- The SDK has two planes. The control plane is REST with an `X-API-KEY` header. The data plane is
+  `envd`, a daemon inside each sandbox on port 49983.
+- `envd` serves two Connect-RPC services and HTTP routes (`/files`, `/health`, `/init`). The SDK's
+  `Commands`, `Pty` and `Filesystem` classes are built on these and have no transport seam:
+  replacing envd means rewriting them.
+- `envd` is one static Go binary, Apache-2.0. With `-isnotfc -no-cgroups` it runs as a plain
+  container process. `/init` sets its access token, environment variables and default user; E2B's
+  orchestrator calls it, the SDK never does.
+- With `ConnectionConfig.sandbox_url` set, the SDK reaches envd at that one URL and sends
+  `extra_sandbox_headers` on each envd call. The SDK constructor builds a working object without a
+  REST call.
+- The control plane has no injection point: the instance methods call `SandboxApi._cls_*` by class
+  name, and `get_api_client` has no transport hook. The private names change between minor releases.
+- The SDK needs Python 3.11 or newer, and marks `sandbox_url` as deprecated for removal in `e2b` 3.
 
-### 2.2 AgentENV
-
-AgentENV (`kvcache-ai/AgentENV`) supports the unmodified E2B SDK from the server side:
-
-- Its gateway serves E2B's REST API (a superset of E2B's OpenAPI spec) and generates `e2b_`-prefixed
-  keys so the SDK accepts them.
-- Each microVM runs unmodified upstream envd, built from a pinned `e2b-dev/runtime` ref. It sits on
-  a separate tools drive, thus the user image is not changed.
-- Users set `E2B_API_URL` and `E2B_SANDBOX_URL` to the gateway. The gateway forwards any request
-  that carries `E2b-Sandbox-Id` and `E2b-Sandbox-Port` to that port of that sandbox. Wildcard
-  hostnames are optional and off by default.
-- An E2B template ID resolves to an AgentENV template, which is one snapshot of an OCI image.
-- Its code-interpreter suite is disabled, and its template build API rejects `COPY`.
-
-Lesson: the REST layer is thin. The data plane is the expensive part, and running real envd removes
-it.
-
-### 2.3 agent-sandbox
-
-- No E2B-compatible API or SDK adapter exists, merged or in an open pull request. Issues #235 and
-  #1154 ask for one; both are stale.
-- `examples/envd-sandbox` runs upstream envd with `--isnotfc --no-cgroups` on port 49983 in a plain
-  pod, and drives its HTTP routes. It proves envd runs in a container without Firecracker.
-- Each framework integration there (OpenHands, DeepAgents, OpenAI Agents SDK, NeMo Gym) subclasses
-  the framework's own class. `AgentSandboxWorkspace` is the model `AteEnvWorkspace` already mirrors.
-
-### 2.4 What sandboxenv-rl has
+### 2.2 What sandboxenv-rl has
 
 | E2B needs                          | sandboxenv-rl on `main`                                                                  |
 | ---------------------------------- | ---------------------------------------------------------------------------------------- |
@@ -99,30 +61,30 @@ it.
 | `get_host(port)` hostname          | Missing: the port proxy has header and path forms, no hostname form                      |
 | Egress rules                       | Missing: no per-environment network policy                                               |
 
-The guest's own file API has only read and write (#78). This plan does not need more, because envd
-serves the file calls.
-
 ## 3. Options
 
-| Option                                                              | Server change                                                          | Covers                               | Cost                                                                                        |
-| ------------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------- |
-| A. Subclass of `e2b.Sandbox`, envd as a runtime layer (recommended) | none for the core; D-8 can add an opt-in answer form to the port proxy | Python SDK, sync and async           | One small package; lifecycle overrides track the SDK's private classmethods                 |
-| B. E2B REST API on ate-env-api, envd as a runtime layer             | a new REST surface                                                     | Python, JS, CLI, with no code change | A second public API to keep compatible; `sandbox_url` removal forces wildcard DNS and TLS   |
-| C. Duck-typed class over `ate_env_rl`, no envd                      | file RPCs (#78), user                                                  | Python, only the methods we rewrite  | Rewrites `commands`, `files`, `pty` and their streaming semantics; drifts with each release |
-
-Option A is the request ("only swapping the python class") and the pattern of
-`integrations/openhands`: subclass the framework's class, inject its daemon as a layer, reach it
-through the port proxy. Option A's layer is also the data plane of option B, thus B stays possible
-later. Option C is rejected: it is the most code and the least compatible.
+- **A (chosen).** A subclass of `e2b.Sandbox`, with real envd as a runtime layer. Covers the Python
+  SDK, sync and async. Server change: two generic core changes with no E2B dialect, the
+  `--add-capability` flag (#363) and the wake hold of the port proxy (section 4.2).
+- **B.** E2B's REST API on ate-env-api, with the same layer. Covers Python, JS and the CLI with no
+  code change. Cost: a second public API, and wildcard DNS and TLS once `sandbox_url` is removed. It
+  stays possible later, because the layer of A is its data plane.
+- **C (rejected).** A duck-typed class over `ate_env_rl`, without envd. It rewrites `commands`,
+  `files` and `pty`, and drifts with each SDK release.
 
 ## 4. Design
 
+This section describes planned code: the layer and its template are pull request 1 (#364), the class
+is pull request 2 (#365).
+
 ### 4.1 The envd runtime layer
 
-`integrations/e2b/layer` builds an image that holds the envd binary, built from a pinned
-`e2b-dev/runtime` commit with its Apache-2.0 licence. Upstream tags no envd release after
-`envd-v0.6.13` and has no notice file, thus the pin is the commit that released the version. A base
-template mounts it:
+`integrations/e2b/layer` builds an image that holds upstream's released envd binary and its
+Apache-2.0 licence. The binary is static, and upstream publishes a sha256 next to it:
+`https://storage.googleapis.com/e2b-artifact-binaries/envd/v<version>/envd` for amd64 and
+`.../v<version>/arm64/envd` for arm64. The pins are one envd version and two checksums. There is no
+source build, thus no builder image and no module proxy at build time; only a patched envd would
+need one, and the series carries no patch (D-9). A base template mounts the layer:
 
 ```bash
 ate-env manifest template --template e2b-base \
@@ -137,107 +99,79 @@ ate-env manifest template --template e2b-base \
 
 envd sets the user, the group and the groups of each process it starts, also for root. An actor's
 container has only `AUDIT_WRITE`, `KILL` and `NET_BIND_SERVICE`, thus without `SETUID` and `SETGID`
-no process starts. `CHOWN` is for a file written as another user; `DAC_OVERRIDE` and `FOWNER` let
-root read and re-mode the files of the other users. `--add-capability` is pull request 0 (#363).
+no process starts. `CHOWN`, `DAC_OVERRIDE` and `FOWNER` are for the files of other users.
 
-The rootfs image needs `/bin/sh`, which envd starts each process through, and `/bin/bash`, which the
-SDK runs each command and each PTY in. envd itself is static and runs on a musl image.
+`--add-capability` is pull request 0 (#363). The CLI validates each name against Substrate's
+accepted list, and a repeated name is harmless. The capabilities are effective only for a container
+that runs as root (section 5, item 6).
 
-Template derivation keeps the layer, thus an environment on any `rootfs_image` starts envd. envd
-needs an image whose `USER` is root or not set (section 5, item 6). The golden snapshot of a derived
-template has envd already listening.
+The rootfs image needs `/bin/sh` (envd starts each process through it) and `/bin/bash` (the SDK runs
+each command and each PTY in it). Template derivation keeps the layer, thus an environment on any
+`rootfs_image` starts envd.
 
 ### 4.2 The class
 
 Package `ate-env-e2b` in `integrations/e2b`, import `ate_env_e2b`, depending on `ate-env-rl` and
 `e2b>=2.63,<3`. It exports `Sandbox(e2b.Sandbox)` and `AsyncSandbox(e2b.AsyncSandbox)`, and
-re-exports E2B's exceptions and result types so one import line changes.
+re-exports E2B's exceptions and result types.
 
-`create`:
+**Public names only.** The class overrides only public names of the SDK: the public `create`, and
+`connect`, `kill`, `pause`, `get_info` and the other methods with an instance form and a class form,
+through a descriptor of our own. It does not use `_create`, `_cls_*`, `_envd_api`,
+`_resolve_api_params` or `class_method_variant`. Three couplings remain: the SDK constructor,
+`ConnectionConfig(sandbox_url=..., extra_sandbox_headers=...)` and `ApiParams`. The
+`ConnectionConfig` carries an API key and an API URL that cannot reach E2B, thus an SDK path that
+the class does not map fails closed.
 
-1. Resolve the template (section 4.4) and call `CreateEnvironment` with a generated id.
-2. Wait for envd's `/health` through the port proxy. Delete the environment if the wait fails.
-3. `POST /init` with the access token and `envs`. The class sends no `defaultUser` and no
-   `defaultWorkdir`: commands run as `root` in `/root`, which is envd's default, and `user=` and
-   `cwd=` on a call change them (D-4). `e2b.Sandbox.create` has no `user` or `cwd` argument.
-4. Build the object with
-   `ConnectionConfig(sandbox_url=<SUBSTRATE_ENV_API>, extra_sandbox_headers=...)`. The headers are
-   `X-Env-Id`, `X-Env-Atespace`, `X-Env-Port: 49983`, `X-Env-Authorization` and `X-Access-Token`.
+**One async core.** The control-plane mapping is written once, as coroutines. `Sandbox` calls it
+through `LoopRunner`, never `asyncio.run()`, and `AsyncSandbox` awaits it. For an `https://`
+endpoint the core passes `credentials=grpc.ssl_channel_credentials()` to `ate_env_rl.Client`.
 
-From there the SDK's own `commands`, `files` and `pty` run unchanged against real envd. The sync
-class reaches `ate_env_rl` through `LoopRunner`, never `asyncio.run()`. For an `https://` endpoint
-the class passes `credentials=grpc.ssl_channel_credentials()` to `ate_env_rl.Client`, which then
-opens the secure channel itself and keeps its auth and trace interceptors (#360). Pull request 2
-(#365) predates that argument: it opens a `grpc.aio.secure_channel` and passes it as `channel`, as
-the NeMo Gym provider does, and changes to `credentials` when it takes `main`.
+**`create`.** Resolve the template (section 4.4) and call `CreateEnvironment`. Wait for envd's
+`/health` through the port proxy. `POST /init` with `envs` only: commands run as `root` in `/root`,
+envd's default, and `user=` and `cwd=` on a call change them (D-4). Refuse an image that does not
+run as root (D-9). Build the object with the headers `X-Env-Id`, `X-Env-Atespace`,
+`X-Env-Port: 49983`, `X-Env-Authorization` and the wake-hold header. A failure after the create
+deletes the environment. From there the SDK's own `commands`, `files` and `pty` run unchanged
+against real envd.
 
-The SDK expects E2B's proxy to answer `502` with `was not found` for a sandbox that is gone, and
-maps that answer to `SandboxNotRunningException` on the HTTP path and on the Connect path
-(`envd/api.py`, `envd/rpc.py`). The port proxy answers `404` for a deleted or deleting environment,
-`410` for a crashed one, and `503` with `Retry-After: 1` when a suspended one wakes longer than the
-router's timeout (`internal/portproxy/portproxy.go`); it does not send the request again. On `404`
-the stock `is_running` raises `NotFoundException`, `files.exists` returns `False` and `files.read`
-raises `FileNotFoundException`. The SDK retries no status on the data plane: its envd clients use
-`ConnectionRetryTransport`, which retries connection errors only (the `429`, `502`, `503` and `504`
-retry of `e2b/retry.py` is on the REST client), thus neither a `502` nor a `503` during a wake is
-tried again. A `/health` probe wakes a suspended environment.
+**No envd access token (D-3).** The class sends no `accessToken` to `/init` and no `X-Access-Token`.
+A token adds no protection: each holder of the API token can derive an HMAC token, the port proxy
+already requires the API token, and code in the environment runs as root in the same container as
+envd. It also adds a race (section 5, item 3).
 
-The class therefore reads `GetEnvironment` before envd in `is_running`, `get_info` and `pause`; pull
-request 2 (#365) has this. The data plane needs two more behaviours, and #365 has neither:
+**A suspended environment (D-8a).** The port proxy answers `503` with `Retry-After: 1` when a wake
+takes longer than the router's timeout, and the SDK retries no status on the data plane. The port
+proxy therefore gets a generic, opt-in hold: a request with the header `X-Env-Wake-Wait` (working
+name) waits while the environment wakes. It is a separate core pull request with no E2B dialect
+(section 6). The class sends the header.
 
-1. A call on a deleted or crashed environment raises `SandboxNotRunningException` (E2B-16, E2B-19).
-2. A call during a wake waits and then succeeds (E2B-16, E2B-17, E2B-20).
-
-The SDK builds its HTTP client and its Connect clients in module-level factories (`get_envd_api`,
-`create_rpc_client`) on a shared transport pool, thus no per-sandbox transport exists to replace.
-Decision D-8 picks the mechanism, and it must cover both behaviours:
-
-- In the class: swap the private clients of each object for ones on a translating transport. `404`
-  and `410` raise `SandboxNotRunningException` with the proxy's message, and `503` is retried after
-  `Retry-After` until `request_timeout`. No server change.
-- In the port proxy: for a request that asks for it, answer `502` with `was not found` for a
-  deleted, deleting or crashed environment, and hold a request to a waking environment until the
-  environment serves or the wake budget ends. A `502` or a `503` for a waking environment is not
-  enough, because the SDK retries neither.
-
-Until that pull request, a data-plane call on a gone, crashed or waking environment gets the port
-proxy's answer through the SDK's stock mapping.
-
-The envd access token is an HMAC, keyed with the API token, of `f"{atespace}/{env_id}"`; `/` is in
-neither label, thus two pairs never share an input. `Sandbox.connect(sandbox_id)` in another process
-derives it again, thus no store is needed. Without an API token there is no envd token, the same
-trust level as the port proxy without auth.
+**A gone or crashed environment (D-8b).** The control-plane methods read `GetEnvironment` first. On
+the data plane the port proxy answers `404` for a deleted environment and `410` for a crashed one,
+where E2B's proxy answers `502`. Phase 1 does not translate: a translating transport in the class
+needs the SDK's private clients in three objects. A program gets the SDK's stock mapping of the
+proxy's answer, and `integrations/e2b/README.md` documents which exception that is.
 
 ### 4.3 Method mapping
 
-| E2B                                                                                                       | ate-env                                                                                                                                                                                                                                                                               | Phase |
-| --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
-| `create`, `with Sandbox.create()`                                                                         | `CreateEnvironment`, health wait, `/init`                                                                                                                                                                                                                                             | 1     |
-| `kill` (returns `False` when gone)                                                                        | `DeleteEnvironment`                                                                                                                                                                                                                                                                   | 1     |
-| `pause`                                                                                                   | `GetEnvironment`, then `SuspendEnvironment` durable; `False` when already suspended; `mode="filesystem"`, `keep_memory=False` and `strict=True` raise                                                                                                                                 | 1     |
-| `beta_pause`                                                                                              | `pause` (the SDK's own alias)                                                                                                                                                                                                                                                         | 1     |
-| `connect` (resumes a paused sandbox)                                                                      | `GetEnvironment`, then the health wait, which wakes it; `on_resume="reboot"` raises                                                                                                                                                                                                   | 1     |
-| `get_info`, `is_running`                                                                                  | `GetEnvironment` and status mapping first; envd `/health` only on a running environment                                                                                                                                                                                               | 1     |
-| `commands.*`, `pty.*`, `files.*`, `git.*`                                                                 | inherited: envd through the port proxy (`sandbox.git` runs its commands through `commands`; the SDK deprecates it)                                                                                                                                                                    | 1     |
-| `envs`, `user`, `cwd`                                                                                     | `envs` of `create` through envd `/init`; `envs`, `user=` and `cwd=` of a call through envd's own per-call handling; the default is `root` in `/root`                                                                                                                                  | 1     |
-| `AsyncSandbox`                                                                                            | the same overrides on the async class                                                                                                                                                                                                                                                 | 2     |
-| `e2b_code_interpreter.Sandbox.run_code`, `*_code_context`                                                 | a second layer (the code-interpreter server, port 49999); `_jupyter_url` overridden to the path form `/v1alpha/atespaces/<atespace>/envs/<id>/ports/49999` and `_client` to send `X-Env-Authorization`, because the stock client sends `E2b-Sandbox-Port` without the sandbox headers | 3     |
-| `timeout`, `set_timeout`                                                                                  | needs a time to live on the environment                                                                                                                                                                                                                                               | 4     |
-| `metadata`, `Sandbox.list`                                                                                | needs labels and a list RPC                                                                                                                                                                                                                                                           | 4     |
-| `get_host`, `download_url`, `upload_url`                                                                  | needs a hostname form on the port proxy                                                                                                                                                                                                                                               | 4     |
-| `allow_internet_access=False`, `network`, `update_network`                                                | needs per-environment egress policy in Substrate                                                                                                                                                                                                                                      | none  |
-| `fork`, `create_snapshot`, `list_snapshots`, `delete_snapshot`, `get_metrics`                             | no equivalent                                                                                                                                                                                                                                                                         | none  |
-| `volume_mounts`, `mcp`, `get_mcp_url`, `get_mcp_token`, `iam`, `lifecycle`, `create(idempotency_key=...)` | no equivalent                                                                                                                                                                                                                                                                         | none  |
+| E2B                                                         | ate-env                                                         |
+| ----------------------------------------------------------- | --------------------------------------------------------------- |
+| `create`, `with Sandbox.create()`                           | `CreateEnvironment`, health wait, `/init`                       |
+| `kill`                                                      | `DeleteEnvironment`                                             |
+| `pause`, `beta_pause`                                       | `GetEnvironment`, then `SuspendEnvironment`, durable (D-5)      |
+| `connect` (resumes a paused sandbox)                        | `GetEnvironment`, then the health wait, which wakes it          |
+| `get_info`, `is_running`                                    | `GetEnvironment`; envd `/health` only on a running environment  |
+| `commands.*`, `pty.*`, `files.*`, `git.*`                   | Inherited: envd through the port proxy                          |
+| `timeout`, `set_timeout`                                    | Refused or warned (D-2) until an environment has a time to live |
+| `metadata`, `Sandbox.list`                                  | Refused until environments have labels and a list RPC           |
+| `get_host`, `download_url`, `upload_url`                    | Refused until the port proxy has a hostname form                |
+| `allow_internet_access=False`, `network`, `update_network`  | Refused: needs per-environment egress policy in Substrate       |
+| Forks, snapshots, metrics, volumes, MCP, `iam`, `lifecycle` | Refused: no equivalent                                          |
 
-A method or argument without an implementation raises E2B's `SandboxException` and names
-`integrations/e2b/README.md`, the user's document of the package. It never does nothing. This
-matters most for the egress arguments: a program that asks for no internet access must not get an
-open network.
-
-Until phase 4, `timeout` is the one exception: the default E2B program passes none and relies on
-`kill` or the context manager. Each `create` or `connect` call with a `timeout` emits a
-`TimeoutNotEnforcedWarning` (a `UserWarning`, through `warnings.warn`, not `logging`), because no
-server enforces the timeout, and `set_timeout` raises.
+Refusals are one table bound to the SDK's public signatures, and the default is to refuse: an
+argument that is not `None` and not on the allow-list, and a public callable of the SDK base that is
+neither mapped nor on the explicit inherited list. A new SDK argument or method is thus refused,
+never ignored. Group R of the criteria has the rule.
 
 ### 4.4 Templates
 
@@ -250,117 +184,121 @@ E2B's `template` is an opaque string that the server resolves. Here:
 3. No template, or E2B's default `base`, uses the base template itself.
 4. Anything else raises `TemplateException`.
 
-In each case the image must run as root: its `USER` is root or not set (section 5, item 6).
-
 `e2b.Dockerfile` templates are built and pushed with Docker, then used by digest. E2B's start
-command has no equivalent yet; a start command is a second `--sidecar` on a registered template.
+command is a second `--sidecar` on a registered template.
 
-## 5. Risks to check first
+## 5. Findings of the checks
 
-Each is a criterion in group V. Phase 1 starts with them, on Kind, before the class is written.
-Results are from 2026-11-11: Kind, gVisor, Substrate `274605f1`, envd 0.10.2, `e2b` 2.63.0. Items 1
-to 3 are the Kind test of pull request 1 (#364); item 4 was checked by hand.
+From 2026-11-11: Kind, gVisor, Substrate `274605f1`, envd 0.10.2 built from source, `e2b` 2.63.0,
+images that run as root. Group V of the criteria has the results that are criteria.
 
-1. envd under gVisor: starts with `-isnotfc -no-cgroups`, survives suspend and restore, and its
-   process table and watchers are correct after a restore from the golden snapshot. **Result:**
-   holds, with the five capabilities of section 4.1. Without `SETUID` and `SETGID` envd answers
-   `/health` and each process start fails with `operation not permitted`. A process and a watcher
-   survive a suspend and the wake. envd runs in a glibc image and in Alpine.
-2. Users: envd looks up its default user in the image. `/init` must set a user that exists in an
-   arbitrary task image (the image's user, else root). **Result:** envd's own default is `root`.
-   `/init` with `defaultUser` changes it, and one call can name another user. envd starts a command
-   in the home of its user and refuses the command when the home does not exist (`nobody` on
-   Debian). Pull request 2 (#365) sends neither field: the default stays `root` in `/root`. A
-   default user other than root needs `defaultWorkdir` with it.
-3. `/init` repeat: whether a second `/init` after a resume or a `connect` is accepted, and what
-   protects an envd that has no token yet. **Result:** the first `/init` with a token sets it. After
-   that envd answers `401` to a call without the token and to an `/init` with another token or none,
-   and accepts an `/init` with the same token: the derived token of section 4.2 can be sent again
-   after each resume and each `connect`. Before the first `/init`, the port proxy's caller token is
-   the only guard, and a process inside the environment can reach envd on localhost and set a token
-   first.
-4. Transport: the port proxy speaks HTTP/1.1 to the daemon. Check that the SDK's Connect client
-   (default `E2B_HTTP_VERSION=2`) streams output and input through ate-env-api's listener. The SDK's
-   pyqwest transport negotiates HTTP/2 through TLS ALPN only and sends HTTP/1.1 on plaintext
-   `http://`, thus the HTTP/2 check needs TLS in front of `ate-env-api`. **Result:** holds on both.
-   The stock SDK, built with `sandbox_url` and `extra_sandbox_headers`, runs commands, gets stdout
-   as it arrives, sends stdin, drives a PTY, watches a directory and moves a 100 MiB file each way
-   with a matching sha256, on plaintext HTTP/1.1 and on HTTP/2 through a TLS front. The first
-   command after a suspend wakes the environment, and a background process is still listed.
-5. `sandbox_url` removal in `e2b` 3: the fallback is a `ConnectionConfig` subclass that overrides
-   `get_sandbox_url` and `get_sandbox_direct_url`: `SandboxBase` builds `envd_api_url` and
-   `envd_direct_url` from them, `_file_url` reads the direct one, and the code interpreter calls
-   `get_sandbox_url` with port 49999. The drift check in section 7 watches for it. **Result:** not
-   checked; no `e2b` 3 exists.
-
-The checks added three risks:
-
-6. The image's `USER`. The Substrate pin (`274605f1`) contains `5d226a50`, thus a container runs as
-   the image's `USER`. Substrate sets no ambient capabilities (`internal/ocispec/ocispec.go`), thus
-   a non-root process has no effective capability and `--add-capability` does not help it;
-   Substrate's own test wants `CapEff` 0 for a non-root `USER` (`internal/e2e/suites/imagefs`). The
-   checks of items 1 to 4 used images that run as root. Not run on Kind (E2B-34): an image with a
-   non-root `USER`. The expected result is that envd answers `/health`, thus `create` succeeds, and
-   that each process start fails with `operation not permitted`, as for root without `SETUID` and
-   `SETGID` (item 1). Phase 1 therefore requires an image whose `USER` is root or not set, and
-   `integrations/e2b/README.md` must name this limit. A flag on `ate-env manifest template` cannot
-   run the container as root: the actor template of the pin has no field for the user, and its
-   `SecurityContext` holds capabilities only. Decision D-9 has the options for such an image and
-   their order.
-7. `/bin/bash`. The SDK runs each command and each PTY in `/bin/bash -l -c`. An image without it
-   (Alpine) serves the file calls and fails each command. The class must say so in the error, not
-   pass envd's `nice: can't execute '/bin/bash'` through.
-8. TLS trust. The SDK verifies an `https://` endpoint against the system certificate store only: it
-   has no option for a CA file, and on macOS it ignores `SSL_CERT_FILE`. An ate-env-api behind a
-   private CA needs that CA in the system store of the client.
+1. envd under gVisor holds, with the five capabilities of section 4.1 (E2B-1, E2B-2).
+2. Users: envd's default user is `root`, and `/init` with `defaultUser` changes it. envd refuses a
+   command when the home of its user does not exist, thus a default user other than root needs
+   `defaultWorkdir` with it. The class sends neither field.
+3. `/init` and the token: the first `/init` with a token sets it, and envd then answers `401` to a
+   call without it. Before that, a process inside the environment can reach envd on localhost and
+   set a token first: a `create` that sends a token then fails. This is one reason for D-3.
+4. Transport: the stock SDK works through the port proxy on plaintext HTTP/1.1 and on HTTP/2 through
+   a TLS front (E2B-5).
+5. `sandbox_url` removal in `e2b` 3: not checked; no `e2b` 3 exists. The fallback is a
+   `ConnectionConfig` subclass that overrides `get_sandbox_url` and `get_sandbox_direct_url`.
+6. The image's `USER`. At the Substrate pin a container runs as the image's `USER`. Substrate sets
+   no ambient capabilities, thus `--add-capability` does not help a non-root process, and the actor
+   template has no field for the user. The Kind test of the layer in #364 records the case (E2B-34):
+   envd answers `/health` and starts no process. D-9 has the decision.
+7. `/bin/bash`. An image without it (Alpine) serves the file calls and fails each command. The class
+   must say so in the error, not pass envd's `nice: can't execute '/bin/bash'` through.
+8. TLS trust. The SDK verifies an `https://` endpoint against the system certificate store only, and
+   on macOS it ignores `SSL_CERT_FILE`. A private CA must be in the system store of the client.
 
 ## 6. Phases and pull requests
 
-| Phase | Pull request                                                                                                                                                                                                                                             | Depends on |
-| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| 1     | 0. `ate-env manifest template --add-capability` (#363)                                                                                                                                                                                                   |            |
-| 1     | 1. The envd layer, its template script, and the group V checks as a Kind test (#364); the Kind check of an image with a non-root `USER` (E2B-34) goes into the same test                                                                                 | 0          |
-| 1     | 2. `ate_env_e2b.Sandbox`: lifecycle, refusals, unit tests against a fake ate-env-api, CI job and Nix shell, README and integrations table (#365)                                                                                                         | 1          |
-| 1     | 3. The data-plane error mapping and the wake handling that D-8 picks (E2B-16, E2B-17, E2B-19, E2B-20), the refusal of an image with a non-root `USER` in `create` (E2B-35), live E2E test with the class on Kind, the conformance script, `examples/e2b` | 2          |
-| 2     | 4. `AsyncSandbox`                                                                                                                                                                                                                                        | 2          |
-| 3     | 5. Code-interpreter layer and `ate_env_e2b.code_interpreter.Sandbox`                                                                                                                                                                                     | 2          |
-| 4     | 6. Environment time to live: API field, enforcement, `timeout` and `set_timeout`                                                                                                                                                                         | 2          |
-| 4     | 7. Environment labels and `ListEnvironments`: `metadata`, `Sandbox.list`                                                                                                                                                                                 | 2          |
-| 4     | 8. Hostname form on the port proxy: `get_host`, signed file URLs                                                                                                                                                                                         | 2          |
-| 5     | 9. An image with a non-root `USER` runs as its own user: the layer's envd makes no credential change for that user, and the class refuses `user=` for another one (D-9 option 3, E2B-36)                                                                 | 1, 3       |
+| Pull request | Content                                                                             | After |
+| ------------ | ----------------------------------------------------------------------------------- | ----- |
+| 0 (#363)     | `ate-env manifest template --add-capability`                                        |       |
+| 1 (#364)     | The envd layer, its template script, the Kind test of the layer                     | 0     |
+| 2 (#365)     | `ate_env_e2b.Sandbox`, `AsyncSandbox` if it stays thin, the Kind test of the class  | 1     |
+| core         | The opt-in wake hold of the port proxy: a separate core pull request, with an issue |       |
+| later        | Environment time to live: API field, enforcement, `timeout` and `set_timeout`       | 2     |
+| later        | Environment labels and `ListEnvironments`: `metadata`, `Sandbox.list`               | 2     |
+| later        | Hostname form on the port proxy: `get_host`, signed file URLs                       | 2     |
+| later        | The scheduled drift job (section 7)                                                 | 2     |
 
-Phase 4 items change `proto/ateenv/v1alpha` and are useful beyond E2B (the limits in the READMEs of
-`integrations/openhands` and `integrations/nemo-gym` name the missing time to live, and those of
-`integrations/openhands` and `integrations/harbor` the missing labels). Each gets its own issue
-before work starts. Option B, the REST surface, is a later decision and reuses the layer and
-phase 4.
+The core pull request for the wake hold is #384, and its issue is #382: the header is
+`X-Env-Wake-Wait: <seconds>`, capped by `-port-proxy-wake-wait-cap`.
+
+- The Kind test of the layer proves only our layer: envd starts, the capabilities suffice, the port
+  proxy reaches it, `401` without the API token, suspend and resume, and what envd does on an image
+  with a non-root `USER` (E2B-34).
+- Pull request 2 also has the refusal table, the unit tests against a fake ate-env-api, the CI job,
+  the Nix shell and the README. Its Kind test is the conformance proof: the class against real envd
+  through the public SDK surface (E2B-27). If `AsyncSandbox` does not stay thin, it is a pull
+  request of its own after 2.
+- The class sends the wake-hold header from pull request 2 on; the hold works when the core pull
+  request merges.
+- Each "later" item gets its own issue before work starts. The first three are useful beyond E2B.
+- Not in this series: the code interpreter (D-6) and an envd change for non-root images (D-9).
 
 ## 7. Drift check for a new `e2b` release
 
-1. Download the wheel into a directory of its own. Read it; do not import it.
-2. Diff `sandbox/main.py`, `sandbox_sync/main.py`, `sandbox_async/main.py`,
-   `sandbox_sync/sandbox_api.py` and `sandbox_async/sandbox_api.py` against the last checked
-   version: new or renamed `_cls_*` classmethods, new `create` arguments, changes to `SandboxOpts`
-   and `SandboxBase`.
-3. Diff `connection_config.py` (`sandbox_url`, `extra_sandbox_headers`, `get_sandbox_url`,
-   `get_sandbox_direct_url`) and `envd/api.py`, `envd/rpc.py` and `envd/client_shared.py` (the
-   status-code mapping of section 4.2).
-4. Diff `envd/versions.py` against the pinned envd version, and bump the layer when the SDK gates a
-   feature on a newer envd.
-5. Run the conformance test (E2B-25) with the new version, then move the upper bound.
-6. When the layer carries a change to envd (D-9 option 3, E2B-36): check that the change still
-   applies to the pinned envd version after a bump of step 4, and run its Kind check again.
+A scheduled CI job, planned and not built (E2B-37): each week, against the newest `e2b` below 3, it
+runs the structural tests (public names only; the refuse-by-default guards, E2B-28) and the Kind
+test of the class (E2B-27).
 
-## 8. Open decisions
+Manual, because a job cannot do it:
 
-| ID  | Decision                                                                                                                                                                                                                                                                                                                                                                                                   | Recommendation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D-1 | Option A, B or C                                                                                                                                                                                                                                                                                                                                                                                           | A now; B later if the JS SDK or the CLI is needed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| D-2 | `timeout` before phase 4: warn, or refuse a non-default value                                                                                                                                                                                                                                                                                                                                              | Warn, with a `TimeoutNotEnforcedWarning` on each call as in pull request 2 (#365); refuse `set_timeout`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| D-3 | envd token: derived HMAC, or random and stored                                                                                                                                                                                                                                                                                                                                                             | Derived, until environments carry labels                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| D-4 | Default user: root, the image's user, or require `user`                                                                                                                                                                                                                                                                                                                                                    | Root in `/root`, envd's default, as in pull request 2 (#365). The image's user is a later change: it needs `defaultWorkdir`, and at the pin envd does not work in an image with a non-root `USER` (section 5, item 6)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| D-5 | `pause` mode: durable, or `SUSPEND_MODE_LOCAL`                                                                                                                                                                                                                                                                                                                                                             | Durable; E2B programs expect a paused sandbox to survive                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| D-6 | Code interpreter in this series, or after a user asks                                                                                                                                                                                                                                                                                                                                                      | In the series, after phase 2                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| D-7 | Python floor 3.11 (the SDK's) in a repository whose client is 3.10                                                                                                                                                                                                                                                                                                                                         | Accept 3.11 for this package only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| D-8 | How a call on a gone, crashed or waking environment behaves as on E2B (section 4.2): the class swaps the private clients of each object for ones on a translating transport that also retries `503`, or the port proxy, for a request that asks for it, answers a gone or crashed environment in E2B's dialect (`502`, `was not found`) and holds a request to a waking environment until it serves        | The port proxy, with both parts: no coupling to SDK internals, and it also serves a later REST surface (option B). The `502` answer alone leaves a long wake as an error, because the SDK retries no status on the data plane                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| D-9 | An image whose `USER` is not root (section 5, item 6): (1) phase 1 takes root images only and `create` refuses another image; (2) Substrate gets a run-as-user field on the actor template, and `ate-env manifest template` a `--user` flag; (3) the envd of the layer starts a process without a credential change when the target user is the user it runs as; (4) ambient or file capabilities for envd | 1 now, with the refusal in `create` and the Kind check (E2B-34, E2B-35). 3 next, as a pull request of its own after the Kind check shows what envd does on such an image (E2B-36): the image then works as its own user only, `user=` for another user is refused, and the drift check gets the patch to follow. The change must also make that user envd's default user and its home the default working directory (in `/init`, or when envd does not run as root): envd's built-in default user is `root`, and a file call without a user resolves to the default user before it changes the owner of the file. 2 is the full answer, with `user="root"` and `user="user"` as on E2B; it is requested in agent-substrate/substrate#3245 and needs a pin bump. Not 4: Substrate sets no ambient capabilities (agent-substrate/substrate#1187 asks for them), file capabilities need extended attributes that an image layer can lose, and ambient capabilities give each process of the image more than it needs |
+1. When the job fails: download the wheel into a directory of its own, read it without an import,
+   and decide for each new name whether it is mapped, inherited or refused. Then move the bounds.
+2. An envd bump: one version and two checksums. The SDK's own envd gates (`e2b/envd/versions.py`)
+   are far below the pin (the highest gate of `e2b` 2.63.0 is 0.6.4, against envd 0.10.2), thus they
+   rarely force a bump.
+3. The legs that CI cannot run: the conformance script against E2B's cloud (E2B-25) and the HTTP/2
+   check through a TLS front (E2B-5).
+4. For `e2b` 3: the `sandbox_url` fallback of section 5, item 5.
+
+## 8. Decisions
+
+All are closed, by the owner, on 2026-11-13.
+
+| ID  | Decision                                                                                            | Status |
+| --- | --------------------------------------------------------------------------------------------------- | ------ |
+| D-1 | Option A, with public SDK names only and one async core. B later if the JS SDK or the CLI is needed | closed |
+| D-2 | `timeout`: a `TimeoutNotEnforcedWarning` on each `create` or `connect` call; `set_timeout` refused  | closed |
+| D-3 | No envd access token in phase 1                                                                     | closed |
+| D-4 | Default user: root in `/root`, envd's default                                                       | closed |
+| D-5 | `pause` is a durable suspend                                                                        | closed |
+| D-6 | The code interpreter is out of this series; it comes back when a user asks                          | closed |
+| D-7 | Python floor 3.11 (the SDK's), for this package only                                                | closed |
+| D-8 | (a) A generic wake hold on the port proxy. (b) No translation of a gone environment in phase 1      | closed |
+| D-9 | Phase 1 takes images that run as root; no changed envd in the layer                                 | closed |
+
+D-6: the code interpreter needs a second layer and more private overrides.
+
+D-9: `create` refuses an image whose `USER` is not root (E2B-35), and the Kind test of the layer
+records what envd does on one (E2B-34). The full answer is a run-as-user field in Substrate
+(agent-substrate/substrate#3245). A changed envd in our layer (option 3) is dropped, because it
+means carrying a patch to third-party code; this reverses the "3 next" part of the recommendation of
+2026-11-12. Ambient and file capabilities (option 4) stay rejected.
+
+## 9. Changes on 2026-11-13
+
+- The class uses public SDK names only; before, it overrode `_create` and `_cls_*`.
+- One async core; `AsyncSandbox` (E2B-29) moves into pull request 2.
+- Refusals are one refuse-by-default table; E2B-22, E2B-23 and E2B-28 state the rule.
+- D-3: no envd token. E2B-21 and the token half of E2B-4 are retired; E2B-9 says "no token".
+- D-8: a generic wake hold in core (E2B-16); the "gone" fidelity is not planned (E2B-19).
+- D-6: the code interpreter leaves the series (E2B-30).
+- D-9: option 3 is dropped, with its phases row, drift step 6 and E2B-36.
+- The layer takes upstream's released envd binary, not a source build (E2B-6).
+- The Kind test of the class (E2B-27) is in pull request 2, with E2B-35; the former pull request 3
+  is gone. The Kind test of the layer is reduced (E2B-2 follows it), and gets E2B-34.
+- Criteria that test E2B's SDK or envd are folded into E2B-27: E2B-17, E2B-20, and the working
+  halves of E2B-16 and E2B-19. E2B-3 is retired. E2B-14 states the behaviour, not `LoopRunner`.
+  E2B-18 keeps only the `envs` of `create`. E2B-5 and E2B-25 each have a manual leg.
+- E2B-15 adds that the `ConnectionConfig` holds nothing that reaches E2B.
+- The drift check becomes a scheduled CI job (E2B-37, new).
+- `--add-capability` validates names in the CLI, and a repeated name is harmless.
+- D-1, D-2, D-4, D-5 and D-7 are closed as pull request 2 implements them.
+- Removed: the research on AgentENV and agent-sandbox, the pull request history of section 4.2, and
+  the prose that repeated the criteria.
