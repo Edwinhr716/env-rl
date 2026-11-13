@@ -278,6 +278,12 @@ class SubstrateBackendDriver(BackendDriver):
         # A release lost during a close does too (_return_popped), as after
         # any teardown.
         self._closing = False
+        # The image pre-flights in progress, each a task of the driver's on
+        # its caller's loop. A close cancels them (_cancel_preflights):
+        # close_async() on the caller's loop cancels no task of the caller,
+        # and a pre-flight that sleeps between two requests has no call for
+        # the channel close to cut off.
+        self._preflights: set[asyncio.Task[Any]] = set()
         # Per run id: reaps of that run in progress, and the _teardowns
         # value when its last reap ended. An acquire whose own run was reaped
         # while it created the actor owns it under WARM_POOL_RUN_ID (AC-15.10).
@@ -407,11 +413,66 @@ class SubstrateBackendDriver(BackendDriver):
         an unpooled actor, that the shutdown cancels starts a background
         delete too (_return_popped, _delete_unpooled), and a reap it cuts off
         starts one for each actor it had not deleted
-        (_delete_unreaped_in_close).
+        (_delete_unreaped_in_close). The image pre-flights in progress are
+        cancelled (_cancel_preflights).
         """
         with self._lock:
             self._teardowns += 1
             self._closing = True
+        self._cancel_preflights()
+
+    def _cancel_preflights(self) -> None:
+        """Cancel the image pre-flights in progress, each on its own loop.
+
+        They are the driver's tasks (preflight_images_async awaits one), so a
+        close on the caller's loop ends them too. A pre-flight in a request
+        is cut off by the channel close, but one that sleeps (the pool-listing
+        backoff, the golden poll, a warm call's backoff) would wake after the
+        close: on the closed channel the warmer reports a short coverage and
+        the fleet goes on to create environments, or the pre-flight dials a
+        new client through the ``client`` property that no close closes. The
+        cancelled warmer ends its calls in flight, and the server deletes
+        their probes.
+
+        A cancel for another loop arrives at the task's next await, which
+        can be after this close returned. The task is taken out of
+        _preflights here, and a pass that is not in it dials no client
+        (_preflight_client).
+        """
+        with self._lock:
+            preflights = list(self._preflights)
+            self._preflights.clear()
+        for task in preflights:
+            loop = task.get_loop()
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if loop is running:
+                task.cancel("the driver is closing")
+                continue
+            try:
+                loop.call_soon_threadsafe(task.cancel, "the driver is closing")
+            except RuntimeError:
+                # The loop is closed: the task cannot run on.
+                pass
+
+    def _preflight_client(self) -> Client:
+        """The ``client`` property for the pre-flight pass that calls it.
+
+        A pass that a close cancelled (_cancel_preflights) gets
+        CancelledError instead of a client the close would not close: the
+        cancel of a close in another thread reaches the pass only at its
+        next await. Under one lock hold with the dial, so a close either
+        cancelled the pass before, or takes the client dialed here.
+        """
+        task = asyncio.current_task()
+        with self._lock:
+            if task not in self._preflights:
+                raise asyncio.CancelledError("the driver is closing")
+            if self._client is None:
+                self._client = self._new_client()
+            return self._client
 
     async def _shutdown_async(self, cancel_calls: bool) -> None:
         """close()'s work on one loop: count a teardown, join the deletes, then
@@ -463,7 +524,18 @@ class SubstrateBackendDriver(BackendDriver):
     def close(self) -> None:
         runner = self._loop_runner
         if runner is None:
-            if not (self._owns_client and (self._client or self._extra_clients)):
+            # No loop of the driver's ever ran, but a pre-flight can be in
+            # progress on its caller's loop: end it first. It dials no client
+            # from then on, so the channels read below are all there are.
+            with self._lock:
+                preflights = bool(self._preflights)
+            if preflights:
+                self._count_teardown()
+            with self._lock:
+                clients = self._owns_client and bool(self._client or self._extra_clients)
+                if preflights and not clients:
+                    self._closing = False
+            if not clients:
                 return
             # Channels, but no loop of the driver's ever ran: close them on
             # one, stopped below.
@@ -544,7 +616,56 @@ class SubstrateBackendDriver(BackendDriver):
         A large image list goes in batches, each with its own golden wait
         of ``golden_timeout_s`` without progress; with ``fail`` the pass
         stops at the first batch that has an unready golden.
+
+        A ``close()`` or ``close_async()`` of the driver ends the pre-flight
+        with ``CancelledError``, at any point: in a request, in a sleep
+        between two requests, or between two batches.
         """
+        # The pass is a task of the driver's, so a close can cancel it
+        # (_cancel_preflights); a cancel of the caller's task reaches it
+        # through this await, which then waits for the pass to end its calls.
+        task = asyncio.ensure_future(
+            self._preflight_images_internal(
+                images,
+                observer=observer,
+                run_id=run_id,
+                probes_per_node=probes_per_node,
+                image_concurrency=image_concurrency,
+                max_rounds=max_rounds,
+                golden_timeout_s=golden_timeout_s,
+                probe_timeout_s=probe_timeout_s,
+                golden=golden,
+            )
+        )
+        # A pre-flight that starts while a close runs would dial a client
+        # the close does not close. The check and the registration are one
+        # step under the lock: a close of another thread either sees the
+        # task and cancels it, or is seen here.
+        with self._lock:
+            closing = self._closing
+            if not closing:
+                self._preflights.add(task)
+        if closing:
+            task.cancel("the driver is closing")
+        try:
+            return await task
+        finally:
+            with self._lock:
+                self._preflights.discard(task)
+
+    async def _preflight_images_internal(
+        self,
+        images: Sequence[str],
+        *,
+        observer: Any,
+        run_id: str,
+        probes_per_node: int,
+        image_concurrency: int,
+        max_rounds: int,
+        golden_timeout_s: float,
+        probe_timeout_s: float,
+        golden: str,
+    ) -> PreflightCoverage | None:
         if golden not in ("wait", "skip", "fail"):
             raise ValueError(f"golden must be wait, skip or fail, got {golden!r}")
         pinned: list[str] = []
@@ -567,7 +688,7 @@ class SubstrateBackendDriver(BackendDriver):
         # binding or any other refusal is final.
         for attempt in range(1, 4):
             try:
-                pools = await self.client.list_placement_domains(
+                pools = await self._preflight_client().list_placement_domains(
                     template_name=template, atespace=self.atespace
                 )
                 break
@@ -642,7 +763,7 @@ class SubstrateBackendDriver(BackendDriver):
             try:
                 # The warmer bounds the probes per domain by its node_slots.
                 warmer = PreflightWarmer(
-                    self.client,
+                    self._preflight_client(),
                     plan,
                     atespace=self.atespace,
                     template_name=template,

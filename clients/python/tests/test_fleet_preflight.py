@@ -19,6 +19,7 @@ land on."""
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -994,3 +995,322 @@ def test_every_report_phase_is_in_the_observability_doc():
     text = doc.read_text(encoding="utf-8")
     missing = [p for p in RunReport.ORDER if f"`{p}`" not in text]
     assert missing == [], missing
+
+
+def _driver(fake_stack):
+    """An async fleet's driver, with the pools and both goldens ready."""
+    client, fakes = fake_stack
+    _pools(fakes, "tmpl-test")
+    _ready_goldens(fakes, "tmpl-test", IMG_A, IMG_B)
+    cfg = FleetConfig(backend="substrate", endpoint=client.endpoint, template="tmpl-test")
+    return AsyncSandboxFleet(cfg).backend, fakes
+
+
+async def _preflight_in_the_listing_backoff(fake_stack, driver=None):
+    """A driver (an async fleet's unless given) whose pre-flight sleeps in the
+    pool-listing backoff: the first listing failed with a transient error."""
+    if driver is None:
+        driver, fakes = _driver(fake_stack)
+    else:
+        fakes = fake_stack[1]
+        _pools(fakes, "tmpl-test")
+        _ready_goldens(fakes, "tmpl-test", IMG_A, IMG_B)
+    fakes.environments.list_unavailable_first = 1
+    # Far above the test's waits: only the close ends this sleep.
+    driver.preflight_list_backoff = 30.0
+    task = asyncio.create_task(driver.preflight_images_async([IMG_A, IMG_B]))
+    deadline = time.monotonic() + 5.0
+    while fakes.environments.list_unavailable_first > 0:
+        assert time.monotonic() < deadline, "the first listing did not reach the server"
+        await asyncio.sleep(0.005)
+    # The failed answer is on its way; the task then sleeps 30 s.
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    return driver, fakes, task
+
+
+async def test_close_async_stops_a_preflight_that_sleeps_in_the_listing_backoff(fake_stack):
+    # close_async() on the caller's loop cancels no task of the caller, and a
+    # pre-flight between two requests has no call for the channel close to cut
+    # off. It must not wake, dial a client that no close closes and warm the
+    # pools: the close ends it, without the rest of the backoff.
+    driver, fakes, task = await _preflight_in_the_listing_backoff(fake_stack)
+
+    await asyncio.wait_for(driver.close_async(), timeout=5.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
+    assert driver._client is None and driver._extra_clients == []
+    assert fakes.environments.warm_requests == []
+
+
+async def test_a_preflight_after_a_close_runs_on_a_new_client(fake_stack):
+    # Only a pre-flight that a close overtook stops: the driver stays usable,
+    # and a pre-flight started after the close is a new one.
+    driver, fakes, task = await _preflight_in_the_listing_backoff(fake_stack)
+    await asyncio.wait_for(driver.close_async(), timeout=5.0)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
+
+    coverage = await asyncio.wait_for(driver.preflight_images_async([IMG_A, IMG_B]), timeout=10.0)
+    assert coverage is not None and coverage.complete
+    await driver.close_async()
+    assert driver._client is None and driver._extra_clients == []
+
+
+async def test_close_async_between_two_batches_stops_the_preflight_before_the_next(
+    fake_stack, monkeypatch
+):
+    # Two batches of one image. The close runs as the first batch's pass
+    # returns: the second batch must not start (no ensure, no warm call).
+    # Without the stop it ran on a new client.
+    from ate_env_rl.preflight import PreflightWarmer
+
+    client, fakes = fake_stack
+    _pools(fakes, "tmpl-test")
+    _ready_goldens(fakes, "tmpl-test", IMG_A)
+    cfg = FleetConfig(backend="substrate", endpoint=client.endpoint, template="tmpl-test")
+    driver = AsyncSandboxFleet(cfg).backend
+    driver.preflight_batch_images = 1
+    run = PreflightWarmer.run
+    closes: list[asyncio.Task] = []
+
+    async def run_then_close(self):
+        coverage = await run(self)
+        assert coverage.complete
+        # The whole close runs here, between the two batches. It is a task of
+        # its own: the close cancels the pre-flight, which is this coroutine.
+        closes.append(asyncio.ensure_future(driver.close_async()))
+        await asyncio.wait(closes)
+        return coverage
+
+    monkeypatch.setattr(PreflightWarmer, "run", run_then_close)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(driver.preflight_images_async([IMG_A, IMG_B]), timeout=10.0)
+    assert len(closes) == 1
+    await asyncio.wait_for(closes[0], timeout=5.0)
+    assert driver._client is None and driver._extra_clients == []
+    assert {r.rootfs_image for r in fakes.environments.warm_requests} == {IMG_A}
+    assert ("ate-env", "tmpl-test-" + "b" * 12) not in fakes.environments.image_templates
+
+
+async def test_close_stops_a_preflight_of_the_sync_fleet(fake_stack):
+    # The sync facade runs the pre-flight on the driver's own loop, where
+    # close() cancels every task: SandboxFleet.setup() in another thread ends
+    # at once, not at the golden timeout.
+    client, fakes = fake_stack
+    _pools(fakes, "tmpl-test")
+    _ready_goldens(fakes, "tmpl-test", IMG_A)
+    cfg = FleetConfig(
+        backend="substrate", endpoint=client.endpoint, template="tmpl-test", preflight=True,
+        max_warmpool_replicas=2, node_selector={"ate-env/domain": "d0"},
+    )
+    fleet = SandboxFleet(cfg)
+    fleet.load_tasks(_tasks())
+    setup = asyncio.create_task(asyncio.to_thread(fleet.setup))
+    try:
+        await _until(
+            lambda: ("ate-env", "tmpl-test-" + "b" * 12) in fakes.environments.image_templates,
+            "the ensure did not reach the server",
+        )
+        await asyncio.wait_for(asyncio.to_thread(fleet.close), timeout=5.0)
+        with pytest.raises(BaseException) as exc:
+            await asyncio.wait_for(setup, timeout=5.0)
+    finally:
+        await asyncio.to_thread(fleet.close)
+    assert type(exc.value).__name__ == "CancelledError", repr(exc.value)
+    assert "create" not in fakes.environments.call_log
+
+
+async def _until(cond, what: str) -> None:
+    deadline = time.monotonic() + 5.0
+    while not cond():
+        assert time.monotonic() < deadline, what
+        await asyncio.sleep(0.005)
+
+
+async def _close_under_setup(fake_stack, in_window, what: str, *, pending=(IMG_B,), **knobs):
+    """AsyncSandboxFleet.setup() with the image pre-flight and a warm pool to
+    fill after it; close_async() once ``in_window(fakes)`` holds. The setup
+    must end with CancelledError, on no new client, with no environment
+    created. Returns the fakes."""
+    client, fakes = fake_stack
+    _pools(fakes, "tmpl-test")
+    _ready_goldens(fakes, "tmpl-test", *(i for i in (IMG_A, IMG_B) if i not in pending))
+    cfg = FleetConfig(
+        backend="substrate", endpoint=client.endpoint, template="tmpl-test", preflight=True,
+        max_warmpool_replicas=2, node_selector={"ate-env/domain": "d0"}, **knobs,
+    )
+    fleet = AsyncSandboxFleet(cfg)
+    driver = fleet.backend
+    setup = asyncio.create_task(fleet.setup(_tasks()))
+    try:
+        await _until(lambda: in_window(fakes), what)
+        assert not setup.done()
+        await asyncio.wait_for(fleet.close_async(), timeout=5.0)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(setup, timeout=8.0)
+    finally:
+        if not setup.done():
+            setup.cancel()
+        await asyncio.gather(setup, return_exceptions=True)
+        clients = (driver._client, list(driver._extra_clients))
+        await driver.close_async()
+    # The close left no client open, and the pre-flight dialed none after it.
+    assert clients == (None, [])
+    # The warm pool that setup() fills after the pre-flight was not started.
+    assert "create" not in fakes.environments.call_log
+    # The server deletes the probes of the warm calls the close cut off.
+    await _until(lambda: fakes.environments.environments == {}, "probes or environments are left")
+    return fakes
+
+
+def _track_calls(monkeypatch) -> dict[str, int]:
+    """Count the warmer's calls at the client: the ones in flight, and the
+    warm calls that returned. The server's counters move before the answer
+    is back, so they cannot show that no call is in flight for the channel
+    close to cut off."""
+    from ate_env_rl import Client
+
+    calls = {"in_flight": 0, "warmed": 0}
+
+    def track(name: str) -> None:
+        orig = getattr(Client, name)
+
+        async def call(self, *args, **kwargs):
+            calls["in_flight"] += 1
+            try:
+                out = await orig(self, *args, **kwargs)
+            finally:
+                calls["in_flight"] -= 1
+            calls["warmed"] += name == "warm_image"
+            return out
+
+        monkeypatch.setattr(Client, name, call)
+
+    track("image_status")
+    track("warm_image")
+    return calls
+
+
+async def test_close_async_stops_a_preflight_in_the_golden_poll_sleep(fake_stack, monkeypatch):
+    # IMG_B's golden bakes for good; the poller sleeps 5 s (the golden
+    # timeout, below the 10 s poll). Without the stop it woke on the closed
+    # channel, gave the golden up, and setup() filled the pool on a new client.
+    # The close waits for IMG_A's warm call and both ensures to return: with
+    # one in flight, the channel close alone would end the pass.
+    calls = _track_calls(monkeypatch)
+    fakes = await _close_under_setup(
+        fake_stack,
+        lambda f: ("ate-env", "tmpl-test-" + "b" * 12) in f.environments.image_templates
+        and calls["warmed"] == 1
+        and calls["in_flight"] == 0,
+        "the ensures and IMG_A's warm call did not return",
+        preflight_golden_timeout_s=5.0,
+    )
+    assert calls == {"in_flight": 0, "warmed": 1}
+    assert fakes.environments.status_calls == 0, "the close was not in the first poll sleep"
+
+
+@pytest.mark.parametrize("golden", ["wait", "fail"])
+async def test_close_async_stops_a_preflight_with_a_golden_poll_in_flight(fake_stack, golden):
+    # The channel close cuts the GetImageStatus call off, which ends the
+    # poller: "wait" then probed on the closed channel and returned a short
+    # coverage, "fail" raised PreflightError. Both are CancelledError now.
+    client, fakes = fake_stack
+    fakes.environments.status_hold = 30.0
+    await _close_under_setup(
+        fake_stack,
+        lambda f: f.environments.status_calls > 0,
+        "no poll reached the server",
+        preflight_golden_timeout_s=0.2, preflight_golden=golden,
+    )
+
+
+async def test_close_async_stops_a_preflight_in_the_warm_call_backoff(fake_stack, monkeypatch):
+    # One WarmImage call fails with a transient error; its repeat waits 2 s.
+    # The other image's call has returned by the close: no call is in flight.
+    client, fakes = fake_stack
+    fakes.environments.warm_unavailable_first = 1
+    calls = _track_calls(monkeypatch)
+    fakes = await _close_under_setup(
+        fake_stack,
+        lambda f: f.environments.warm_calls == 2
+        and calls["warmed"] == 1
+        and calls["in_flight"] == 0,
+        "the warm calls did not return",
+        pending=(),
+    )
+    assert fakes.environments.warm_calls == 2, "the failed call was repeated"
+
+
+async def test_close_stops_a_preflight_on_a_callers_client(fake_stack):
+    # A driver on the caller's client that only ran async calls has no loop
+    # and no channel of its own, so the sync close() had nothing to do and
+    # returned before it cancelled the pre-flight, which slept on.
+    from ate_env_rl.backend.substrate import SubstrateBackendDriver
+
+    client, fakes = fake_stack
+    driver = SubstrateBackendDriver(client=client, default_template="tmpl-test")
+    driver, fakes, task = await _preflight_in_the_listing_backoff(fake_stack, driver)
+
+    await asyncio.wait_for(asyncio.to_thread(driver.close), timeout=5.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
+    assert fakes.environments.warm_requests == []
+    # The client is the caller's: still open, and the driver usable on it.
+    assert driver._client is client and driver._loop_runner is None
+    coverage = await asyncio.wait_for(driver.preflight_images_async([IMG_A, IMG_B]), timeout=10.0)
+    assert coverage is not None and coverage.complete
+
+
+async def test_close_stops_a_preflight_that_has_not_dialed_its_client(fake_stack):
+    # close() in another thread runs from start to end while the pass is in
+    # its code before the first request. The driver has no channel yet, so
+    # the close returned at once; the pass then dialed a client and warmed
+    # the pools. The close's cancel reaches the pass's loop only at its next
+    # await, which is after the dial: the pass must not dial.
+    driver, fakes = _driver(fake_stack)
+    internal = driver._preflight_images_internal
+    closes: list[threading.Thread] = []
+
+    async def close_then_pass(*args, **kwargs):
+        closes.append(threading.Thread(target=driver.close))
+        closes[0].start()
+        closes[0].join(5.0)
+        assert not closes[0].is_alive()
+        return await internal(*args, **kwargs)
+
+    driver._preflight_images_internal = close_then_pass
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(driver.preflight_images_async([IMG_A, IMG_B]), timeout=10.0)
+        assert len(closes) == 1
+        assert driver._client is None and driver._extra_clients == []
+        assert fakes.environments.warm_requests == []
+    finally:
+        await driver.close_async()
+
+
+async def test_a_close_between_the_start_of_a_preflight_and_its_registration_stops_it(fake_stack):
+    # The close of another thread counts its teardown (and cancels the
+    # registered pre-flights) after this pre-flight saw no close and before
+    # it is registered: it escaped the cancel, dialed a client and warmed.
+    driver, fakes = _driver(fake_stack)
+    internal = driver._preflight_images_internal
+
+    def teardown_then_pass(*args, **kwargs):
+        driver._count_teardown()
+        return internal(*args, **kwargs)
+
+    driver._preflight_images_internal = teardown_then_pass
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(driver.preflight_images_async([IMG_A, IMG_B]), timeout=10.0)
+        assert driver._client is None and driver._extra_clients == []
+        assert fakes.environments.warm_requests == []
+        assert driver._preflights == set()
+    finally:
+        driver._closing = False  # that close ends
+        await driver.close_async()

@@ -554,6 +554,19 @@ user needs to know across them.
   stays as a re-export of the new module, with the same names.
 
 ### Fixed
+- Python client: `close_async()` on the caller's loop ends an image pre-flight
+  (`FleetConfig.preflight`, `preflight_images_async`) at once, also one that
+  is between two requests: in its pool-listing backoff, in the golden poll,
+  in a warm call's backoff, or between two batches. Before, the pre-flight
+  woke after the close. From the listing backoff it dialed a new client,
+  warmed the pools and left that client open until the next close. From the
+  other sleeps it returned a short coverage (or `PreflightError` with
+  `preflight_golden="fail"`), and `setup()` or `run()` went on to create
+  environments on a new client. It now stops with `CancelledError`; a
+  pre-flight started after the close runs as before. The sync `close()` from
+  another thread ends it too, also on a caller's `client` and before the
+  pass dialed its own (before, that `close()` returned without a cancel),
+  and a pre-flight that starts while a close runs cannot escape the cancel.
 - Go client: `Env.Run` returns `ctx.Err()` (`context.Canceled` or
   `context.DeadlineExceeded`) when the context ends while `StartProcess` is in
   flight or while the streaming output is followed, as the polled run already

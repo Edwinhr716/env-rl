@@ -71,6 +71,10 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         self.deny_list_workers = False
         # How many ListPlacementDomains calls answer UNAVAILABLE first.
         self.list_unavailable_first = 0
+        # GetImageStatus (not the ensure): the calls seen, and the seconds
+        # each is held before its answer, so a test can act with one in flight.
+        self.status_calls = 0
+        self.status_hold = 0.0
         # The order of creates and warm calls, for tests of what came first.
         self.call_log: list[str] = []
         self.warm_same_node = False
@@ -212,6 +216,12 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         return (atespace, derived.name), atespace, derived
 
     async def GetImageStatus(self, request, context):
+        self.status_calls += 1
+        if self.status_hold:
+            await asyncio.sleep(self.status_hold)
+        return await self._get_image_status(request, context)
+
+    async def _get_image_status(self, request, context):
         key, atespace, derived = self._image_status(request)
         if key is None:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "image is not pinned by digest")
@@ -235,7 +245,7 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         existing = self.image_templates.get(key)
         if existing is None or existing.golden == env_pb2.GOLDEN_SNAPSHOT_STATE_FAILED:
             self.image_templates[key] = env_pb2.ImageStatus(golden=env_pb2.GOLDEN_SNAPSHOT_STATE_PENDING)
-        return await self.GetImageStatus(request, context)
+        return await self._get_image_status(request, context)
 
     async def ListPlacementDomains(self, request, context):
         # Mirror ate-env-api: one domain per value of the ate-env/domain label
