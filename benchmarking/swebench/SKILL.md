@@ -164,7 +164,7 @@ queues no create. Two arms, about 45 and 7 minutes:
 ... run-in-cluster.sh RUN swebench-verified-445.jsonl -mode steps -rollouts 2 -steps 50 -width 890 -park suspend -trajectory workload-file-read-one -label arm=wake ...
 ```
 
-Baseline: startup create 0.67 s, ttfi 6.4 s p50 / 39.7 s p95, step 20 to 28 s warm and 118 s on
+Baseline: startup create 0.67 s, ttfic 6.4 s p50 / 39.7 s p95, step 20 to 28 s warm and 118 s on
 the first cold steps; wake 2.1 s p50 / 5.5 s p95, step 6.6 s, no retries. The images fit the
 nodes, so the cold steps end by about step 10 and the step time settles near 20 s by step 33:
 this run does not measure image delivery.
@@ -191,12 +191,12 @@ recreate the node pool, or use at least 47 images per node, the full run's ratio
 lands on a node that holds its image. A 500 GB disk holds about 290 unpacked Prime images under
 the 70% eviction mark. Goldens are baked once beforehand and not timed.
 Baseline, plain pull on pd-balanced, measured by this recipe at width 30 on a 783-node pool: start
-arm ttfi 28.7 s p50 / 101 s p95 / 275 s max, unpack 26.8 s p50, 0.99 pulls per start; read arm
-ttfi 28.9 s / 91.7 s with the read step 573 ms p50 / 1.1 s p95; the three large images 209, 215
+arm ttfic 28.7 s p50 / 101 s p95 / 275 s max, unpack 26.8 s p50, 0.99 pulls per start; read arm
+ttfic 28.9 s / 91.7 s with the read step 573 ms p50 / 1.1 s p95; the three large images 209, 215
 and 275 s. The smoke tier gave 29.8 s p50 in 94 s of wall time. 94 starts per arm, two reps when
 the p95 matters. It measures the per-start cost without contention; a width of 160 per node measures
 contention instead, and the two are not comparable
-on ttfi.
+on ttfic.
 
 For iterating on a delivery change, a smoke tier on the same manifest: `-images 30
 -tasks-per-image 1 -width 3` on two nodes (width 10 on a cluster of hundreds of nodes) takes the
@@ -209,9 +209,10 @@ describes.
 
 ## 3. Read the report
 
-- `ttfi` is create start to first command answered; `retried` on that row counts first commands
-  that waited on a bake or a wake.
-- The `restore first` block (needs `RESTORE_LOG`) splits each first command: `download` is the
+- `ttfi` is the ask for a sandbox to the first command being issued; `ttfic` runs on to that
+  command's answer, so it holds the boot or restore wait. `retried` on the `ttfic` row counts first
+  commands that waited on a bake or a wake.
+- The `restore first` block (needs `RESTORE_LOG`) splits each first command (paired by its `ttfic` window): `download` is the
   golden from the bucket, `oci_unpack` is the image onto the node, `worker_restore` is gVisor,
   `outside` is everything atelet does not do (create, placement, router, guest readiness). No
   restore records at all means the actors booted; see check 3.

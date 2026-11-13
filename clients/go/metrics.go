@@ -40,9 +40,10 @@ const (
 	metricSourceDirect = "direct"
 )
 
-// secondsBuckets is the shared latency bucket list (50 ms to 10 min) used by
-// SEC_BUCKETS in the Python client and internal/telemetry.SecondsBuckets.
-var secondsBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600}
+// secondsBuckets is the client latency bucket list (10 ms to 10 min), the same
+// as SEC_BUCKETS in the Python client (proto/testdata/client-parity). The
+// server's internal/telemetry.SecondsBuckets starts at 50 ms.
+var secondsBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600}
 
 // clientMetrics holds the client's optional Prometheus histograms. A zero
 // value (MetricsRegisterer == nil) records nothing.

@@ -150,9 +150,10 @@ child processes, and serves `ProcessService` and `FileSystemService`.
   `swebench.PreflightWarmer`), and handles assets, traces, and reports (`trajectory-assets`,
   `convert-trace`, `report`, `compare`).
 - **`internal/benchmarking/swebench`**: Emits structured JSONL events (`EventRun`, `EventCreate`,
-  `EventTTFI`, `EventWake`, `EventStep`, `EventTask`, `EventFork`, `EventSuspend`, `EventDelete`,
-  `EventBarrier`, `EventPark`, `EventPrewarm`, `EventReap`, `EventThink`, `EventPhase`) plus
-  pre-flight events (`EventPreflightTemplate`, `EventPreflightGolden`, `EventPreflightProbe`).
+  `EventTTFI`, `EventTTFIC`, `EventWake`, `EventStep`, `EventTask`, `EventFork`, `EventSuspend`,
+  `EventDelete`, `EventBarrier`, `EventPark`, `EventPrewarm`, `EventReap`, `EventThink`,
+  `EventPhase`) plus pre-flight events (`EventPreflightTemplate`, `EventPreflightGolden`,
+  `EventPreflightProbe`).
 - **Scripts**: `sample-node-cache.sh` and `harvest-restore-timings.sh` in `benchmarking/swebench/`
   sample containerd image caches and harvest `atelet` restore logs.
 

@@ -306,7 +306,7 @@ container logs when a worker or node daemon restarted mid-run):
   checkpoint sub-phases parsed from structured `atelet` timing logs (Substrate
   `Restore`/`Checkpoint timing breakdown`: `manifest_fetch`, `download`,
   `oci_unpack`, `worker_restore`/`worker_checkpoint`, `persist`, split by
-  `golden` vs. `latest`, joined to `ttfi` on first restore and `wake` on later
+  `golden` vs. `latest`, joined to `ttfic` on first restore and `wake` on later
   restores with an `outside` remainder for time spent outside `atelet`, and
   cross-checked against client request counts to surface rotated or unreadable
   pod logs), Substrate router registry metrics (`atenet.router.parking.rejected`
@@ -515,7 +515,25 @@ while breaking the system.
    path. Per-call JSONL logging is restricted to `trace` mode.
 5. **Exact raw-event aggregation**: `Report` (`W4`) must compute percentiles
    (`p50`, `p90`, `p95`, `max`) over the merged raw event durations, never by
-   averaging percentiles across steps, shards or jobs.
+   averaging percentiles across steps, shards or jobs. When the bundle holds
+   in-window Prometheus histograms of a client family (two or more samples of
+   its `_bucket` series), the report takes that family's stat from the
+   histogram first: traces add latency of their own and are often not
+   captured, while the histogram sees every call. Its percentiles are bucket
+   estimates and its max and min come from the client's `_max_seconds` and
+   `_min_seconds` gauges, which are process-lifetime extremes accepted when
+   the series first appears inside the window or rises/falls across it, else
+   staying 0; in the rolled `measurements.json`, a first value of `-1` (min) or
+   `0` (max) shows a series that starts in the window. The reported extremes
+   cover only the label sets that start or move in the window (a long-lived,
+   flat label set is included in the count but not in the extremes), and a
+   process that restarts in the window loses its extremes as with histogram
+   counter resets. The raw-event stat is the fallback when no windowed
+   histogram exists. Each `Stat` sets `source` to `prom` when derived from
+   Prometheus series or summaries and to `events` when computed from raw trace
+   events. A single post-run `bench measure` holds one sample per series and
+   does not qualify (range queries that would let it are tracked in #271; exact
+   client-side quantiles in #272).
 6. **Non-blocking prefetch and client self-benchmarking**: Next-step pool
    prefetch and previous-step retirement (`W3`) must run asynchronously off the
    step barrier's critical path. The load generator and event recorder must

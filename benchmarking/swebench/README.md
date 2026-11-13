@@ -18,10 +18,10 @@ are wall time as a trainer sees it, API server and network included.
 
 | Question | Run shape | The numbers it produces |
 |---|---|---|
-| Cold restore: how long until a sandbox whose image is on no node can run a command | `-mode eval`, one task per image or many, on nodes that have not seen the images | `ttfi` (create start to the first command's answer), `create`, the restore phases from atelet (download, unpack, restore), pulls per start from the node cache samples |
-| Warm restore: the same when the image is already on the node | `-mode eval` with several tasks per image on a fixed pool, or a second pass | `ttfi` with unpack near zero; the gap between it and atelet's restore is the control plane |
+| Cold restore: how long until a sandbox whose image is on no node can run a command | `-mode eval`, one task per image or many, on nodes that have not seen the images | `ttfic` (the ask to the first command's answer), `create`, the restore phases from atelet (download, unpack, restore), pulls per start from the node cache samples |
+| Warm restore: the same when the image is already on the node | `-mode eval` with several tasks per image on a fixed pool, or a second pass | `ttfic` with unpack near zero; the gap between it and atelet's restore is the control plane |
 | Park and wake: what it costs to suspend a fleet and resume it for the next step | `-mode steps -park suspend`, with `-park-each` for a fleet larger than the running slots | `suspend`, `wake` p50/p95, `step_barrier` (first task start to last task end in a step), and with `-restore-log` the restore phases of each wake; a `download` phase in a wake's record is the only trace of a move to another node |
-| Image delivery: pull against streaming or another loader | `-mode eval` with the `workload-*` trajectories | `ttfi` per start and the read step's time, under the same command per mechanism |
+| Image delivery: pull against streaming or another loader | `-mode eval` with the `workload-*` trajectories | `ttfic` per start and the read step's time, under the same command per mechanism |
 
 `-park suspend` and `suspend-sync` are durable suspends: the call returns once the snapshot is in
 object storage. `-park suspend-async` is a local suspend. The call returns once the snapshot is on
@@ -39,7 +39,7 @@ from the width and the task time. `-mode open-loop -arrival-rate` sets a
 Poisson rate in tasks per second instead.
 
 The sandbox command in every shape is the trajectory. The built-in
-`workload-file-read-one` runs `true` (what `ttfi` and `wake` measure: the
+`workload-file-read-one` runs `true` (what `ttfic` and `wake` measure: the
 first instant the sandbox executes anything) and reads one file, thus the
 numbers are the platform's. `swebench-gold` replays a
 SWE-bench solution and grades it, for correctness regressions.
@@ -113,7 +113,8 @@ API server included, which is what a trainer sees):
 | Event | Meaning |
 |---|---|
 | `create` | CreateEnvironment call |
-| `ttfi` | create start to the first command's return (time to first instruction) |
+| `ttfi` | the ask for a sandbox to the first command being issued (time to first instruction) |
+| `ttfic` | the ask to the first command's return (time to first instruction complete): the boot or restore wait lives here |
 | `wake` | first command after a suspend park, including the wake it triggers |
 | `step` (by name) | each trajectory step, with exit code; the reward step carries the reward and an output tail |
 | `task` | one replay end to end, ok and reward |
@@ -168,9 +169,9 @@ room; if that node has never pulled the image, the restore pulls it first.
 
 | Cost | What it is | Where it shows | How to make a run measure it |
 |---|---|---|---|
-| Cold boot | the golden bake, the first boot of an image on a cluster | the first `ttfi` of each image when no golden exists yet; the first command is retried until the bake is done | fresh cluster, or delete the derived templates, then `-mode eval -tasks-per-image 1`; a second pass of the same command is restore only, and the difference is the bake |
-| Cold restore | restore from the golden onto a node that has not pulled the image | `ttfi` with a long `oci_unpack` phase in the restore record; a miss in the node cache delta | a fresh node pool and `-tasks-per-image 1`, so no node has seen any image |
-| Warm restore | restore from the golden onto a node that has the image | `ttfi` with `oci_unpack` near zero; a cache hit | a second pass, or `-tasks-per-image 2` and more: later creates of an image tend to land where it already is |
+| Cold boot | the golden bake, the first boot of an image on a cluster | the first `ttfic` of each image when no golden exists yet; the first command is retried until the bake is done | fresh cluster, or delete the derived templates, then `-mode eval -tasks-per-image 1`; a second pass of the same command is restore only, and the difference is the bake |
+| Cold restore | restore from the golden onto a node that has not pulled the image | `ttfic` with a long `oci_unpack` phase in the restore record; a miss in the node cache delta | a fresh node pool and `-tasks-per-image 1`, so no node has seen any image |
+| Warm restore | restore from the golden onto a node that has the image | `ttfic` with `oci_unpack` near zero; a cache hit | a second pass, or `-tasks-per-image 2` and more: later creates of an image tend to land where it already is |
 | Suspend and wake | park the fleet, resume it on the next step's first command | `suspend` and `park`, then `wake`; the restore record of a wake has no download phase when the node still holds the snapshot | `-mode steps -park suspend`; eval never suspends |
 
 By shape:
@@ -458,7 +459,7 @@ grading, for comparing conventional pull, image streaming and other loaders:
 `workload-file-read` (read a sample of files), `workload-compile`
 (byte-compile every Python file, which reads each one and writes next to it)
 and `workload-read-all` (read every file, the worst case for lazy loading).
-Each starts with a `probe` step that runs `true`, so `ttfi` is the cold start
+Each starts with a `probe` step that runs `true`, so `ttfic` is the cold start
 alone and the workload's own time is its own `step` row. They need no grading
 material, so the manifest can be image-only:
 
@@ -549,9 +550,9 @@ RESTORE_LOG=restores.jsonl benchmarking/swebench/run-in-cluster.sh pull-baseline
 atelet logs one record per actor restore with the seconds each phase took:
 manifest fetch, snapshot download, image unpack, the worker's restore, and
 the total. The actor's name is the environment's name, so the report pairs
-each record with the `ttfi` or `wake` event of that environment whose window
+each record with the `ttfic` or `wake` event of that environment whose window
 (the event's end minus its duration, up to its end) contains the record's
-time: a record inside a `ttfi` window is a first start, one inside a `wake`
+time: a record inside a `ttfic` window is a first start, one inside a `wake`
 window is a wake. The table gives p50/p95/max per phase plus an `outside`
 row, the event's span minus atelet's total, which is ateapi, the scheduler,
 the router and the command itself. The report does not call a restore cold

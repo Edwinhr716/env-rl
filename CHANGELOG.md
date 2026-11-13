@@ -340,6 +340,19 @@ user needs to know across them.
 - `uni_agent_substrate.datasets --shuffle-seed` for datasets sorted by
   repository; `resolve_images.sh` `MODE=hubapi` (Docker Hub tags API, no
   pulls), `MODE=arapi` (Artifact Registry listing) and `MIRROR_NAME_SEP`.
+- Python client: `ate_env_client_ttfi_seconds` (time to first instruction:
+  the ask for a sandbox to the first command being issued) and
+  `ate_env_client_{grade,read_file,write_file}_seconds` histograms, so the
+  sandbox latency breakdown exists without a trace; `exec(..., phase="grade")`
+  marks a grading command explicitly.
+- `bench report` reads the Prometheus histograms before trace-derived stats;
+  traces are the fallback, and each `Stat` records its `source` (`prom` or
+  `events`). The histograms count only when sampled through the run window (two
+  or more samples per series: the `measurements_snapshots/` copy loop; PR #252
+  adds the sampler flags); a single post-run scrape holds one sample and is
+  skipped. The Python client also records `<family>_max_seconds` and
+  `<family>_min_seconds` gauges, which give the report an exact max and min
+  where buckets only bound them.
 - Python client: `FleetConfig.node_selector` is sent as every environment's
   `worker_selector`, and `FleetConfig.placement` adds labels per task image;
   `SubstrateBackendDriver(worker_selector=, placement=)` and
@@ -431,6 +444,14 @@ user needs to know across them.
   installed from its checkout and imported on first use.
 
 ### Changed
+- Go and Python clients: the `ate_env_client_*` histograms in both SDKs and the
+  Python `ate_env_fleet_*` latency histograms gain `0.01` and `0.025` s buckets
+  (`SEC_BUCKETS`, 10 ms to 600 s) for sub-50 ms operations; server and guest
+  histograms keep 50 ms to 600 s.
+- The `ttfi` event from traces and the loader now ends when the first command
+  is issued, matching `ate_env_client_ttfi_seconds`; the former span (through
+  the first command's return, which holds the boot or wake wait) is the new
+  `ttfic` event, and atelet restore records pair against it.
 - `swebench-loader preflight` and `ate_env_rl.PreflightWarmer` warm the nodes
   through `ate-env-api`'s `WarmImage`, one call per (image, domain), instead
   of creating, running and deleting the probes themselves. The server's

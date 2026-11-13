@@ -41,7 +41,7 @@ from .trace_recorder import get_bench_context, is_measure_mode
 logger = logging.getLogger("ate_env_rl.telemetry.metrics")
 
 # One bucket set, in seconds, for every ate_env histogram.
-SEC_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
+SEC_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
 
 _MISSING_EXTRA_MSG = (
     "prometheus_client not installed; metrics disabled. "
@@ -197,6 +197,22 @@ SUBPHASE_FAMILIES: dict[str, tuple[str, str]] = {
         "ate_env_client_ready_to_first_command_seconds",
         "Time from environment acquire ready until the first command begins",
     ),
+    "ttfi": (
+        "ate_env_client_ttfi_seconds",
+        "Time from the ask for a sandbox (before any slot wait) until the first command is issued",
+    ),
+    "grade": (
+        "ate_env_client_grade_seconds",
+        "Time to execute a grading command in an environment",
+    ),
+    "read_file": (
+        "ate_env_client_read_file_seconds",
+        "Time to read a file from an environment",
+    ),
+    "write_file": (
+        "ate_env_client_write_file_seconds",
+        "Time to write a file into an environment",
+    ),
 }
 
 _ALLOWED_SOURCES = frozenset({"warm_pool", "cold_create", "mock", "direct"})
@@ -204,6 +220,9 @@ _ALLOWED_SOURCES = frozenset({"warm_pool", "cold_create", "mock", "direct"})
 _ENABLED = False
 _HISTOGRAMS: dict[str, Any] = {}
 _SUBPHASE_HISTOGRAMS: dict[str, Any] = {}
+# (family name) -> (max gauge, min gauge); see _observe_extremes.
+_EXTREMES: dict[str, tuple[Any, Any]] = {}
+_EXTREME_VALUES: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float, float]] = {}
 
 _SUMMARY_LOCK = threading.Lock()
 _RECORDED_OPS: dict[str, dict[str, Any]] = {}
@@ -263,6 +282,52 @@ def _subphase_histogram(phase: str) -> Any:
     return hist
 
 
+def _observe_extremes(name: str, doc: str, labelnames: list[str], labels: dict[str, str], seconds: float) -> None:
+    """Keep the largest and smallest observation of a family in two gauges.
+
+    A histogram holds counts per bucket, never an observation, so the report
+    can only place the maximum inside the last non-empty bucket. The gauges
+    ``<family>_max_seconds`` and ``<family>_min_seconds`` carry the exact
+    values, per label set, over the process lifetime, as the histogram
+    counters do. ``_EXTREME_VALUES`` lives on this module, so reloading the
+    module resets both gauges from the next observation.
+    """
+    pair = _EXTREMES.get(name)
+    if pair is None:
+        with _LOCK:
+            pair = _EXTREMES.get(name)
+            if pair is None:
+                prom = _load_prom()
+                pair = (
+                    _metric(prom.Gauge, name.removesuffix("_seconds") + "_max_seconds", doc + " (largest observation)", labelnames),
+                    _metric(prom.Gauge, name.removesuffix("_seconds") + "_min_seconds", doc + " (smallest observation)", labelnames),
+                )
+                _EXTREMES[name] = pair
+    mx, mn = pair[0].labels(**labels), pair[1].labels(**labels)
+    k = (name, tuple(sorted(labels.items())))
+    with _LOCK:
+        v = _EXTREME_VALUES.get(k)
+        if v is None:
+            _EXTREME_VALUES[k] = (seconds, seconds)
+            mx.set(seconds)
+            mn.set(seconds)
+        else:
+            cur_max, cur_min = v
+            new_max = cur_max
+            new_min = cur_min
+            changed = False
+            if seconds > cur_max:
+                new_max = seconds
+                mx.set(seconds)
+                changed = True
+            if seconds < cur_min:
+                new_min = seconds
+                mn.set(seconds)
+                changed = True
+            if changed:
+                _EXTREME_VALUES[k] = (new_max, new_min)
+
+
 def _record_inmem_op(op: str, seconds: float, status: str) -> None:
     dur_s = max(0.0, float(seconds))
     with _SUMMARY_LOCK:
@@ -275,12 +340,14 @@ def _record_inmem_op(op: str, seconds: float, status: str) -> None:
                 "cancelled": 0,
                 "sum_s": 0.0,
                 "max_s": 0.0,
+                "min_s": None,
             }
             _RECORDED_OPS[op] = entry
         entry["count"] += 1
         entry[status if status in ("ok", "error", "cancelled") else "error"] += 1
         entry["sum_s"] += dur_s
         entry["max_s"] = max(entry["max_s"], dur_s)
+        entry["min_s"] = dur_s if entry["min_s"] is None else min(entry["min_s"], dur_s)
 
 
 def _record_inmem_subphase(
@@ -300,6 +367,7 @@ def _record_inmem_subphase(
                 "error": 0,
                 "sum_s": 0.0,
                 "max_s": 0.0,
+                "min_s": None,
             }
             _RECORDED_SUBPHASES[key] = entry
         entry["count"] += 1
@@ -309,6 +377,7 @@ def _record_inmem_subphase(
             entry["error"] += 1
         entry["sum_s"] += dur_s
         entry["max_s"] = max(entry["max_s"], dur_s)
+        entry["min_s"] = dur_s if entry["min_s"] is None else min(entry["min_s"], dur_s)
 
 
 def observe(op: str, seconds: float, status: str = "ok") -> None:
@@ -321,6 +390,8 @@ def observe(op: str, seconds: float, status: str = "ok") -> None:
     _record_inmem_op(op, seconds, status)
     if _ENABLED and op in CLIENT_FAMILIES:
         _histogram(op).labels(status=status).observe(seconds)
+        name, doc = CLIENT_FAMILIES[op]
+        _observe_extremes(name, doc, ["status"], {"status": status}, seconds)
 
 
 def observe_subphase(
@@ -342,6 +413,10 @@ def observe_subphase(
         _subphase_histogram(phase).labels(
             status=status, source=bounded_source
         ).observe(seconds)
+        name, doc = SUBPHASE_FAMILIES[phase]
+        _observe_extremes(
+            name, doc, ["status", "source"], {"status": status, "source": bounded_source}, seconds
+        )
 
 
 @contextlib.contextmanager
@@ -389,7 +464,12 @@ def render_prometheus() -> str:
             return text
     lines: list[str] = []
     snap = get_recorded_summary()
+    base = lambda fam: fam.removesuffix("_seconds")  # noqa: E731
     for op, stats in sorted(snap["ops"].items()):
+        if op in SUBPHASE_FAMILIES and any(k.startswith(f"{op}:") for k in snap["subphases"]):
+            # The handle records these under the sub-phase family (status,
+            # source); one TYPE block per metric name, so they render below.
+            continue
         fam = CLIENT_FAMILIES.get(op, (f"ate_env_client_{op}_seconds", f"Client {op} latency"))[0]
         lines.append(f"# TYPE {fam} histogram")
         for st in ("ok", "error", "cancelled"):
@@ -397,19 +477,27 @@ def render_prometheus() -> str:
             if cnt > 0 or st == "ok":
                 lines.append(f'{fam}_count{{status="{st}"}} {cnt}')
         lines.append(f'{fam}_sum {stats["sum_s"]:.6f}')
+        lines.append(f'{base(fam)}_max_seconds {stats["max_s"]:.6f}')
+        if stats.get("min_s") is not None:
+            lines.append(f'{base(fam)}_min_seconds {stats["min_s"]:.6f}')
+    seen_type: set[str] = set()
     for (_key, stats) in sorted(snap["subphases"].items()):
         phase = stats["phase"]
         src = stats["source"]
         fam = SUBPHASE_FAMILIES.get(
             phase, (f"ate_env_client_{phase}_seconds", f"Subphase {phase} latency")
         )[0]
-        lines.append(f"# TYPE {fam} histogram")
-        lines.append(
-            f'{fam}_count{{source="{src}",status="ok"}} {stats["ok"]}'
-        )
-        lines.append(
-            f'{fam}_sum{{source="{src}",status="ok"}} {stats["sum_s"]:.6f}'
-        )
+        if fam not in seen_type:
+            seen_type.add(fam)
+            lines.append(f"# TYPE {fam} histogram")
+        for st in ("ok", "error"):
+            cnt = stats.get(st, 0)
+            if cnt > 0 or st == "ok":
+                lines.append(f'{fam}_count{{source="{src}",status="{st}"}} {cnt}')
+        lines.append(f'{fam}_sum{{source="{src}"}} {stats["sum_s"]:.6f}')
+        lines.append(f'{base(fam)}_max_seconds{{source="{src}"}} {stats["max_s"]:.6f}')
+        if stats.get("min_s") is not None:
+            lines.append(f'{base(fam)}_min_seconds{{source="{src}"}} {stats["min_s"]:.6f}')
     return "\n".join(lines) + ("\n" if lines else "")
 
 

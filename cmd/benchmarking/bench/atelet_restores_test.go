@@ -297,6 +297,7 @@ func writeTwoShardEvents(t *testing.T, dir string, baseT time.Time, r2eImg, sweI
 	r2eEvents := []any{
 		swebench.Event{Time: baseT.Add(100 * time.Millisecond), RunID: "bkl-a1-r2e", Job: "r2e", Worker: "r2e", Task: 0, Step: 1, Instance: "r2e-1", Image: r2eImg, Env: "bkl-a1-r2e-0", Event: swebench.EventCreate, DurMS: 50, OK: true},
 		swebench.Event{Time: baseT.Add(300 * time.Millisecond), RunID: "bkl-a1-r2e", Job: "r2e", Worker: "r2e", Task: 0, Step: 1, Instance: "r2e-1", Image: r2eImg, Env: "bkl-a1-r2e-0", Event: swebench.EventTTFI, DurMS: 200, OK: true},
+		swebench.Event{Time: baseT.Add(350 * time.Millisecond), RunID: "bkl-a1-r2e", Job: "r2e", Worker: "r2e", Task: 0, Step: 1, Instance: "r2e-1", Image: r2eImg, Env: "bkl-a1-r2e-0", Event: swebench.EventTTFIC, DurMS: 250, OK: true},
 		swebench.Event{Time: baseT.Add(900 * time.Millisecond), RunID: "bkl-a1-r2e", Job: "r2e", Worker: "r2e", Task: 0, Step: 1, Instance: "r2e-1", Image: r2eImg, Env: "bkl-a1-r2e-0", Event: swebench.EventTask, DurMS: 800, OK: true, Reward: &rewardOne},
 		swebench.Event{Time: baseT.Add(950 * time.Millisecond), RunID: "bkl-a1-r2e", Job: "r2e", Worker: "r2e", Step: 1, Event: swebench.EventBarrier, DurMS: 850, OK: true, Count: 1, WorkingSetMisses: 1, Created: 1, Retired: 1},
 		swebench.Event{
@@ -321,6 +322,7 @@ func writeTwoShardEvents(t *testing.T, dir string, baseT time.Time, r2eImg, sweI
 	sweEvents := []any{
 		swebench.Event{Time: baseT.Add(120 * time.Millisecond), RunID: "bkl-a1-swe", Job: "swe", Worker: "swe", Task: 0, Step: 1, Instance: "swe-1", Image: sweImg, Env: "bkl-a1-swe-0", Event: swebench.EventCreate, DurMS: 60, OK: true},
 		swebench.Event{Time: baseT.Add(340 * time.Millisecond), RunID: "bkl-a1-swe", Job: "swe", Worker: "swe", Task: 0, Step: 1, Instance: "swe-1", Image: sweImg, Env: "bkl-a1-swe-0", Event: swebench.EventTTFI, DurMS: 220, OK: true},
+		swebench.Event{Time: baseT.Add(390 * time.Millisecond), RunID: "bkl-a1-swe", Job: "swe", Worker: "swe", Task: 0, Step: 1, Instance: "swe-1", Image: sweImg, Env: "bkl-a1-swe-0", Event: swebench.EventTTFIC, DurMS: 270, OK: true},
 		swebench.Event{Time: baseT.Add(1100 * time.Millisecond), RunID: "bkl-a1-swe", Job: "swe", Worker: "swe", Task: 0, Step: 1, Instance: "swe-1", Image: sweImg, Env: "bkl-a1-swe-0", Event: swebench.EventTask, DurMS: 980, OK: true, Reward: &rewardOne},
 		swebench.Event{Time: baseT.Add(1150 * time.Millisecond), RunID: "bkl-a1-swe", Job: "swe", Worker: "swe", Step: 1, Event: swebench.EventBarrier, DurMS: 1030, OK: true, Count: 1, WorkingSetMisses: 1, Created: 1, Retired: 1},
 		swebench.Event{

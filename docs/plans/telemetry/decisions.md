@@ -504,3 +504,9 @@ Append-only. Each entry: date, who, what, why.
   `ate.atespace="ate-env"`, whereas Go's `Client.Get`, `Client.Suspend` and `Client.Delete` take a
   positional `atespace` string and omit `ate.atespace` when it is `""` (the server resolves the
   default).
+- 2026-11-13, #378 (from #251): the client histograms (Python `SEC_BUCKETS`, Go `secondsBuckets`,
+  pinned for both by `proto/testdata/client-parity/metric_families.json`) add `0.01` and `0.025` s
+  buckets, so the sub-second client operations (`read_file`, `write_file`, short `exec`) that
+  `bench report` now reads from the histograms are not all in the first bucket. The server's
+  `internal/telemetry.SecondsBuckets` keeps its 50 ms floor; the 2026-10-21 "one bucket set" now
+  holds per side (client, server).

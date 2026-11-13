@@ -825,14 +825,28 @@ func TestFirstCommandRetriesUnavailable(t *testing.T) {
 		t.Fatalf("summary %+v", sum)
 	}
 
-	rep := Build(parseEvents(t, out.String()))
+	events := parseEvents(t, out.String())
+	rep := Build(events)
 	if s := stat(rep, EventTTFI); s.Count != 1 {
 		t.Fatalf("ttfi %+v", s)
 	}
-	for _, e := range parseEvents(t, out.String()) {
-		if e.Event == EventTTFI && e.Attempts != 3 {
-			t.Fatalf("ttfi attempts = %d, want 3", e.Attempts)
+	ttfiIdx, ttficIdx := -1, -1
+	for i, e := range events {
+		switch e.Event {
+		case EventTTFI:
+			ttfiIdx = i
+			if e.Attempts != 3 {
+				t.Fatalf("ttfi attempts = %d, want 3", e.Attempts)
+			}
+		case EventTTFIC:
+			ttficIdx = i
+			if e.Attempts != 3 {
+				t.Fatalf("ttfic attempts = %d, want 3", e.Attempts)
+			}
 		}
+	}
+	if ttfiIdx < 0 || ttficIdx < 0 || ttfiIdx >= ttficIdx {
+		t.Fatalf("ttfi index = %d, ttfic index = %d, want both recorded with ttfi before ttfic", ttfiIdx, ttficIdx)
 	}
 
 	f = newFake()

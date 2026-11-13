@@ -231,8 +231,8 @@ keeps the heuristic and PR 6 records `ate_env.timed_out` from it.
 - `ClientOptions.MetricsRegisterer prometheus.Registerer`. Families and labels:
   `ate_env_client_exec_seconds{status}`, `ate_env_client_suspend_seconds{status}`,
   `ate_env_client_ready_to_first_command_seconds{status,source}` with `source="direct"`; the buckets
-  of `internal/telemetry` and `SEC_BUCKETS` in `telemetry/metrics.py` (`0.05` to `600`). `status` is
-  `ok`, `error` or `cancelled` (`ctx` done), as `metrics.status_of`.
+  of `SEC_BUCKETS` in `telemetry/metrics.py` (`0.01` to `600`; `internal/telemetry` keeps `0.05` to
+  `600`). `status` is `ok`, `error` or `cancelled` (`ctx` done), as `metrics.status_of`.
 - A `start_process` span on `Env.StartProcess`, as the Python `Env.start_process()` has, with the
   `exec` attributes except `ate_env.exit_code`; `ate_env.first_command=true` on the first `Run` or
   `StartProcess` of an `Env`; `ate_env.timed_out` on `exec`.
