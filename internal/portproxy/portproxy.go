@@ -85,6 +85,22 @@ const (
 // forwards it.
 const EnvAuthorizationHeader = "X-Env-Authorization"
 
+// EnvWakeWaitHeader asks the proxy to hold the request while a suspended
+// environment wakes, instead of the 503 that a wake longer than the router's
+// own hold gets (see modifyResponse). Its value is a whole number of seconds
+// in decimal, the most the caller wants to wait; 0 asks for no hold. The
+// proxy holds for that long or for Options.WakeWaitCap, whichever is less,
+// and never forwards the header. See Proxy.hold.
+const EnvWakeWaitHeader = "X-Env-Wake-Wait"
+
+// DefaultWakeWaitCap is ate-env-api's bound on one hold that
+// EnvWakeWaitHeader asks for (its -port-proxy-wake-wait-cap flag). A resume
+// takes 1 to 2 s and the first wake on a new image 15 to 31 s (measured, see
+// the README), so one minute serves both. A longer wake gets the 503, as
+// without the header. It is well below the five minutes a guest gRPC call
+// may hold the same resources (apiservice.DefaultWakeBudget).
+const DefaultWakeWaitCap = time.Minute
+
 // DefaultHandshakeTimeout bounds dialing the router and waiting for its
 // answer to CONNECT, which includes resuming a suspended actor.
 const DefaultHandshakeTimeout = 2 * time.Minute
@@ -171,6 +187,19 @@ type Options struct {
 	// Authorization is Basic with the user CapabilityUser and that has no
 	// EnvAuthorizationHeader. An error refuses the request with 401.
 	AuthenticateCapability func(capability, atespace, id string, port int) error
+
+	// Wake, when set, wakes an environment and returns nil once its guest
+	// answers: ate-env-api's wait for guest calls
+	// (apiservice.(*Server).Wake). The proxy calls it only for a request
+	// that carries EnvWakeWaitHeader, before it forwards any byte of the
+	// request, with a context that ends with the hold or with the caller.
+	// Wake must return when that context ends. Whatever error it returns,
+	// the proxy takes the answer from ActorState (see hold).
+	Wake func(ctx context.Context, atespace, id string) error
+	// WakeWaitCap is the longest hold EnvWakeWaitHeader gets; a larger
+	// value in the header is cut to it. Zero or less means no request is
+	// held; the header is still validated and not forwarded.
+	WakeWaitCap time.Duration
 
 	// Atespaces, when set, are the only atespaces whose environments the
 	// proxy forwards to; a request that names another gets 403, after
@@ -476,7 +505,7 @@ func (p *Proxy) ServePath(w http.ResponseWriter, r *http.Request) {
 			"add the page's origin to the port proxy's trusted origins", http.StatusForbidden)
 		return
 	}
-	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), targetKey{}, t)))
+	p.forward(w, r, t)
 }
 
 // ServeHTTP forwards r to the environment port its headers name.
@@ -492,7 +521,110 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !p.authenticate(w, r, &t) || !p.inScope(w, t) {
 		return
 	}
+	p.forward(w, r, t)
+}
+
+// heldBodyMax is the largest request body that hold reads into memory, for
+// each held request.
+const heldBodyMax = 64 << 10
+
+// wakeWaitSeconds is the value of EnvWakeWaitHeader: decimal seconds with no
+// sign, fraction, unit or leading zero. Nine digits keep it a time.Duration.
+var wakeWaitSeconds = regexp.MustCompile(`^(0|[1-9][0-9]{0,8})$`)
+
+// wakeWait returns the hold that r asks for in EnvWakeWaitHeader, zero
+// without the header.
+func wakeWait(r *http.Request) (time.Duration, error) {
+	values := r.Header.Values(EnvWakeWaitHeader)
+	switch {
+	case len(values) == 0:
+		return 0, nil
+	case len(values) > 1:
+		return 0, fmt.Errorf("%s appears more than once", EnvWakeWaitHeader)
+	case !wakeWaitSeconds.MatchString(values[0]):
+		return 0, fmt.Errorf("%s %q is not a whole number of seconds (for example 30)", EnvWakeWaitHeader, values[0])
+	}
+	n, _ := strconv.Atoi(values[0])
+	return time.Duration(n) * time.Second, nil
+}
+
+// forward sends r to target t, which the caller may reach. A request with
+// EnvWakeWaitHeader is first held while the environment wakes (see hold).
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, t target) {
+	wait, err := wakeWait(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if wait = min(wait, p.opts.WakeWaitCap); wait > 0 && p.opts.Wake != nil && !p.hold(w, r, t, wait) {
+		return
+	}
 	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), targetKey{}, t)))
+}
+
+// hold waits up to wait for t's environment to wake, before any byte of r is
+// forwarded: once a request is inside the router's tunnel the proxy cannot
+// send it again, because it keeps no copy of the body. It reports whether to
+// forward r; when it returns false it has answered, or the caller left.
+//
+// Options.Wake does the waiting. When it returns nil the guest answers and r
+// is forwarded. Otherwise the answer comes from the state, the same one
+// modifyResponse gives without a hold: 503 with Retry-After while the
+// environment is still waking (the hold ran out), 410 for a crashed one and
+// 404 for one that is deleting or gone, each of which ends Wake at once. In
+// any other state, or when the state cannot be read, r is forwarded and the
+// router's answer stands, as without the header.
+//
+// A caller that leaves ends the hold through r's context. Over HTTP/1.x Go's
+// server watches the connection only once the request body is read to its
+// end, so hold first reads a body of a known length up to heldBodyMax into
+// memory; the forward then sends it from there, once. A longer or chunked
+// HTTP/1.x body stays unread, and a caller that leaves is then noticed only
+// when the hold ends. HTTP/2 has no such limit.
+func (p *Proxy) hold(w http.ResponseWriter, r *http.Request, t target, wait time.Duration) bool {
+	if r.ProtoMajor == 1 && r.ContentLength > 0 && r.ContentLength <= heldBodyMax {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "reading the request body failed", http.StatusBadRequest)
+			return false
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), wait)
+	err := p.opts.Wake(ctx, t.atespace, t.id)
+	cancel()
+	if err == nil {
+		return true
+	}
+	if r.Context().Err() != nil {
+		return false // the caller went away; nobody reads an answer
+	}
+	if p.opts.ActorState == nil {
+		return true
+	}
+	st, err := p.actorState(r.Context(), t.atespace, t.id)
+	switch {
+	case status.Code(err) == codes.NotFound, errors.Is(err, ate.ErrNotFound):
+		writeAnswer(w, t, http.StatusNotFound, "", causeNotFound, false)
+	case err != nil:
+		if r.Context().Err() != nil {
+			return false
+		}
+		p.logStateReadError(t.atespace, t.id, err)
+		return true
+	case st == ateapipb.ActorState_ACTOR_STATE_CRASHED:
+		writeAnswer(w, t, http.StatusGone, "CRASHED", causeCrashed, false)
+		p.crashed(t)
+	case st == ateapipb.ActorState_ACTOR_STATE_DELETING:
+		writeAnswer(w, t, http.StatusNotFound, "DELETING", causeDeleting, false)
+	default:
+		name, waking := wakingStates[st]
+		if !waking {
+			return true
+		}
+		writeAnswer(w, t, http.StatusServiceUnavailable, name, causeWaking, true)
+	}
+	return false
 }
 
 // inScope answers 403 and returns false when t's atespace is not one that
@@ -573,7 +705,7 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	// inspects the query, so forward RawQuery as sent. ForceQuery (a bare
 	// '?') is copied from the inbound request by ReverseProxy itself.
 	pr.Out.URL.RawQuery = pr.In.URL.RawQuery
-	for _, h := range []string{EnvIDHeader, EnvAtespaceHeader, EnvPortHeader, EnvAuthorizationHeader} {
+	for _, h := range []string{EnvIDHeader, EnvAtespaceHeader, EnvPortHeader, EnvAuthorizationHeader, EnvWakeWaitHeader} {
 		pr.Out.Header.Del(h)
 	}
 	if t.dropAuthorization {
@@ -732,8 +864,10 @@ type stateEntry struct {
 // empty 504 or 500, SUSPENDED or RESUMING gets 503 with Retry-After: 1, each
 // with EnvStateHeader. Otherwise the answer passes unchanged: the daemon's own
 // 503, 404, 504 or 500 included (a RUNNING actor), and when the read fails.
-// The proxy never sends a request again. A refused WebSocket upgrade comes
-// here too.
+// The proxy never sends a request again; a caller that wants the proxy to
+// wait for the wake instead says so with EnvWakeWaitHeader, and the wait
+// happens before the request is forwarded (see hold). A refused WebSocket
+// upgrade comes here too.
 func (p *Proxy) modifyResponse(resp *http.Response) error {
 	t, ok := resp.Request.Context().Value(targetKey{}).(target)
 	if !ok {
@@ -776,25 +910,24 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	switch {
 	case status.Code(err) == codes.NotFound, errors.Is(err, ate.ErrNotFound):
 		if resp.StatusCode != http.StatusNotFound {
-			replaceAnswer(resp, t, http.StatusNotFound, "", "was not found")
+			replaceAnswer(resp, t, http.StatusNotFound, "", causeNotFound, false)
 		}
 	case err != nil:
 		if resp.Request.Context().Err() == nil { // not a caller that left
 			p.logStateReadError(t.atespace, t.id, err)
 		}
 	case st == ateapipb.ActorState_ACTOR_STATE_CRASHED:
-		replaceAnswer(resp, t, http.StatusGone, "CRASHED", "has crashed (actor state CRASHED); delete it and create a new one")
+		replaceAnswer(resp, t, http.StatusGone, "CRASHED", causeCrashed, false)
 		p.crashed(t)
 	case st == ateapipb.ActorState_ACTOR_STATE_DELETING:
-		replaceAnswer(resp, t, http.StatusNotFound, "DELETING", "is being deleted (actor state DELETING)")
+		replaceAnswer(resp, t, http.StatusNotFound, "DELETING", causeDeleting, false)
 	case resp.StatusCode == http.StatusGatewayTimeout || resp.StatusCode == http.StatusInternalServerError:
 		// A wake that ends after Envoy's timeout but before this read
 		// reads RUNNING, and the empty 504 passes unchanged: the proxy
 		// cannot tell it from a daemon's empty 504. The window is short,
 		// and a retry then reaches the daemon.
 		if name, waking := wakingStates[st]; waking {
-			replaceAnswer(resp, t, http.StatusServiceUnavailable, name, "is still waking; retry")
-			resp.Header.Set("Retry-After", "1")
+			replaceAnswer(resp, t, http.StatusServiceUnavailable, name, causeWaking, true)
 		}
 	}
 	return nil
@@ -850,22 +983,54 @@ func routerBody(resp *http.Response, t target) bool {
 	return strings.HasPrefix(body, "actor "+ref+" ") || strings.HasPrefix(body, `actor "`+ref+`"`)
 }
 
-// replaceAnswer replaces resp with the proxy's own text answer.
-func replaceAnswer(resp *http.Response, t target, code int, state, cause string) {
-	resp.Body.Close()
+// The causes in the proxy's own answers for an environment that does not
+// serve, by state.
+const (
+	causeNotFound = "was not found"
+	causeCrashed  = "has crashed (actor state CRASHED); delete it and create a new one"
+	causeDeleting = "is being deleted (actor state DELETING)"
+	causeWaking   = "is still waking; retry"
+)
+
+// ownAnswer returns the headers and the body of the proxy's own text answer
+// about t's environment: state, when set, goes in EnvStateHeader, and retry
+// adds Retry-After: 1.
+func ownAnswer(t target, state, cause string, retry bool) (http.Header, string) {
 	body := fmt.Sprintf("environment %s/%s port %d %s\n", t.atespace, t.id, t.port, cause)
+	h := http.Header{}
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	if state != "" {
+		h.Set(EnvStateHeader, state)
+	}
+	if retry {
+		h.Set("Retry-After", "1")
+	}
+	return h, body
+}
+
+// replaceAnswer replaces resp with the proxy's own text answer.
+func replaceAnswer(resp *http.Response, t target, code int, state, cause string, retry bool) {
+	resp.Body.Close()
+	h, body := ownAnswer(t, state, cause, retry)
 	resp.StatusCode = code
 	resp.Status = fmt.Sprintf("%d %s", code, http.StatusText(code))
-	resp.Header = http.Header{}
-	resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	resp.Header.Set("X-Content-Type-Options", "nosniff")
-	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-	if state != "" {
-		resp.Header.Set(EnvStateHeader, state)
-	}
+	resp.Header = h
 	resp.ContentLength = int64(len(body))
 	resp.TransferEncoding = nil
 	resp.Body = io.NopCloser(strings.NewReader(body))
+}
+
+// writeAnswer writes the proxy's own text answer, the one replaceAnswer
+// makes, for a request that was not forwarded.
+func writeAnswer(w http.ResponseWriter, t target, code int, state, cause string, retry bool) {
+	h, body := ownAnswer(t, state, cause, retry)
+	for k, v := range h {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(code)
+	_, _ = io.WriteString(w, body)
 }
 
 // actorState reads the actor's state, at most once per stateCacheTTL for one

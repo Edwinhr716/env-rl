@@ -29,6 +29,16 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- ate-env-api: a port-proxy caller can ask the proxy to wait while a
+  suspended environment wakes, with `X-Env-Wake-Wait: <seconds>` (a whole
+  number in decimal) on the request, in the header form and the path form.
+  The proxy wakes the environment before it forwards anything, with the wait
+  of guest gRPC calls, and forwards the request once when the guest answers.
+  The wait lasts at most the header's value or the new
+  `-port-proxy-wake-wait-cap` (default `1m`; `0` turns it off). A longer
+  wake gets the 503 with `Retry-After: 1` as before, a crashed environment
+  410 and a deleting one 404 at once, and an invalid value 400. The proxy
+  strips the header. Without the header nothing changes (#382).
 - `ate-env-reporter` (`cmd/ate-env-reporter`): a per-cluster daemon that writes
   the fleet inventory snapshot of `internal/inventory` every `-interval`
   (default 5 s) to `gs://<-bucket>/v1/inventory/<project>/<cluster>/latest.json`,

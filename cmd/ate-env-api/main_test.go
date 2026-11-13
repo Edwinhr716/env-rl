@@ -196,6 +196,9 @@ func TestPortProxyOptionsWiresStateReadAndAuth(t *testing.T) {
 	if _, err := opts.ActorState(context.Background(), "ate-env", "missing"); status.Code(err) != codes.NotFound {
 		t.Errorf("ActorState of a missing environment: %v, want NotFound from the control plane", err)
 	}
+	if opts.Wake == nil {
+		t.Fatal("Wake is not set: a request with X-Env-Wake-Wait would not be held")
+	}
 	if opts.Authenticate == nil || opts.Authenticate("Bearer s3cret") != nil || opts.Authenticate("Bearer wrong") == nil {
 		t.Error("Authenticate does not check the API's token")
 	}

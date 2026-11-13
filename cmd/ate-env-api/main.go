@@ -124,6 +124,7 @@ func main() {
 		ppAtespaces       = flag.String("port-proxy-atespaces", ate.DefaultAtespace, "comma-separated atespaces whose environments the port proxy forwards to, or * for any")
 		ppOrigins         = flag.String("port-proxy-trusted-origins", "", "comma-separated browser origins (scheme://host[:port]) whose pages may use the port proxy's path form, next to the listener's own origin")
 		ppHeaderTimeout   = flag.Duration("port-proxy-response-header-timeout", 0, "how long the port proxy waits for a daemon's response headers; 0 means no limit, and the caller's deadline applies")
+		ppWakeWaitCap     = flag.Duration("port-proxy-wake-wait-cap", portproxy.DefaultWakeWaitCap, "the longest the port proxy holds a request that asks for it with the X-Env-Wake-Wait header (whole seconds) while a suspended environment wakes, before it forwards the request; a larger value in the header is cut to this, and a wake that lasts longer gets 503 with Retry-After as without the header. 0 or less turns the hold off; the header is then still validated and not forwarded")
 		hostSuffix        = flag.String("host-suffix", ate.DefaultHostSuffix, "atenet router host suffix for actor routing")
 		atenetClientCert  = flag.String("atenet-client-cert", "", "PEM credential bundle (certificate chain and key) presented to the atenet router's TLS listeners: the pod identity bundle the kubelet projects. Substrate v0.6.0 serves only those listeners; with this flag, -atenet and -atenet-connect default to them (443 and 8444). The file is re-read at every handshake, so rotation needs no restart")
 		atenetCAFile      = flag.String("atenet-ca-file", "", "PEM trust bundle that signs the router's serving certificate (the servicedns bundle); required with -atenet-client-cert")
@@ -310,6 +311,7 @@ func main() {
 			ResponseHeaderTimeout: *ppHeaderTimeout,
 			TrustedOrigins:        origins,
 			WakeBudget:            *wakeBudget,
+			WakeWaitCap:           *ppWakeWaitCap,
 			Atespaces:             atespaces,
 		}
 		if metrics != nil {
@@ -441,9 +443,11 @@ func newHTTPServer(addr string, handler http.Handler, maxStreams int) *http.Serv
 
 // portProxyOptions adds what the port proxy takes from the API server to
 // base: the state read that makes a crashed or deleted environment fail at
-// once, and the caller check when -auth-token-file is set.
+// once, the wake wait that holds a request with X-Env-Wake-Wait, and the
+// caller check when -auth-token-file is set.
 func portProxyOptions(base portproxy.Options, apisvc *apiservice.Server, callerAuth *apiservice.BearerAuth) portproxy.Options {
 	base.ActorState = apisvc.ActorState
+	base.Wake = apisvc.Wake
 	if callerAuth != nil {
 		base.Authenticate = callerAuth.Check
 		base.AuthenticateCapability = callerAuth.CheckCapability

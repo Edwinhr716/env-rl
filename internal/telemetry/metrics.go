@@ -113,8 +113,8 @@ var Definitions = []Definition{
 	{
 		Name: MetricWakeWaitSeconds,
 		Type: TypeHistogram,
-		Help: "Seconds a proxied guest call (process or file RPC) spent waiting for a suspended or still-starting environment to answer, observed only when the first probe found the guest unreachable. " +
-			"outcome is woke, timeout (wake or running budget spent) or error (crashed, deleted, control-plane error or caller gone).",
+		Help: "Seconds a proxied guest call (process or file RPC), or a port-proxy request held with X-Env-Wake-Wait, spent waiting for a suspended or still-starting environment to answer, observed only when the first probe found the guest unreachable. " +
+			"outcome is woke, timeout (wake or running budget spent) or error (crashed, deleted, control-plane error, caller gone or port-proxy hold ended).",
 		Labels:  []string{"outcome"},
 		Buckets: SecondsBuckets,
 	},

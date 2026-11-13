@@ -837,6 +837,20 @@ router's 5 s hold; one that is being deleted gets 404 with `X-Env-State: DELETIN
 deleted gets 404. A client stops on 410, because only a new environment helps. The daemon's own
 answers, its 503, 404 and 504 included, pass unchanged.
 
+A caller that cannot retry the 503 asks the proxy to wait instead, with `X-Env-Wake-Wait: <seconds>`
+on the request (both forms): a whole number of seconds in decimal, such as `30`; `0` asks for no
+wait, and any other syntax, or a repeated header, gets 400. The proxy then wakes the environment
+before it forwards anything, with the wait that guest gRPC calls use, and forwards the request once
+when the guest answers, so the daemon never gets a request or a body twice. The wait lasts at most
+the header's value or `--port-proxy-wake-wait-cap` (default 1m), whichever is less; a larger value
+is cut to the cap. A wake that takes longer gets the same 503 with `Retry-After: 1`, thus a client
+that also retries still works. A crashed or deleting environment ends the wait at once with the 410
+or 404 above. The proxy strips the header. A request with it costs one guest round trip also when
+the environment runs, so send it only where a wake is possible. Over HTTP/1.x the proxy notices a
+caller that leaves during the wait only when the request has no body or a body of a known length up
+to 64 KiB, which it reads into memory first; behind a longer or chunked body the wait runs to its
+end. HTTP/2 has no such limit.
+
 ```bash
 curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' \
      -H "X-Env-Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" localhost:7777/health
@@ -926,6 +940,7 @@ image keeps them. Add other names, such as an internal load balancer, with `--ap
 | `--atenet-server-name` | `atenet-router.ate-system.svc` | Name the router's serving certificate must carry. |
 | `--port-proxy-trusted-origins` | none | Comma-separated browser origins allowed to use the path form. |
 | `--port-proxy-response-header-timeout` | `0`, no limit | Bound on the wait for a daemon's response headers. Without it, the caller's deadline ends the wait. |
+| `--port-proxy-wake-wait-cap` | `1m` | The longest wait that a request gets with `X-Env-Wake-Wait` while its environment wakes; a larger value in the header is cut to it. `0` or less turns the wait off: the header is still validated and stripped. |
 
 ## Built-in MCP Server
 

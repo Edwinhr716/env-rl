@@ -149,6 +149,55 @@ func TestGuestCallFailsFastOnDeleting(t *testing.T) {
 	}
 }
 
+// Wake is the wait of a guest call without the call: it returns once a
+// suspended environment's guest answers, fails at once for a crashed or
+// deleting one, and ends with its context. The port proxy holds a request on
+// it (X-Env-Wake-Wait).
+func TestWake(t *testing.T) {
+	te := newFullTestEnv(t)
+	registerGuest(t, te, "wake-only")
+	te.control.SetState("wake-only", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		te.control.SetState("wake-only", ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	}()
+	start := time.Now()
+	if err := te.srv.Wake(context.Background(), apiservice.DefaultAtespace, "wake-only"); err != nil {
+		t.Fatalf("Wake of a suspended environment: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
+		t.Errorf("Wake returned after %s, before the environment was running", elapsed)
+	}
+
+	for _, tc := range []struct {
+		state ateapipb.ActorState
+		code  codes.Code
+	}{
+		{ateapipb.ActorState_ACTOR_STATE_CRASHED, codes.FailedPrecondition},
+		{ateapipb.ActorState_ACTOR_STATE_DELETING, codes.NotFound},
+	} {
+		te.control.SetState("wake-only", tc.state)
+		start = time.Now()
+		if err := te.srv.Wake(context.Background(), apiservice.DefaultAtespace, "wake-only"); status.Code(err) != tc.code {
+			t.Errorf("Wake in %s: code %v (%v), want %v", tc.state, status.Code(err), err, tc.code)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("Wake in %s took %s to fail; the wake budget must not apply", tc.state, elapsed)
+		}
+	}
+
+	te.control.SetState("wake-only", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start = time.Now()
+	if err := te.srv.Wake(ctx, apiservice.DefaultAtespace, "wake-only"); status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("Wake past its context: code %v (%v), want DeadlineExceeded", status.Code(err), err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("Wake ended %s after a 300 ms context", elapsed)
+	}
+}
+
 // An environment that stays suspended past the wake budget fails with
 // Unavailable, naming the state and the attempt count.
 func TestGuestCallFailsWhenWakeBudgetExpires(t *testing.T) {

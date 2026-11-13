@@ -366,6 +366,19 @@ func identityNote(id string) string {
 	return " (" + id + ")"
 }
 
+// Wake wakes the environment and returns nil once its guest answers: the
+// wait of a guest call (see ensureAwake), with its budgets, its fail-fasts
+// for a crashed or deleting environment and its wake_wait observation, but
+// with no call after it. The port proxy holds a request on it when the caller
+// asks (portproxy.Options.Wake).
+func (s *Server) Wake(ctx context.Context, atespace, id string) error {
+	conn, err := s.guestConn(ctx, atespace, id)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
 // ActorState is the state read ensureAwake uses, for the port proxy
 // (portproxy.Options.ActorState): a deleted environment is NotFound.
 func (s *Server) ActorState(ctx context.Context, atespace, id string) (ateapipb.ActorState, error) {
