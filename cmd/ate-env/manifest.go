@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -250,6 +251,10 @@ type templateConfig struct {
 	// sidecars get: the container carries them as sidecarenv.Prefix+NAME,
 	// and the guest removes them from its own environment at start.
 	sidecarEnv []string
+	// addCapabilities are Linux capabilities the actor's container gets on
+	// top of Substrate's default set, named as Substrate names them: upper
+	// case, without the CAP_ prefix.
+	addCapabilities []string
 }
 
 // wakeupTimeoutSeconds returns the probe timeout the template carries.
@@ -351,6 +356,46 @@ func (c *templateConfig) validateResources() error {
 		}
 		if q.Cmp(l.max) > 0 {
 			return fmt.Errorf("%s %q is above the maximum of %s", l.flag, l.value, l.max.String())
+		}
+	}
+	return nil
+}
+
+// addCapabilityNames are the capabilities that Substrate lets a container
+// add, sorted. It is a copy of AllowedAddCapabilities in Substrate's
+// internal/resources/validate.go at commit 274605f1, the pin in go.mod: the
+// package is internal, thus this file cannot import it. Update the list with
+// the pin. The names have no CAP_ prefix and Substrate compares them exactly.
+var addCapabilityNames = []string{
+	"AUDIT_WRITE",
+	"CHOWN",
+	"DAC_OVERRIDE",
+	"FOWNER",
+	"FSETID",
+	"KILL",
+	"NET_BIND_SERVICE",
+	"SETFCAP",
+	"SETGID",
+	"SETPCAP",
+	"SETUID",
+	"SYS_CHROOT",
+}
+
+// validateCapabilities checks each --add-capability value against
+// addCapabilityNames, thus a template that Substrate rejects at create fails
+// here. It accepts only the exact name, as Substrate does: it does not change
+// "CAP_SETUID" or "setuid" to "SETUID", because the template then holds what
+// the caller wrote, and the error says how to write it. A repeated name is not
+// an error: Substrate has no rule against it, and buildTemplate writes the
+// name once.
+func (c *templateConfig) validateCapabilities() error {
+	accepted := strings.Join(addCapabilityNames, ", ")
+	for _, name := range c.addCapabilities {
+		if !slices.Contains(addCapabilityNames, name) {
+			if fixed := strings.TrimPrefix(strings.ToUpper(name), "CAP_"); slices.Contains(addCapabilityNames, fixed) {
+				return fmt.Errorf("--add-capability %q: write it as %s, in upper case without the CAP_ prefix; Substrate accepts %s", name, fixed, accepted)
+			}
+			return fmt.Errorf("--add-capability %q: Substrate does not let a container add it; it accepts %s", name, accepted)
 		}
 	}
 	return nil
@@ -650,6 +695,9 @@ It prints YAML to stdout without touching the cluster.`,
 			if err := tCfg.validateEnv(); err != nil {
 				return err
 			}
+			if err := tCfg.validateCapabilities(); err != nil {
+				return err
+			}
 			tmpl, err := buildTemplate(tCfg)
 			if err != nil {
 				return err
@@ -674,6 +722,7 @@ It prints YAML to stdout without touching the cluster.`,
 	cmd.Flags().DurationVar(&tCfg.wakeupTimeout, "wakeup-timeout", 0, fmt.Sprintf("how long Substrate polls the guest's /readyz at each actor start and resume before it fails the actor, whole seconds from 1s to %s; 0 or unset means the default: %s with --sidecar-readyz, else Substrate's %s", maxWakeupTimeout, sidecarWakeupTimeout, substrateWakeupTimeout))
 	cmd.Flags().StringArrayVar(&tCfg.env, "env", nil, "environment variable for the actor's container as NAME=VALUE (repeatable); the guest passes it to sidecars and to each command it starts, e.g. a layer daemon's log level; use --sidecar-env for a secret")
 	cmd.Flags().StringArrayVar(&tCfg.sidecarEnv, "sidecar-env", nil, fmt.Sprintf("environment variable that only the --sidecar processes get, as NAME=VALUE (repeatable), e.g. a layer daemon's API key; the container carries it as %sNAME and the guest strips it before it starts anything. Limits: docs/security/threat-model.md", sidecarenv.Prefix))
+	cmd.Flags().StringArrayVar(&tCfg.addCapabilities, "add-capability", nil, fmt.Sprintf("Linux capability the actor's container gets on top of Substrate's default set (AUDIT_WRITE, KILL, NET_BIND_SERVICE), e.g. SETUID (repeatable). Accepted names, in upper case without the CAP_ prefix: %s. A daemon that starts processes as another user needs SETUID and SETGID. The capabilities are effective only for a container that runs as root: a process of a non-root image USER has no effective capability. Limits: docs/security/threat-model.md", strings.Join(addCapabilityNames, ", ")))
 
 	return cmd
 }
@@ -955,6 +1004,20 @@ func buildTemplate(cfg templateConfig) (*ateapipb.ActorTemplate, error) {
 		return nil, err
 	}
 	c.Env = append(c.Env, env...)
+	// Set before any rootfs-image derivation, like the layers below, thus a
+	// derived template keeps the capabilities. A repeated name goes in once,
+	// at its first position.
+	if len(cfg.addCapabilities) > 0 {
+		var add []string
+		for _, name := range cfg.addCapabilities {
+			if !slices.Contains(add, name) {
+				add = append(add, name)
+			}
+		}
+		c.SecurityContext = &ateapipb.SecurityContext{
+			Capabilities: &ateapipb.Capabilities{Add: add},
+		}
+	}
 	command := append([]string(nil), c.Command...)
 	if cfg.workspace != "" {
 		command = append(command, "-workspace", cfg.workspace)

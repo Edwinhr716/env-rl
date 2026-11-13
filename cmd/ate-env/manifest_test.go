@@ -1356,6 +1356,160 @@ func TestManifestTemplateCommandRejectsBadEnv(t *testing.T) {
 	}
 }
 
+func TestBuildTemplateAddCapabilities(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	base, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc := base.GetContainers()[0].GetSecurityContext(); sc != nil {
+		t.Errorf("without --add-capability: securityContext = %v, want none", sc)
+	}
+
+	cfg.addCapabilities = []string{"SETUID", "SETGID"}
+	want := func(t *testing.T, what string, tmpl *ateapipb.ActorTemplate) {
+		t.Helper()
+		caps := tmpl.GetContainers()[0].GetSecurityContext().GetCapabilities()
+		if !slices.Equal(caps.GetAdd(), cfg.addCapabilities) || len(caps.GetDrop()) != 0 {
+			t.Errorf("%s: capabilities = %v, want add %v and no drop", what, caps, cfg.addCapabilities)
+		}
+	}
+	base, err = buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "base", base)
+	// An environment created with an image of its own runs on a derived
+	// template, and needs the capabilities as much as the base does.
+	task := "example.com/task@sha256:" + testHex64
+	derived, err := apiservice.DeriveImageTemplate(base, "default-template-0123456789ab", task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "derived", derived)
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	rootfs, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "--rootfs-image", rootfs)
+}
+
+func TestTemplateConfigRejectsBadCapabilities(t *testing.T) {
+	// Each error names the value it refuses and lists the accepted names.
+	accepted := strings.Join(addCapabilityNames, ", ")
+	for _, tc := range []struct {
+		caps []string
+		want string
+	}{
+		{[]string{"SETGID", "CAP_SETUID"}, `--add-capability "CAP_SETUID": write it as SETUID`},
+		{[]string{"setuid"}, `--add-capability "setuid": write it as SETUID`},
+		{[]string{"cap_setuid"}, `--add-capability "cap_setuid": write it as SETUID`},
+		{[]string{""}, `--add-capability ""`},
+		{[]string{"SETUID,SETGID"}, `--add-capability "SETUID,SETGID"`},
+		// Linux capabilities that Substrate does not let a container add.
+		{[]string{"SYS_ADMIN"}, `--add-capability "SYS_ADMIN"`},
+		{[]string{"SETUID", "NET_ADMIN"}, `--add-capability "NET_ADMIN"`},
+		{[]string{"CAP_SYS_ADMIN"}, `--add-capability "CAP_SYS_ADMIN"`},
+		{[]string{"ALL"}, `--add-capability "ALL"`},
+	} {
+		cfg := testTemplateConfig()
+		cfg.addCapabilities = tc.caps
+		err := cfg.validateCapabilities()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("validateCapabilities(%q) = %v, want an error with %q", tc.caps, err, tc.want)
+			continue
+		}
+		if !strings.Contains(err.Error(), accepted) {
+			t.Errorf("validateCapabilities(%q) = %v, want the accepted names %q in the error", tc.caps, err, accepted)
+		}
+	}
+}
+
+// A script that forwards the caller's flags after its own can repeat a name.
+// Substrate has no rule against a repeat, thus the CLI has none: the template
+// holds each name once, in the order of the first use.
+func TestBuildTemplateAddCapabilitiesRepeated(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	cfg.addCapabilities = []string{"SETUID", "SETGID", "SETUID", "CHOWN", "SETGID", "SETUID"}
+	given := slices.Clone(cfg.addCapabilities)
+	if err := cfg.validateCapabilities(); err != nil {
+		t.Fatalf("validateCapabilities(%q) = %v, want nil", cfg.addCapabilities, err)
+	}
+	tmpl, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tmpl.GetContainers()[0].GetSecurityContext().GetCapabilities().GetAdd()
+	if want := []string{"SETUID", "SETGID", "CHOWN"}; !slices.Equal(got, want) {
+		t.Errorf("capabilities.add = %v, want %v", got, want)
+	}
+	if !slices.Equal(cfg.addCapabilities, given) {
+		t.Errorf("buildTemplate changed the config: %v, want %v", cfg.addCapabilities, given)
+	}
+}
+
+// TestAddCapabilityNames pins the list to Substrate's AllowedAddCapabilities
+// at the pin in go.mod. Update both when the pin moves.
+func TestAddCapabilityNames(t *testing.T) {
+	want := []string{
+		"AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
+		"NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+	}
+	if !slices.Equal(addCapabilityNames, want) {
+		t.Fatalf("addCapabilityNames = %v, want %v", addCapabilityNames, want)
+	}
+	if !slices.IsSorted(addCapabilityNames) {
+		t.Errorf("addCapabilityNames is not sorted: %v", addCapabilityNames)
+	}
+	for _, name := range want {
+		cfg := testTemplateConfig()
+		cfg.addCapabilities = []string{name}
+		if err := cfg.validateCapabilities(); err != nil {
+			t.Errorf("validateCapabilities([%s]) = %v, want nil", name, err)
+		}
+	}
+	cfg := testTemplateConfig()
+	cfg.addCapabilities = slices.Clone(want)
+	if err := cfg.validateCapabilities(); err != nil {
+		t.Errorf("validateCapabilities(all 12) = %v, want nil", err)
+	}
+	// The flag help comes from the same list.
+	usage := newManifestCommand().Commands()
+	for _, sub := range usage {
+		if sub.Name() != "template" {
+			continue
+		}
+		help := sub.Flags().Lookup("add-capability").Usage
+		if !strings.Contains(help, strings.Join(want, ", ")) {
+			t.Errorf("--add-capability help = %q, want the accepted names", help)
+		}
+		return
+	}
+	t.Fatal("no template command")
+}
+
+// The builder and the validation have their own tests above. This one shows
+// that the command runs the validation: it fails, and prints no template.
+func TestManifestTemplateCommandRejectsBadCapability(t *testing.T) {
+	for _, name := range []string{"SYS_ADMIN", "ALL", "CAP_SETUID"} {
+		var out bytes.Buffer
+		cmd := newManifestCommand()
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"template", "--guest-image=example.com/guest@sha256:aaaa", "--add-capability=SETUID", "--add-capability=" + name})
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), `--add-capability "`+name+`"`) {
+			t.Errorf("execute with --add-capability=%s: want the flag's error, got %v", name, err)
+		}
+		// On an error cobra prints the usage to the same writer.
+		if strings.Contains(out.String(), "containers:") {
+			t.Errorf("execute with --add-capability=%s printed a template:\n%s", name, out.String())
+		}
+	}
+}
+
 // allowedHostsArg returns the value of the -allowed-hosts argument, or "" if
 // the deployment has none.
 func allowedHostsArg(dep *appsv1.Deployment) (string, bool) {

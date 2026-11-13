@@ -560,6 +560,11 @@ commands run as one user, the image's `USER` at the Substrate pin (root on a Sub
 with its support: the template also carries the guest flag `-sidecar-env-required`, thus an older
 guest exits at start instead of running the sidecars without the values.
 
+A runtime that needs a Linux capability, such as a daemon that starts processes as another user
+(`SETUID`, `SETGID`), gets it with `--add-capability NAME`. The capabilities are effective only for a
+container that runs as root. `ate-env manifest template --help` lists the default set and the
+accepted names; [docs/security/threat-model.md](docs/security/threat-model.md) has the limits.
+
 Layers must be self-contained: the `1.37-musl` busybox is static, while the glibc build fails
 on images with an older libc. The runnable version is
 [`examples/runtime-layers/demo.sh`](examples/runtime-layers/demo.sh).

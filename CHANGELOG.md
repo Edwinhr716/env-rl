@@ -29,6 +29,15 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `ate-env manifest template --add-capability NAME` (repeatable): adds a
+  Linux capability, named without the `CAP_` prefix, to the container of the
+  template's actors, on top of Substrate's default set. A runtime layer whose
+  daemon starts processes as another user needs `SETUID` and `SETGID`. The
+  flag accepts the names that Substrate accepts at the pin in `go.mod`
+  (`ate-env manifest template --help` lists them) and fails for another name,
+  such as `SYS_ADMIN` or `ALL`. A repeated name is in the template once. The
+  capabilities are effective only for a container that runs as root. A derived
+  template keeps the capabilities.
 - ate-env-api: a port-proxy caller can ask the proxy to wait while a
   suspended environment wakes, with `X-Env-Wake-Wait: <seconds>` (a whole
   number in decimal) on the request, in the header form and the path form.
