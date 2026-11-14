@@ -119,6 +119,9 @@ The classes override public names of the SDK only, and refuse by default. Each r
 `e2b` is held to `>=2.63,<3`. A newer 2.x cannot widen what the classes do: a new method or a new
 argument is refused, and the SDK object holds no API key and an API address that does not resolve
 (`ate-env-e2b.invalid`), thus an SDK code path that the classes do not map cannot reach E2B.
+A weekly job (`.github/workflows/e2b-drift.yaml`, `hack/ci/e2b-drift.sh`) runs these tests and the
+Kind test of the classes against the newest `e2b` below 3, which `uv.lock` does not hold. It is not
+a required check.
 
 ### How it is tested
 

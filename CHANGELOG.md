@@ -29,6 +29,9 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- CI: the weekly workflow `e2b-drift` runs the tests of `integrations/e2b`
+  and the Kind test of the E2B classes against the newest `e2b` below 3, not
+  the version in `uv.lock`. It is not a required check.
 - `integrations/e2b`: the package `ate-env-e2b` (e2b 2.63 to below 3, Python
   3.11 or newer). `ate_env_e2b.Sandbox` and `ate_env_e2b.AsyncSandbox` are
   subclasses of `e2b.Sandbox` and `e2b.AsyncSandbox`: a program changes its
