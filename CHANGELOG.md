@@ -29,6 +29,11 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `examples/e2b-envd-layer`: an E2B-compatible sandbox from any image, with
+  upstream envd as an added runtime layer. `demo.sh` builds the layer,
+  registers the base template and runs an E2B SDK program on two images.
+  `integrations/README.md` and `integrations/e2b/README.md` explain that the
+  framework daemons are layers next to an unmodified root filesystem image.
 - CI: the weekly workflow `e2b-drift` runs the tests of `integrations/e2b`
   and the Kind test of the E2B classes against the newest `e2b` below 3, not
   the version in `uv.lock`. It is not a required check.
