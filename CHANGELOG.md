@@ -610,6 +610,14 @@ user needs to know across them.
   stays as a re-export of the new module, with the same names.
 
 ### Fixed
+- `bench report -dest` finishes on runs with tens of millions of events. It
+  reads the event files once, one file at a time. Of the events it keeps only
+  the `ttfic` and `wake` fields that the restore join reads, and only when the
+  bundle has `atelet_restores.jsonl` or `restore_timings.jsonl`. Before, it
+  held every event file and every parsed event in memory, and it recounted
+  the live environments on each event. `bench report <events.jsonl>` had the
+  same recount and held the file in memory; it now streams the file. The
+  output of both does not change.
 - Python client: `close_async()` on the caller's loop ends an image pre-flight
   (`FleetConfig.preflight`, `preflight_images_async`) at once, also one that
   is between two requests: in its pool-listing backoff, in the golden poll,
