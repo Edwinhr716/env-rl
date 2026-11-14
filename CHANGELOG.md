@@ -147,6 +147,15 @@ user needs to know across them.
 - Python client: `Client(credentials=...)` connects to ate-env-api over TLS
   with the given `grpc.ChannelCredentials`, as the Go client can with
   `DialOptions`. Without it the channel stays plaintext.
+- `swebench-loader run -domain-width N`: in eval mode with `-placement`, runs
+  N tasks at a time in each placement domain, a closed loop per domain, in
+  place of `-width` across the run. Replay k of an image goes to the k-th of
+  its domains (`EnvBackend` `DomainFor` and `CreateInDomain`). The run
+  records the `domain_width` label, so `report -arm` keeps runs with
+  different domain widths apart, and no `width` label, so reps may differ in
+  `-width`. `load_max_concurrent` is the sum over the domain queues of N, or
+  of a queue's tasks when it has fewer. `run_fleet_bench.py` refuses
+  `--label placement` and `--label domain_width`, as the loader does.
 - `swebench-loader run -preflight`: with `-placement`, runs the pre-flight
   over the plan inside the same command before the run (the `preflight`
   subcommand's defaults), writing `preflight-events.jsonl` and

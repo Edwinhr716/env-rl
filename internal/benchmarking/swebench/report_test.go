@@ -557,6 +557,7 @@ func TestPool(t *testing.T) {
 	}
 	same := map[string]string{"mode": "eval", "width": "2", "commit": "aaa"}
 	other := map[string]string{"mode": "eval", "width": "2", "commit": "bbb"}
+	domain := map[string]string{"mode": "eval", "width": "2", "domain_width": "2"}
 	rep, err := Pool([][]Event{run("r1", same), run("r2", other)})
 	if err != nil {
 		t.Fatal(err)
@@ -573,6 +574,8 @@ func TestPool(t *testing.T) {
 		{"run id twice", [][]Event{run("r1", same), run("r1", same)}, `rep 2 repeats run id "r1" of rep 1`},
 		{"other workload", [][]Event{run("r1", same), run("r2", map[string]string{"mode": "eval", "width": "3"})}, `rep 2 differs from rep 1 in width ("3", "2")`},
 		{"no loader labels", [][]Event{run("r1", same), run("r2", nil)}, `rep 2 (run "r2") has no loader labels`},
+		{"other domain width", [][]Event{run("r1", domain), run("r2", map[string]string{"mode": "eval", "width": "2", "domain_width": "3"})}, `rep 2 differs from rep 1 in domain_width ("3", "2")`},
+		{"no domain width", [][]Event{run("r1", domain), run("r2", same)}, `rep 2 differs from rep 1 in domain_width ("", "2")`},
 		{"two runs in one file", [][]Event{append(run("r1", same), run("r2", same)...)}, "rep 1 holds 2 run events"},
 		{"other -set value", [][]Event{run("r1", same), run("r2", map[string]string{"mode": "eval", "width": "2", "set.READ_FILES": "10"})}, `rep 2 differs from rep 1 in set.READ_FILES ("10", "")`},
 	} {
