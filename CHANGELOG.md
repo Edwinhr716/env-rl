@@ -358,6 +358,14 @@ user needs to know across them.
   dataset tag loses its `/var/run/ko/` prefix. `bench reap -prefix run-` writes `run` as the run id of
   `events/reap.jsonl`, and `bench upload` copies the bundle's files into
   `gs://<bucket>/<folder>/` itself, not into a `<folder>/<dir>/` subdirectory.
+- `swebench-loader run -task-order round` (eval): run replay k of every image
+  before replay k+1 instead of an image's replays back to back, which with
+  `-placement` had sent them to one node at once. The default `image` order is
+  unchanged and records no label; a `round` run records `task_order=round`,
+  which `report -arm` compares, so the two orders do not pool. `round` is
+  refused with `-strategy`, which plans its own order. With `-domain-width`
+  the order applies in each domain's queue. `run_fleet_bench.py` refuses
+  `--label task_order`, as the loader does.
 - swebench-loader: `run -delete-rate` caps the environment deletes per second
   through ate-env-api (default 200; 0 removes the cap), and a delete the
   bucket rate-limits (429, `ResourceExhausted`) is retried with backoff for

@@ -211,6 +211,7 @@ set how many, and one paces their deletes:
 | `-domain-width` | eval with `-placement`: actors in flight at once in each placement domain, in place of `-width`; the run has up to N times the number of domains in flight |
 | `-delete-rate` | most environment deletes per second through ate-env-api, per loader process (several loaders at once add their caps up), 200 by default; 0 removes the cap. The bucket rate-limits snapshot deletes, and a delete it refuses (429, `ResourceExhausted`) is retried with backoff for up to two minutes. The queue wait and the backoff count in the `delete` event and in the `park_s` of a `-park delete` run; the run records the cap as the `delete_rate` label |
 | `-tasks-per-image` | eval: actors created per image, each a full create, replay, delete |
+| `-task-order` | eval: `image` (default) runs an image's replays back to back, which with `-placement` and no `-domain-width` sends them all to one node at once; `round` runs replay k of every image before replay k+1, spreading one image's creates over the run (not with `-strategy`). With `-domain-width` the order applies in each domain's queue. An image with no more replays than domains has at most one replay in each domain, and `round` then spreads nothing for it. A `round` run records the `task_order` label |
 | `-rollouts` | steps: actors per image kept alive across the training steps |
 
 So `-images 445` is many images with one actor each, `-images 1

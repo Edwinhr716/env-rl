@@ -89,6 +89,15 @@ type Config struct {
 	Width int
 	// TasksPerImage is the eval mode fan-out per image.
 	TasksPerImage int
+	// TaskOrder is the order eval mode visits (image, replay) pairs: "image"
+	// (the default) runs every replay of an image back to back; "round" runs
+	// replay k of every image before replay k+1, so the replays of one image
+	// are spread over the run. With -placement and without a domain width,
+	// "image" sends an image's TasksPerImage creates to the same node at
+	// once. With a DomainWidth the order applies in each domain's queue.
+	// "round" is refused outside eval mode and with a Strategy, which plans
+	// its own order.
+	TaskOrder string
 	// DomainWidth, when above zero, makes eval mode a closed loop per
 	// placement domain: each domain runs its own tasks DomainWidth at a time
 	// and Width is not used. Replay k of an image goes to the k-th of the
@@ -188,7 +197,7 @@ var LoaderLabelKeys = []string{
 	"mode", "strategy", "window_size", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
 	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
 	"dataset", "connections", "delete_rate", "base_template", "exclude_file", "instances", "seed", "images_per_step",
-	"park_each", "placement", "domain_width",
+	"park_each", "placement", "task_order", "domain_width",
 }
 
 // labels describes the run for its run event.
@@ -215,6 +224,11 @@ func (c *Config) labels() map[string]string {
 	switch c.Mode {
 	case ModeEval:
 		l["tasks_per_image"] = strconv.Itoa(c.TasksPerImage)
+		// Recorded for round only, like park_each: the default image order
+		// leaves no label, so reps from before the flag pool with new ones.
+		if c.TaskOrder == TaskOrderRound {
+			l["task_order"] = c.TaskOrder
+		}
 		if c.DomainWidth > 0 {
 			// Width is not used: reps that differ only in it are one workload.
 			l["domain_width"] = strconv.Itoa(c.DomainWidth)
@@ -312,6 +326,8 @@ func (c *Config) validate() error {
 			return errors.New("prefetch belongs to the schedule's step loop; a strategy prefetches by its window (pipelined)")
 		case c.Schedule != nil:
 			return errors.New("a schedule drives the step loop; it cannot be combined with a strategy")
+		case c.TaskOrder == TaskOrderRound:
+			return errors.New("task order round belongs to eval's loop; it cannot be combined with a strategy")
 		}
 	}
 	if c.Schedule != nil && c.Mode == ModeSteps && len(c.Schedule.Jobs) > 0 {
@@ -352,6 +368,11 @@ func (c *Config) validate() error {
 	if c.Trajectory == nil {
 		c.Trajectory = c.Trajectories[0]
 	}
+	switch c.TaskOrder {
+	case "", TaskOrderImage, TaskOrderRound:
+	default:
+		return fmt.Errorf("task order must be %q or %q, got %q", TaskOrderImage, TaskOrderRound, c.TaskOrder)
+	}
 	switch c.Mode {
 	case ModeEval:
 		if c.TasksPerImage < 1 {
@@ -361,6 +382,9 @@ func (c *Config) validate() error {
 			return errors.New("domain width must be >= 0")
 		}
 	case ModeSteps:
+		if c.TaskOrder == TaskOrderRound {
+			return errors.New("task order round applies to eval mode only")
+		}
 		if c.Rollouts < 1 || c.Steps < 1 {
 			return errors.New("rollouts and steps must be >= 1")
 		}
@@ -385,6 +409,9 @@ func (c *Config) validate() error {
 			return errors.New("park each keeps one fleet across the steps; it cannot be combined with images per step")
 		}
 	case ModeOpenLoop:
+		if c.TaskOrder == TaskOrderRound {
+			return errors.New("task order round applies to eval mode only")
+		}
 		if c.TasksPerImage < 1 {
 			c.TasksPerImage = 1
 		}
@@ -791,7 +818,35 @@ func (r *runner) plan() ([]*environment, error) {
 			})
 		}
 	}
+	if r.cfg.Mode == ModeEval && r.cfg.TaskOrder == TaskOrderRound {
+		envs = roundOrder(envs, len(r.cfg.Instances), fanout)
+	}
 	return envs, nil
+}
+
+// Task orders for eval mode; see Config.TaskOrder.
+const (
+	TaskOrderImage = "image"
+	TaskOrderRound = "round"
+)
+
+// roundOrder reorders envs planned image-major (instance i, replay k at
+// index i*fanout+k) into round-major order (replay 0 of every instance, then
+// replay 1, ...), keeping the instance order within a round. The trajectory
+// picked for each environment is unchanged, so a seed still assigns the
+// same trajectory to the same environment.
+func roundOrder(envs []*environment, instances, fanout int) []*environment {
+	// The length test is a safety check: plan() always passes instances*fanout.
+	if fanout <= 1 || len(envs) != instances*fanout {
+		return envs
+	}
+	out := make([]*environment, 0, len(envs))
+	for k := 0; k < fanout; k++ {
+		for i := 0; i < instances; i++ {
+			out = append(out, envs[i*fanout+k])
+		}
+	}
+	return out
 }
 
 // EnvID derives a Substrate-valid name (lowercase alphanumerics and '-', at

@@ -1136,6 +1136,23 @@ func TestLabelsAreDeclared(t *testing.T) {
 			}
 		}
 	}
+	// Eval-only labels: task_order is recorded for round and must be a key
+	// report -arm compares; the default image order leaves no label.
+	eval = Config{Mode: ModeEval, Width: 3, Trajectory: &Trajectory{Name: "t"}, TasksPerImage: 2, TaskOrder: TaskOrderRound,
+		CreateTimeout: time.Minute, StepTimeout: time.Minute, WakeBudget: time.Minute, WakeBackoff: time.Second}
+	el := eval.labels()
+	if el["task_order"] != TaskOrderRound {
+		t.Fatalf("eval labels = %v, want task_order=round", el)
+	}
+	for k := range el {
+		if !slices.Contains(LoaderLabelKeys, k) {
+			t.Errorf("the loader records %s but LoaderLabelKeys lacks it, so report -arm would not compare it", k)
+		}
+	}
+	eval.TaskOrder = TaskOrderImage
+	if _, ok := eval.labels()["task_order"]; ok {
+		t.Errorf("task_order=image must leave no label, so reps from before the flag pool with new ones")
+	}
 }
 
 // An operator label may not take a key the loader records: report -arm

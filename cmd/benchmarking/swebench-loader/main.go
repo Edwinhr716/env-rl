@@ -962,6 +962,7 @@ func runCmd(args []string) (retErr error) {
 		width            = fs.Int("width", 50, "Most tasks in flight at once.")
 		arrivalRate      = fs.Float64("arrival-rate", 0, "open-loop: Poisson task arrival rate in tasks/sec.")
 		tasksPerImage    = fs.Int("tasks-per-image", 1, "eval: replays per image.")
+		taskOrder        = fs.String("task-order", "image", "eval: the order of the (image, replay) pairs. image runs an image's replays back to back (with -placement and no -domain-width they all land on one node at once); round runs replay k of every image before replay k+1, which spreads one image's creates over the run (not with -strategy). With -domain-width the order applies in each domain's queue.")
 		domainWidth      = fs.Int("domain-width", 0, "eval with -placement: run this many tasks at once in each placement domain, a closed loop per domain, instead of -width across the run; replay k of an image goes to the k-th of its domains. 0 disables.")
 		rollouts         = fs.Int("rollouts", 2, "steps: environments per image.")
 		steps            = fs.Int("steps", 8, "steps: training steps.")
@@ -1180,7 +1181,7 @@ func runCmd(args []string) (retErr error) {
 		environments = *imagesPerStep * fanout // per step
 	}
 	log.Info("plan", slog.String("run", *runID), slog.String("mode", *mode),
-		slog.String("strategy", *strategy), slog.Int("window_size", *windowSize),
+		slog.String("strategy", *strategy), slog.Int("window_size", *windowSize), slog.String("task_order", *taskOrder),
 		slog.Int("images", len(selected)),
 		slog.Int("images_per_step", *imagesPerStep),
 		slog.Int("environments", environments), slog.Int("width", *width), slog.Int("steps", *steps),
@@ -1199,6 +1200,7 @@ func runCmd(args []string) (retErr error) {
 		Width:         *width,
 		ArrivalRate:   *arrivalRate,
 		TasksPerImage: *tasksPerImage,
+		TaskOrder:     *taskOrder,
 		DomainWidth:   *domainWidth,
 		Rollouts:      *rollouts,
 		Steps:         *steps,
