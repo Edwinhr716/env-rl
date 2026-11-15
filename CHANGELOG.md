@@ -37,6 +37,14 @@ user needs to know across them.
 - CI: the weekly workflow `e2b-drift` runs the tests of `integrations/e2b`
   and the Kind test of the E2B classes against the newest `e2b` below 3, not
   the version in `uv.lock`. It is not a required check.
+- Python client: `SandboxFleet.preflight_report()` and
+  `AsyncSandboxFleet.preflight_report()` return a `PreflightReport`: a
+  `connectivity` check, one check per loaded image's derived template and
+  golden snapshot (`GetImageStatus`), and a `placement` check
+  (`ListPlacementDomains`, narrowed by `node_selector` and `placement`). An RPC
+  that the server does not serve makes its check `skipped`.
+  `preflight_report(strict=True)` raises `PreflightError` naming the failed
+  checks. `preflight()` does not change (FL-1 to FL-4).
 - `integrations/e2b`: the package `ate-env-e2b` (e2b 2.63 to below 3, Python
   3.11 or newer). `ate_env_e2b.Sandbox` and `ate_env_e2b.AsyncSandbox` are
   subclasses of `e2b.Sandbox` and `e2b.AsyncSandbox`: a program changes its
