@@ -155,7 +155,8 @@ type Config struct {
 	// budget answers Unavailable, and a first create whose image is still
 	// being golden-baked answers Unknown until the bake is done. WakeBackoff
 	// is the initial pause between attempts; it doubles up to five times
-	// that.
+	// that. The step loop's park retries a suspend on the same errors, with
+	// the same budget and pauses.
 	WakeBudget  time.Duration
 	WakeBackoff time.Duration
 	// Keep leaves the environments in place when the run ends.
@@ -1841,11 +1842,12 @@ func isNotFound(err error) bool {
 	return ok && st.Code() == codes.NotFound
 }
 
-// isTransient reports whether a first-command error is worth another try.
-// Unavailable is the router giving up on a wake; DeadlineExceeded, Unknown,
-// Internal and Aborted are what a resume that races the golden bake or a
-// worker restart surfaces as. Argument and precondition errors are not
-// retried.
+// isTransient reports whether a first-command or suspend error is worth
+// another try. Unavailable is the router giving up on a wake, or the control
+// plane failing its call to atelet; DeadlineExceeded, Unknown, Internal and
+// Aborted are what a resume that races the golden bake or a worker restart,
+// or a suspend that meets a concurrent update, surfaces as. Argument and
+// precondition errors are not retried.
 func isTransient(err error) bool {
 	st, ok := status.FromError(err)
 	if !ok {
@@ -1858,23 +1860,40 @@ func isTransient(err error) bool {
 	return false
 }
 
+// suspendWithMode parks e. A suspend that fails with a transient error
+// (isTransient) is sent again, with the first-command pauses, until the next
+// pause would end after WakeBudget or ctx is done. Each failing suspend keeps
+// its -width slot for the full budget; there is no run-wide cap, so in a
+// control-plane outage parking N environments at width W takes about ceil(N/W)
+// budgets, as the first-command retry does. A repeat is safe: a suspend of an
+// environment that is already suspended succeeds (env.Client.Suspend). The
+// suspend event covers every attempt and the pauses, and records the attempts.
 func (r *runner) suspendWithMode(ctx context.Context, e *environment, step int, async bool) {
 	start := time.Now()
+	deadline := start.Add(r.cfg.WakeBudget)
+	wait := r.cfg.WakeBackoff
 	var err error
-	if ms, ok := e.sb.(ModeSuspender); ok {
-		err = ms.SuspendWithMode(ctx, async)
-	} else if async {
-		if as, ok := e.sb.(AsyncSuspender); ok {
-			err = as.SuspendAsync(ctx)
-		} else {
-			err = e.sb.Suspend(ctx)
+	attempts := 0
+	for {
+		attempts++
+		err = suspendSandbox(ctx, e.sb, async)
+		if err == nil || !isTransient(err) || time.Now().Add(wait).After(deadline) {
+			break
 		}
-	} else {
-		err = e.sb.Suspend(ctx)
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		wait = min(wait*2, 5*r.cfg.WakeBackoff)
 	}
-	r.rec.Record(r.event(EventSuspend, e, step, time.Since(start), err))
+	ev := r.event(EventSuspend, e, step, time.Since(start), err)
+	ev.Attempts = attempts
+	r.rec.Record(ev)
 	if err != nil {
-		r.log.Warn("suspend failed", slog.String("env", e.id), slog.String("err", err.Error()))
+		r.log.Warn("suspend failed", slog.String("env", e.id), slog.Int("attempts", attempts), slog.String("err", err.Error()))
 	}
 }
 

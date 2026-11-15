@@ -634,6 +634,15 @@ user needs to know across them.
   stays as a re-export of the new module, with the same names.
 
 ### Fixed
+- swebench-loader: the step loop's park (`-mode steps` without `-strategy`
+  and without the working-set flags) sends a suspend again when it fails
+  with a transient error: gRPC `Unavailable`, `DeadlineExceeded`, `Unknown`,
+  `Internal` or `Aborted`. It pauses `-wake-backoff` between attempts,
+  doubling up to five times that, and stops when the next pause would end
+  after `-wake-budget`: at most 20 attempts with the defaults. Before, the
+  first such error failed the suspend. The `suspend` event covers every
+  attempt and the pauses and carries `attempts`; the report counts it as
+  `retried`.
 - `bench report -dest` finishes on runs with tens of millions of events. It
   reads the event files once, one file at a time. Of the events it keeps only
   the `ttfic` and `wake` fields that the restore join reads, and only when the
