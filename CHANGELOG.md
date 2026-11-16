@@ -16,6 +16,12 @@ user needs to know across them.
   the provider's tests on the newest Harbor inside the bounds, outside the uv
   workspace: on a pull request that changes the provider or the Python
   client, each week, and on demand (HB-29).
+- Python client: `SandboxHandle.release()` and `recycle()` (and their async
+  forms) run once per handle: a call after a release or recycle that succeeded,
+  or while another caller releases the handle, does nothing, and the fleet
+  records no `release` phase for it. Before, each call went to the backend
+  again. A release that failed, was interrupted or was cancelled can be called
+  again.
 - Go client: the install steps in `clients/go/README.md` set
   `GOPRIVATE=github.com/ai-on-gke/*`, because the repository is private.
   Without it, `go mod tidy` takes `@main` from `proxy.golang.org`, which
@@ -71,6 +77,17 @@ user needs to know across them.
 - CI: the weekly workflow `e2b-drift` runs the tests of `integrations/e2b`
   and the Kind test of the E2B classes against the newest `e2b` below 3, not
   the version in `uv.lock`. It is not a required check.
+- Python client: `FleetConfig(exit_hooks=True)` tears a `SandboxFleet` down
+  once at interpreter exit or on `SIGINT`/`SIGTERM`, then calls the handler that
+  was installed before (FL-5 to FL-7). Off by default. All such fleets share one
+  handler per signal, and a forked child does not tear down its parent's run.
+  A failed teardown keeps the `atexit` hook to retry on interpreter exit, and
+  signals with disposition `SIG_IGN` are not intercepted. `AsyncSandboxFleet`
+  refuses the option with a `ValueError` (#398).
+- Python client: `AsyncSandboxFleet.recycle()`, and `release_all()` on both
+  fleets, which releases each handle not yet released or recycled and returns
+  how many it released; a handle whose release fails stays for the next call
+  (FL-8, FL-9).
 - Python client: `SandboxFleet.preflight_report()` and
   `AsyncSandboxFleet.preflight_report()` return a `PreflightReport`: a
   `connectivity` check, one check per loaded image's derived template and
