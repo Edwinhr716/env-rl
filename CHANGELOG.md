@@ -44,6 +44,24 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- Port proxy: a hostname form, off by default. With
+  `ate-env-api --port-proxy-host-suffix <domain>` (on the Deployment:
+  `ate-env manifest --port-proxy-host-suffix`), a request whose `Host` is
+  `<port>-<id>.<domain>`, or `<port>-<id>.<atespace>.<domain>` outside the
+  default atespace, goes to that environment port with its whole path and
+  query. The caller checks are those of the path form: the token, or a port
+  capability on a WebSocket handshake, `--port-proxy-atespaces`, and the
+  cross-origin check, which also separates one environment port from
+  another. The domain and each name below it serve environment ports only:
+  another name there gets 400, and so does a request that also carries
+  `X-Env-Id`, `X-Env-Atespace` or `X-Env-Port`. The operator provides wildcard
+  DNS and TLS for the domain in front of `ate-env-api`; the manifest renders
+  none. The domain has two labels or more: `com` is refused. Use a domain
+  that serves nothing else: the ports of all environments are one site for a
+  browser's cookies, and `ate-env-api` does not start when the domain covers
+  `localhost`, a name of its Service or a name in `--allowed-hosts`, or when
+  the port proxy is off (`--atenet-connect` empty).
+  `ate_env_e2b.Sandbox.get_host` does not use the form yet.
 - `ListEnvironments` on `EnvironmentService`: the environments of one
   atespace, one page per call. `page_size` defaults to 100, and the server
   lowers a value above 1000 to 1000. `page_token` is Substrate's token. An

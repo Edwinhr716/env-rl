@@ -115,6 +115,26 @@ func serviceHostNames(service string, readFile func(string) ([]byte, error), get
 	return hostcheck.ServiceHosts(service, namespace, domain)
 }
 
+// checkPortProxyHostSuffix checks --port-proxy-host-suffix before the server
+// starts. An empty suffix leaves the hostname form off and passes. The
+// domain of the form serves environment ports only, thus it must not cover a
+// name that callers use for the API (portproxy.APIHosts). With an empty
+// --atenet-connect the port proxy is off and nothing serves the form: each
+// name under the suffix would get the 403 of the Host check, and no log line
+// would say why. That is a fault of the start, as a wrong value is.
+func checkPortProxyHostSuffix(suffix, atenetConnect string, serviceHosts, allowedHosts []string) error {
+	if suffix == "" {
+		return nil
+	}
+	if _, err := portproxy.CheckHostSuffix(suffix, portproxy.APIHosts(serviceHosts, allowedHosts)); err != nil {
+		return fmt.Errorf("--port-proxy-host-suffix: %w", err)
+	}
+	if atenetConnect == "" {
+		return fmt.Errorf("--port-proxy-host-suffix %q: the port proxy is off because --atenet-connect is empty, thus no request under the suffix is served; set --atenet-connect, or remove the suffix", suffix)
+	}
+	return nil
+}
+
 // otelServiceName is the OpenTelemetry service.name of the API server's spans.
 const otelServiceName = "ate-env-api"
 
@@ -125,7 +145,8 @@ func main() {
 		atenet            = flag.String("atenet", ate.DefaultRouterAddr, "address of the atenet router for the guest's gRPC: its HTTPS listener (443) with -atenet-client-cert, else the plaintext one, which only the test fakes serve")
 		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's CONNECT listener: the TLS one (8444) with -atenet-client-cert, else the plaintext one, which only the test fakes serve; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. Without -auth-token-file the forwarding does not authenticate callers, and it reaches any port of any actor in the atespaces -port-proxy-atespaces names. Empty disables it")
 		ppAtespaces       = flag.String("port-proxy-atespaces", ate.DefaultAtespace, "comma-separated atespaces whose environments the port proxy forwards to, or * for any")
-		ppOrigins         = flag.String("port-proxy-trusted-origins", "", "comma-separated browser origins (scheme://host[:port]) whose pages may use the port proxy's path form, next to the listener's own origin")
+		ppOrigins         = flag.String("port-proxy-trusted-origins", "", "comma-separated browser origins (scheme://host[:port]) whose pages may use the port proxy's path form and hostname form, next to the request's own origin")
+		ppHostSuffix      = flag.String("port-proxy-host-suffix", "", "domain name of two labels or more that turns on the port proxy's hostname form: a request whose Host is <port>-<id>.<domain>, or <port>-<id>.<atespace>.<domain>, goes to that environment port with the caller checks of the path form. The domain and every name below it serve environment ports only, never the API. Wildcard DNS and TLS for it are provided in front of ate-env-api. Empty (the default) turns the form off")
 		ppHeaderTimeout   = flag.Duration("port-proxy-response-header-timeout", 0, "how long the port proxy waits for a daemon's response headers; 0 means no limit, and the caller's deadline applies")
 		ppWakeWaitCap     = flag.Duration("port-proxy-wake-wait-cap", portproxy.DefaultWakeWaitCap, "the longest the port proxy holds a request that asks for it with the X-Env-Wake-Wait header (whole seconds) while a suspended environment wakes, before it forwards the request; a larger value in the header is cut to this, and a wake that lasts longer gets 503 with Retry-After as without the header. 0 or less turns the hold off; the header is then still validated and not forwarded")
 		hostSuffix        = flag.String("host-suffix", ate.DefaultHostSuffix, "atenet router host suffix for actor routing")
@@ -176,6 +197,9 @@ func main() {
 	hosts, err := hostcheck.New(append(serviceHosts, hostcheck.ParseList(*allowedHosts)...))
 	if err != nil {
 		log.Fatalf("--allowed-hosts: %v", err)
+	}
+	if err := checkPortProxyHostSuffix(*ppHostSuffix, *atenetConn, serviceHosts, hostcheck.ParseList(*allowedHosts)); err != nil {
+		log.Fatal(err)
 	}
 
 	var callerAuth *apiservice.BearerAuth
@@ -322,6 +346,7 @@ func main() {
 			DefaultAtespace:       ate.DefaultAtespace,
 			ResponseHeaderTimeout: *ppHeaderTimeout,
 			TrustedOrigins:        origins,
+			PortHostSuffix:        *ppHostSuffix,
 			WakeBudget:            *wakeBudget,
 			WakeWaitCap:           *ppWakeWaitCap,
 			Atespaces:             atespaces,
@@ -335,8 +360,10 @@ func main() {
 		if err != nil {
 			log.Fatalf("port proxy: %v", err)
 		}
-		// Header form and path form, /v1alpha/envs/{id}/ports/{port}/...
-		handler = portproxy.Dispatch(pp, mux, hosts.Wrap)
+		// Header form, path form (/v1alpha/envs/{id}/ports/{port}/...) and,
+		// with -port-proxy-host-suffix, hostname form. The Host check lets
+		// the names of the hostname form pass on the proxy's route only.
+		handler = portproxy.Dispatch(pp, mux, hosts.WrapFor(pp.ServesHost))
 	}
 
 	// Enable both HTTP/1.1 (for /healthz and /v1alpha/ HTTP endpoints) and
