@@ -38,6 +38,19 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- ate-env-api: the environment store, off by default
+  (`--environment-store=configmaps`; `ate-env manifest
+  --environment-metadata` adds the flag, a Role and a RoleBinding on the
+  ConfigMaps of the namespace, and the Kubernetes API token in the pod). It
+  is where the labels and the deadline of an environment go, which Substrate
+  has no field for: one ConfigMap for each such environment. This release has
+  the store, the delete of the object with its environment, and a sweep that
+  removes an object whose actor is gone or has another uid. No API field
+  writes labels or a deadline yet. The Role grants `list`, `watch`, `create`
+  and `delete`, the calls the store makes. The store's Kubernetes client has
+  a rate limit of its own, `--environment-store-qps` (default 50) and
+  `--environment-store-burst` (default 100), not the 5 per second of
+  client-go's default.
 - `examples/e2b-envd-layer`: an E2B-compatible sandbox from any image, with
   upstream envd as an added runtime layer. `demo.sh` builds the layer,
   registers the base template and runs an E2B SDK program on two images.
