@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import collections
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from datetime import timedelta
 from typing import Any
@@ -47,6 +47,8 @@ from .telemetry.tracing import (
 )
 from .types import (
     EnvironmentInfo,
+    EnvironmentPage,
+    EnvironmentStatus,
     ImageStatus,
     PlacementDomain,
     ServerInfo,
@@ -75,6 +77,11 @@ def _normalize_target(endpoint: str) -> str:
 
 
 _ENVIRONMENT_SERVICE = "ateenv.v1alpha.EnvironmentService"
+
+# The range of an int32 proto field. protobuf raises ValueError for a value
+# outside it when the message is built, before any RPC.
+_INT32_MIN = -(2**31)
+_INT32_MAX = 2**31 - 1
 
 
 def _env_rpc_attrs(method: str, target: str | None) -> dict[str, object]:
@@ -366,6 +373,52 @@ class Client:
             except grpc.RpcError as e:
                 raise map_rpc_error(e) from e
         return _environment_info_from_pb(resp.environment)
+
+    async def list_environments(
+        self,
+        *,
+        atespace: str = DEFAULT_ATESPACE,
+        page_size: int = 0,
+        page_token: str = "",
+        statuses: Iterable[EnvironmentStatus] = (),
+    ) -> EnvironmentPage:
+        """One page of the environments of one atespace.
+
+        ``page_size`` is how many environments the server reads for the page:
+        0 means the server default (100), and the server lowers a value above
+        1000 to 1000 and refuses a negative one (``InvalidArgumentError``).
+        The field is an int32: the client sends a value outside that range as
+        the nearest int32, thus a larger value is lowered and a negative one
+        is refused all the same. ``page_token`` is the ``next_page_token`` of the
+        previous page, "" for the first. With ``statuses``, the server keeps
+        the environments of the page it read whose status is in the set. A
+        page can thus hold fewer environments than ``page_size``, or none,
+        while ``next_page_token`` is set: follow the token until it is "".
+        ``EnvironmentStatus.UNSPECIFIED`` is a status like the others, not
+        "all": it keeps only the environments whose state the server cannot
+        name.
+        """
+        req = env_pb2.ListEnvironmentsRequest(
+            atespace=atespace,
+            page_size=max(_INT32_MIN, min(page_size, _INT32_MAX)),
+            page_token=page_token,
+            statuses=[int(s) for s in statuses],
+        )
+        with self._rpc_span(
+            "list_environments",
+            "ListEnvironments",
+            lambda: {"ate.atespace": atespace},
+        ):
+            try:
+                resp = await self._environments.ListEnvironments(
+                    req, metadata=self._auth_metadata()
+                )
+            except grpc.RpcError as e:
+                raise map_rpc_error(e) from e
+        return EnvironmentPage(
+            environments=tuple(_environment_info_from_pb(e) for e in resp.environments),
+            next_page_token=resp.next_page_token,
+        )
 
     async def suspend(
         self,

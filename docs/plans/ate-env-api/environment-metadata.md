@@ -79,9 +79,9 @@ Substrate assigns the uid and the create time of an actor in `CreateActor` and i
 `CreateActor`, and a crash between the two leaves an object with no `uid` next to a live actor,
 which the orphan rule must then not delete. That is why EM-E chose the other order: the actor first,
 then one write of the object with the `uid`. Its crash window leaves an actor without an object,
-thus an environment without the deadline that its caller asked for. Today
-`internal/ate.Client.CreateActor` drops the actor that `CreateActor` returns; the pull request that
-adds the first create field keeps its uid.
+thus an environment without the deadline that its caller asked for.
+`internal/ate.Client.CreateActor` returns the actor that `CreateActor` returns (since #392, which
+reads its `create_time`); the pull request that adds the first create field keeps its uid.
 
 ### The sweep
 

@@ -75,6 +75,7 @@ actor boots. Retry until it serves (see the how-to below).
 | `Client.get()` / `Env.info()` | `EnvironmentService.GetEnvironment` | ate-env-api → control plane |
 | `Client.suspend()` / `Env.suspend()` | `EnvironmentService.SuspendEnvironment` | ate-env-api → control plane |
 | `Client.delete()` / `Env.delete()` | `EnvironmentService.DeleteEnvironment` | ate-env-api → control plane |
+| `Client.list_environments()` | `EnvironmentService.ListEnvironments` | ate-env-api → control plane |
 | `Client.server_info()` | `EnvironmentService.GetServerInfo` | answered by ate-env-api |
 | `Client.env()` | *(no RPC — returns a handle)* | — |
 | `Env.start_process()` | `ProcessService.StartProcess` | proxied to guest |
@@ -168,6 +169,21 @@ env = await client.create("py1", rootfs_image="docker.io/library/python@sha256:�
 env = await client.create("t1", rootfs_image="…@sha256:…", worker_selector={"ate-env/domain": "d0"})
 info = await client.get("t1")
 print((await env.info()).template.name)   # default-template-<12 hex of the digest>
+```
+
+To list the environments of an atespace, read pages until the token is empty.
+`statuses` filters each page on the server after it reads it, thus a page can
+be short, or empty, while `next_page_token` is set:
+
+```python
+token = ""
+while True:
+    page = await client.list_environments(page_token=token, statuses=[EnvironmentStatus.RUNNING])
+    for info in page.environments:
+        print(info.id, info.status.name, info.node, info.create_time)
+    token = page.next_page_token
+    if not token:
+        break
 ```
 
 To get a handle to an environment that already exists (no RPC is made):

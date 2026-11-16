@@ -169,6 +169,18 @@ both `node` and `worker_selector`.
 Accepted risk for now: this hardening is not needed for RL at the moment. Revisit it before the
 API serves callers other than trusted RL jobs.
 
+## Listing environments
+
+`ListEnvironments` returns the environments of one atespace: id, template, status, node, worker
+selector and create time, the fields `GetEnvironment` reports plus `Environment.create_time`.
+`ate-env-api` reads them with Substrate's `ListActors` on that atespace under its own identity.
+The `editor` role of the access policy already allows that call, thus the RPC adds no privilege.
+
+| Threat | Current mitigation | Gap |
+|---|---|---|
+| A caller enumerates the environments of other callers | The token (Boundary 1). The list reads one atespace for each call, with the access that the policy gives `ate-env-api`: the `editor` role on the atespaces an operator adds. | The RPC has no list of allowed atespaces. With the global viewer binding (`ate-env manifest access-policy --global`, which `ListPlacementDomains` needs), `ate-env-api` can list the actors of each atespace of the control plane, also ones that ate-env did not create, thus a token holder can too. Each token holder reads the id, template, status, node and create time of every environment in every atespace that `ate-env-api` can read. Before, a caller had to know an id to read these with `GetEnvironment`. With an id, a token holder can already run commands in that environment (Boundary 1, one shared token). Tracked in #403; no mitigation is decided. |
+| Large responses | One call asks Substrate for at most 1000 actors (`MaxListPageSize`), 100 by default, and holds one page in memory. Substrate can return a few more than the page size. | No rate limit, as for the other RPCs. |
+
 ## Client tracing
 
 The Python client emits OpenTelemetry spans when `TracerConfig(enable_tracing=True)` is set. The
