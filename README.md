@@ -182,7 +182,8 @@ supported means for each path.
 ## Get started
 
 You need a cluster with Agent Substrate at or after
-[`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c) (with
+[`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c) (2026-10-22; CI tests
+[`v1.0.0`](https://github.com/agent-substrate/substrate/releases/tag/v1.0.0), with
 `spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in `--ingress-allowed-spiffe-ids`), a snapshots
 bucket, `kubectl` with `kubectl-ate`, Go (`1.27` or later), [ko](https://ko.build), and Python
 `3.10` or later for the SDK. The latest
@@ -245,13 +246,19 @@ Then pick an [example](#examples) or an [integration](#integrations).
 
 Prerequisites: a cluster with [Agent Substrate](https://github.com/agent-substrate/substrate)
 installed, with its cluster snapshot location (`ate-setup --snapshot-location`). ate-env is built
-against Substrate [`274605f1`](https://github.com/agent-substrate/substrate/commit/274605f1)
-(2026-11-05, Go module `go.ate.dev/substrate`), and the cluster must run Substrate at or after
-[`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c) (2026-10-22): that commit
-moved the Kubernetes CRDs (`WorkerPool`, `SandboxConfig`) from `ate.dev/v1alpha1` to `ate.dev/v1`
-and the control-plane gRPC service from `/ateapi.Control` to `/substrate.ateapi.v1.Control`.
-Upgrade the control plane, CRDs, and the ate-env images together; with an older
-Substrate (`v0.6.0`), use ate-env from before this bump. The WorkerPool alone chooses the sandbox
+against and tested in CI on Substrate
+[`v1.0.0`](https://github.com/agent-substrate/substrate/releases/tag/v1.0.0)
+([`b34fbee7`](https://github.com/agent-substrate/substrate/commit/b34fbee742906494b5eb4f1f36987176bf8770a4),
+2026-11-05, Go module `go.ate.dev/substrate`, currently tracking `release-1.0`; we do not promise
+to always track stable Substrate versions, so cross-check each sandboxenv-rl release's notes).
+Deployed clusters running Substrate at or after
+[`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c) (2026-10-22) are
+supported: that commit moved the Kubernetes CRDs (`WorkerPool`, `SandboxConfig`) from
+`ate.dev/v1alpha1` to `ate.dev/v1` and the control-plane gRPC service from `/ateapi.Control` to
+`/substrate.ateapi.v1.Control`. When upgrading a cluster from pre-`274605f1` Substrate to `v1.0.0`,
+recreate pre-upgrade gVisor snapshots and register templates without `--snapshots-bucket` unless
+`PerTemplateSnapshotLocation` is enabled. With an older Substrate (`v0.6.0`), use ate-env from
+before `#163`. The WorkerPool alone chooses the sandbox
 (`spec.sandboxClasses`) and the ActorTemplate names none. Because the template no
 longer names a class, an actor booting without a snapshot can land on any pool whose labels its
 template's `workerSelector` matches, and on any pool at all without a selector. `ate-env` labels its
@@ -1134,7 +1141,8 @@ KEEP_CLUSTER=1 make ci-e2e
 # Fast iteration: reuse an existing cluster without re-creating or deleting it
 REUSE_CLUSTER=sbx-e2e-abc123 make ci-e2e
 
-# Verify compatibility against substrate@HEAD (or custom git ref / local path)
+# Verify compatibility against substrate@release-1.0 (or custom git ref / local path)
+make check-substrate-head
 make check-substrate-head ARGS=main
 make check-substrate-head ARGS=../substrate
 

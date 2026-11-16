@@ -11,7 +11,9 @@ require (
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/spf13/cobra v1.10.2
-	go.ate.dev/substrate v0.6.1-0.20261105194526-274605f1f2a8
+	// Tracks Agent Substrate release-1.0 (v1.0.x tags and release-1.0 backports) for now;
+	// later releases are not locked to release-1.0 and may move ahead if upstream APIs require it.
+	go.ate.dev/substrate v1.0.0
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.47.0

@@ -675,7 +675,7 @@ user needs to know across them.
   and push it to your own registry (see `integrations/openhands/README.md`).
   The v0.1.0 image (`oh-agent-server-layer:1.55.0-v0.1.0`) gets no updates: it
   predates the #267 security re-lock. An org admin can delete the package.
-- Built against Substrate `274605f1` (2026-11-05), from `475f49b0`. The
+- Built against Substrate `v1.0.0` (`b34fbee7`, 2026-11-05), from `475f49b0`. The
   control plane API is unchanged for ate-env (`MintActorCertificate`, which
   ate-env never called, is gone). Three runtime changes reach a template.
   Since `5d226a50` the container runs as the image's `USER` in its `WORKDIR`
@@ -690,7 +690,11 @@ user needs to know across them.
   `securityContext.capabilities.add` accepts 12 capabilities only; ate-env
   templates set none. The Kind e2e installs Substrate with
   `ate-setup --kind deploy ate-system`, since Substrate removed
-  `hack/install-ate-kind.sh`.
+  `hack/install-ate-kind.sh`, and `make check-substrate-head` now checks
+  `release-1.0` by default (`ARGS=main` checks upstream `main`). We do not
+  promise to always track stable Substrate versions, so later releases may
+  drift beyond a stable Substrate release; cross-check each sandboxenv-rl
+  release's notes.
 - `ate-env manifest template`: `--snapshots-bucket` is optional. Without it
   the template names no `snapshotConfig.storageLocation` and its snapshots go
   to the cluster's `--snapshot-location`. With it, ate-api-server needs the

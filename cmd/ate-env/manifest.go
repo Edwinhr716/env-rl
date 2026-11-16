@@ -384,7 +384,7 @@ func (c *templateConfig) validateResources() error {
 
 // addCapabilityNames are the capabilities that Substrate lets a container
 // add, sorted. It is a copy of AllowedAddCapabilities in Substrate's
-// internal/resources/validate.go at commit 274605f1, the pin in go.mod: the
+// internal/resources/validate.go at v1.0.0 (b34fbee7), the pin in go.mod: the
 // package is internal, thus this file cannot import it. Update the list with
 // the pin. The names have no CAP_ prefix and Substrate compares them exactly.
 var addCapabilityNames = []string{
