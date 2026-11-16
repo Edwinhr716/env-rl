@@ -40,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
@@ -80,6 +81,8 @@ type Router struct {
 	// open and total count the requests forwarded to guest handlers, by
 	// URL path (the gRPC method): in flight, and since New.
 	open, total map[string]int
+
+	acceptedConns atomic.Int64
 }
 
 type portKey struct {
@@ -194,6 +197,11 @@ func (r *Router) Serve() (addr string, stop func()) {
 
 	srv := httptest.NewUnstartedServer(r)
 	srv.Config.Protocols = &protocols
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			r.acceptedConns.Add(1)
+		}
+	}
 	srv.Start()
 	return strings.TrimPrefix(srv.URL, "http://"), srv.Close
 }
@@ -205,8 +213,18 @@ func (r *Router) ServeTLS(cfg *tls.Config) (addr string, stop func()) {
 	srv := httptest.NewUnstartedServer(r)
 	srv.TLS = cfg
 	srv.EnableHTTP2 = true
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			r.acceptedConns.Add(1)
+		}
+	}
 	srv.StartTLS()
 	return strings.TrimPrefix(srv.URL, "https://"), srv.Close
+}
+
+// AcceptedConns returns the number of TCP connections accepted by the router listener.
+func (r *Router) AcceptedConns() int64 {
+	return r.acceptedConns.Load()
 }
 
 // serveConnect answers a CONNECT like the real router: 200 for any actor

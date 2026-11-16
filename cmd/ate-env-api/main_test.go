@@ -16,12 +16,17 @@ package main
 
 import (
 	"context"
+	"flag"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
@@ -256,5 +261,163 @@ func TestCheckPortProxyHostSuffix(t *testing.T) {
 		case err != nil && !strings.Contains(err.Error(), "--port-proxy-host-suffix"):
 			t.Errorf("checkPortProxyHostSuffix(%q, %q) = %v, want the flag name in the error", tc.suffix, tc.connect, err)
 		}
+	}
+}
+
+// TestResolveGuestRPCOptions checks WF-9 (-router-pool-size and -reactive-wake
+// flag precedence over environment variables and invalid value rejection).
+func TestResolveGuestRPCOptions(t *testing.T) {
+	cases := []struct {
+		name         string
+		args         []string
+		env          map[string]string
+		wantPoolSize int
+		wantReactive bool
+		wantErr      bool
+	}{
+		{
+			name:         "defaults when unset",
+			wantPoolSize: 0,
+			wantReactive: false,
+		},
+		{
+			name: "environment variables apply when flags are omitted",
+			env: map[string]string{
+				"ATE_ENV_ROUTER_POOL_SIZE": "8",
+				"ATE_ENV_REACTIVE_WAKE":    "true",
+			},
+			wantPoolSize: 8,
+			wantReactive: true,
+		},
+		{
+			name: "explicit flags override environment variables",
+			args: []string{"-router-pool-size=0", "-reactive-wake=false"},
+			env: map[string]string{
+				"ATE_ENV_ROUTER_POOL_SIZE": "16",
+				"ATE_ENV_REACTIVE_WAKE":    "true",
+			},
+			wantPoolSize: 0,
+			wantReactive: false,
+		},
+		{
+			name: "explicit positive flags override conflicting environment variables",
+			args: []string{"-router-pool-size=4", "-reactive-wake=true"},
+			env: map[string]string{
+				"ATE_ENV_ROUTER_POOL_SIZE": "bad-when-ignored",
+				"ATE_ENV_REACTIVE_WAKE":    "false",
+			},
+			wantPoolSize: 4,
+			wantReactive: true,
+		},
+		{
+			name:    "invalid ATE_ENV_ROUTER_POOL_SIZE fails",
+			env:     map[string]string{"ATE_ENV_ROUTER_POOL_SIZE": "abc"},
+			wantErr: true,
+		},
+		{
+			name:    "negative ATE_ENV_ROUTER_POOL_SIZE fails",
+			env:     map[string]string{"ATE_ENV_ROUTER_POOL_SIZE": "-2"},
+			wantErr: true,
+		},
+		{
+			name:    "negative -router-pool-size flag fails",
+			args:    []string{"-router-pool-size=-1"},
+			wantErr: true,
+		},
+		{
+			name:    "invalid ATE_ENV_REACTIVE_WAKE fails",
+			env:     map[string]string{"ATE_ENV_REACTIVE_WAKE": "not-a-bool"},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			poolFlag := fs.Int("router-pool-size", 0, "")
+			reactiveFlag := fs.Bool("reactive-wake", false, "")
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("fs.Parse(%v): %v", tc.args, err)
+			}
+			getenv := func(k string) string { return tc.env[k] }
+			gotPool, gotReactive, err := resolveGuestRPCOptions(fs, *poolFlag, *reactiveFlag, getenv)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveGuestRPCOptions(%v, %v) = (%d, %v, nil), want error", tc.args, tc.env, gotPool, gotReactive)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveGuestRPCOptions(%v, %v) unexpected error: %v", tc.args, tc.env, err)
+			}
+			if gotPool != tc.wantPoolSize || gotReactive != tc.wantReactive {
+				t.Errorf("resolveGuestRPCOptions(%v, %v) = (%d, %v), want (%d, %v)",
+					tc.args, tc.env, gotPool, gotReactive, tc.wantPoolSize, tc.wantReactive)
+			}
+		})
+	}
+}
+
+// TestMainExitsOnBadRouterPoolSizeBeforeControlPlane checks that main rejects
+// an invalid -router-pool-size before dialing or waiting on the control plane.
+func TestMainExitsOnBadRouterPoolSizeBeforeControlPlane(t *testing.T) {
+	if os.Getenv("GO_WANT_ATE_ENV_API_MAIN") == "1" {
+		flag.CommandLine = flag.NewFlagSet("ate-env-api", flag.ExitOnError)
+		os.Args = strings.Split(os.Getenv("GO_ATE_ENV_API_ARGS"), "\n")
+		main()
+		return
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer lis.Close()
+
+	var accepted atomic.Int32
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			go func(c net.Conn) {
+				<-done
+				_ = c.Close()
+			}(conn)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	args := []string{
+		"ate-env-api",
+		"-listen=127.0.0.1:0",
+		"-ateapi=" + lis.Addr().String(),
+		"-skip-tls-verify=true",
+		"-router-pool-size=-1",
+	}
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMainExitsOnBadRouterPoolSizeBeforeControlPlane$")
+	cmd.Env = append(os.Environ(),
+		"GO_WANT_ATE_ENV_API_MAIN=1",
+		"GO_ATE_ENV_API_ARGS="+strings.Join(args, "\n"),
+	)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("main hung waiting on control plane: %v\noutput:\n%s", ctx.Err(), out)
+	}
+	if err == nil {
+		t.Fatalf("main exited 0 with -router-pool-size=-1; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "-router-pool-size") {
+		t.Fatalf("expected -router-pool-size error in output, got:\n%s", out)
+	}
+	if got := accepted.Load(); got != 0 {
+		t.Fatalf("control-plane listener accepted %d connection(s) before -router-pool-size was rejected, want 0", got)
 	}
 }

@@ -31,39 +31,39 @@ Companion to [architecture](../architecture.md) and [code layout](./code-layout.
 
 ## Server networking and Substrate boundaries
 
-### 4. Router `ate-target-actor` header deduplication and SPIFFE mTLS
+### 4. Router `ate-target-actor` header deduplication, SPIFFE mTLS, and `guestSession`
 
-- **`internal/apiservice/{server.go,wakeretry.go}` (`guestConn`, `routerCredentials`,
-  `ensureAwake`), `internal/ate/client.go` (`DialGuest`), `internal/routertls/routertls.go`**:
-  Forwarding caller metadata duplicates `ate-target-actor`, which `atenet-router` rejects;
-  `guestConn` and `DialGuest` append `ate-target-actor` without caller metadata.
-  `internal/routertls` reloads kubelet `-atenet-client-cert` and `servicedns` `-atenet-ca-file` on
-  handshakes, and `routertls.TransportCredentials` (`alertConn.Write`) reads TLS 1.3 post-handshake
-  alerts on initial HTTP/2 `EPIPE` so `ensureAwake` matches `routertls.RejectedCertificate`
-  immediately and `DialGuest` gets the alert.
+- **`internal/apiservice/{server,router_interceptor,wakeretry}.go` (`guestSession`, `Close`,
+  `routerUnaryInterceptor`, `routerStreamInterceptor`, `routerCredentials`, `ensureAwake`),
+  `internal/ate/client.go` (`DialGuest`), `internal/routertls/routertls.go`**: Forwarding caller
+  metadata duplicates `ate-target-actor` (`atenet-router` rejects it). `guestSession` and
+  `DialGuest` append it alone; `guestSession` returns `noopClose` on error or `-router-pool-size`
+  (`Close` returns `Unavailable`, `StreamProcessOutput`/`ReadFile` swap `closeFn` on retry).
+  `internal/routertls` reloads `-atenet-client-cert` and `servicedns` `-atenet-ca-file` on
+  handshakes (`routertls.TransportCredentials` `alertConn.Write` reads TLS 1.3 alerts on HTTP/2
+  `EPIPE` for `routertls.RejectedCertificate` in `ensureAwake` and `DialGuest`).
 
-### 5. Actor wake budgets, fail-fast start errors, and actor deletion
+### 5. Actor wake budgets, fail-fast start errors, `boundedAwakeCache`, and deletion
 
-- **Location**: `internal/apiservice/wakeretry.go` (`ensureAwake`, `StartFailureKey`),
-  `internal/ate/client.go` (`Delete`, `evictGuest`).
-- **Wake budgets**: Traffic to a suspended actor resumes it in `atenet`. `ensureAwake` polls
-  `GetProcess("ate-env-wake-probe")` under `DefaultWakeBudget` (5m) and `DefaultWakeRunningBudget`
-  (20s once `RUNNING`), returning `Canceled` or `DeadlineExceeded` probe errors immediately. The
-  state read after an `Unavailable` probe gets the rest of `WakeBudget` (and `WakeNoCapacityGrace`
-  during a no-room run), capped at `WakeStateReadCap` (`-wake-state-read-cap`,
-  `DefaultWakeStateReadCap` = 5s) as the control dial sets no keepalive/timeout. `Unavailable`,
-  `DeadlineExceeded`, or `ResourceExhausted` from that read (or cut at its deadline) leaves the
-  state unknown and the wait continues; if all reads are cut, it probes once per
-  `-wake-state-read-cap` plus backoff and ends at `-wake-budget` with `Unavailable` "while UNKNOWN".
-- **Fail-fast start errors**: `ensureAwake` fails fast: `routertls.RejectedCertificate` returns
-  `codes.FailedPrecondition` with `routertls.RejectionAdvice` and no trailer, `CRASHED` returns
-  `codes.FailedPrecondition` (`ActorStatus.Crash.Message`, trailer
-  `ate-env-start-failure: crashed`), `DELETING` returns `codes.NotFound`, and
-  `"no worker has room for the actor"` over `WakeNoCapacityGrace` while not `RUNNING` (default `0`
-  waits `WakeBudget`) returns `codes.ResourceExhausted` (`ate-env-start-failure: no-capacity`).
-- **Delete sequence**: `internal/ate.Client.Delete` calls `DeleteActor` directly in any state
-  including `CRASHED` (terminating workloads, releasing slots, and deleting snapshots without
-  pre-suspending) and calls `evictGuest` to drop `guestPool`.
+- **Wake budgets (`internal/apiservice/{wakeretry,awake_cache}.go`, `ensureAwake`)**: `atenet`
+  resumes suspended actors as `ensureAwake` polls `GetProcess("ate-env-wake-probe")` under
+  `DefaultWakeBudget` (5m) and `DefaultWakeRunningBudget` (20s once `RUNNING`), returning `Canceled`
+  or `DeadlineExceeded` probe errors immediately (`-reactive-wake` pairs `AddIfGen`/`Generation`,
+  clears `caps` and bumps generation on `Remove`, and keeps `expiresAt` on `RecordCap`). Post-probe
+  state reads get remaining `WakeBudget` (and `WakeNoCapacityGrace` in a no-room run), capped at
+  `WakeStateReadCap` (`-wake-state-read-cap`, `DefaultWakeStateReadCap` = 5s; control dial has no
+  timeout). Read `Unavailable`, `DeadlineExceeded`, or `ResourceExhausted` (or deadline cut) leaves
+  state unknown and waits on; if all reads cut, it probes per `-wake-state-read-cap` plus backoff
+  and ends at `-wake-budget` with `Unavailable` "while UNKNOWN".
+- **Fail-fast (`StartFailureKey`)**: `routertls.RejectedCertificate` returns
+  `codes.FailedPrecondition` (`routertls.RejectionAdvice`, no trailer), `CRASHED` returns
+  `codes.FailedPrecondition` (`ActorStatus.Crash.Message`, `ate-env-start-failure: crashed`),
+  `DELETING` returns `codes.NotFound`, and `"no worker has room for the actor"` over
+  `WakeNoCapacityGrace` while not `RUNNING` (default `0` waits `WakeBudget`) returns
+  `codes.ResourceExhausted` (`ate-env-start-failure: no-capacity`).
+- **Delete (`internal/ate/client.go`: `Delete`, `evictGuest`)**: `internal/ate.Client.Delete` calls
+  `DeleteActor` directly in any state including `CRASHED` (stopping workloads/slots/snapshots
+  without pre-suspending) and `evictGuest` to drop `guestPool`.
 
 ### 6. Idempotent derived `ActorTemplate` creation and failed golden-snapshot recovery
 

@@ -180,6 +180,15 @@ message StartProcessRequest {
   // combined output is streamed on stdout (exempt from the default log cap),
   // and stdin is implicitly enabled.
   TTY tty = 6;
+  // Optional client-assigned idempotency key. When non-empty, a guest that
+  // advertises start-request-id deduplicates concurrent or retried
+  // StartProcess calls carrying the same request_id within a bounded retention
+  // window, returning the existing process handle without launching a
+  // duplicate child process (if the tracker has already reaped the process, a
+  // handle containing only process_id with status UNSPECIFIED is returned).
+  // With -reactive-wake enabled, ate-env-api clears request_id when forwarding
+  // to a guest whose start-request-id capability has not been observed.
+  string request_id = 7;
 }
 
 // Request to get a Process.

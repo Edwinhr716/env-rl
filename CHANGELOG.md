@@ -67,6 +67,18 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `ate-env-api` takes `-router-pool-size` (`ATE_ENV_ROUTER_POOL_SIZE`, default
+  `0`) to pool persistent `round_robin` gRPC connections to the `atenet` router
+  instead of opening one connection per guest call, and `-reactive-wake`
+  (`ATE_ENV_REACTIVE_WAKE`, default `false`) to skip the pre-flight
+  `ensureAwake` probe for environments cached as awake. `StartProcessRequest`
+  gains an optional `request_id` field deduplicated in `ate-env-guest` (`16,384`
+  entries, `15m` TTL, up to `128` printable ASCII bytes, SHA-256 request
+  fingerprinting). When an environment cached as awake is suspended outside the
+  server under `-reactive-wake`, idempotent calls and `StartProcess` to a guest
+  advertising `start-request-id` wake and retry, whereas `SignalProcess` and
+  `StartProcess` to an older guest evict the cache entry and return
+  `Unavailable`.
 - `ate-env manifest --domains N`, `--node-selector key=value` and
   `ate-env manifest workerpool` (with `--domain-offset`): render one
   `WorkerPool` per placement domain (`<workerpool>-d0` .. `<workerpool>-d<N-1>`,

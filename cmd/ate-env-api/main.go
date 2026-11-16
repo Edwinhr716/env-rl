@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -170,6 +171,8 @@ func main() {
 		storeQPS          = flag.Float64("environment-store-qps", defaultEnvironmentStoreQPS, "with --environment-store=configmaps, the most requests per second this process sends to the Kubernetes API over time; a negative value sets no limit in the client and leaves the limit to the API server (API Priority and Fairness). client-go's own default, 5, is for a command-line tool: at that rate the object deletes of a fleet teardown wait inside DeleteEnvironment")
 		storeBurst        = flag.Int("environment-store-burst", defaultEnvironmentStoreBurst, "with --environment-store=configmaps, how many requests to the Kubernetes API this process can send at once before --environment-store-qps applies")
 		environmentsTTL   = flag.Duration("metrics-environments-ttl", telemetry.DefaultEnvironmentsCacheTTL, "how long ate_env_api_environments serves one read of the control plane (a ListActors per atespace) before a scrape reads it again")
+		routerPoolSize    = flag.Int("router-pool-size", 0, "number of persistent round_robin gRPC connections pooled to the atenet router; 0 opens one connection per guest call (defaults to ATE_ENV_ROUTER_POOL_SIZE when the flag is not set)")
+		reactiveWake      = flag.Bool("reactive-wake", false, "skip the pre-flight ensureAwake probe for environments cached as awake (defaults to ATE_ENV_REACTIVE_WAKE when the flag is not set); on an environment suspended outside this server, idempotent calls and StartProcess to a guest with start-request-id wake and retry, while SignalProcess and StartProcess to an older guest evict the cache entry and return Unavailable")
 	)
 	flag.Parse()
 
@@ -200,6 +203,11 @@ func main() {
 	}
 	if err := checkPortProxyHostSuffix(*ppHostSuffix, *atenetConn, serviceHosts, hostcheck.ParseList(*allowedHosts)); err != nil {
 		log.Fatal(err)
+	}
+
+	routerPoolSizeVal, reactiveWakeVal, err := resolveGuestRPCOptions(flag.CommandLine, *routerPoolSize, *reactiveWake, os.Getenv)
+	if err != nil {
+		log.Fatalf("%v", err)
 	}
 
 	var callerAuth *apiservice.BearerAuth
@@ -293,6 +301,11 @@ func main() {
 	apisvc.RouterTLS = routerTLS
 	apisvc.RouterIdentity = routerIdentity
 	apisvc.Metrics = metrics
+	apisvc.RouterPoolSize = routerPoolSizeVal
+	apisvc.ReactiveWake = reactiveWakeVal
+	if apisvc.RouterPoolSize > 0 || apisvc.ReactiveWake {
+		log.Printf("guest RPC optimization enabled: router_pool_size=%d reactive_wake=%v", apisvc.RouterPoolSize, apisvc.ReactiveWake)
+	}
 	defer apisvc.Close()
 
 	grpcServer := grpc.NewServer(grpcServerOptions(callerAuth, metrics, *enableTracing)...)
@@ -587,4 +600,42 @@ func portProxyOptions(base portproxy.Options, apisvc *apiservice.Server, callerA
 		base.AuthenticateCapability = callerAuth.CheckCapability
 	}
 	return base
+}
+
+// resolveGuestRPCOptions resolves -router-pool-size and -reactive-wake, giving
+// explicit CLI flags priority over ATE_ENV_ROUTER_POOL_SIZE and
+// ATE_ENV_REACTIVE_WAKE and rejecting unparseable or negative values.
+func resolveGuestRPCOptions(fs *flag.FlagSet, flagPoolSize int, flagReactiveWake bool, getenv func(string) string) (int, bool, error) {
+	explicit := make(map[string]bool)
+	if fs != nil {
+		fs.Visit(func(f *flag.Flag) {
+			explicit[f.Name] = true
+		})
+	}
+
+	poolSize := flagPoolSize
+	if !explicit["router-pool-size"] {
+		if v := strings.TrimSpace(getenv("ATE_ENV_ROUTER_POOL_SIZE")); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return 0, false, fmt.Errorf("ATE_ENV_ROUTER_POOL_SIZE=%q: %w", v, err)
+			}
+			poolSize = n
+		}
+	}
+	if poolSize < 0 {
+		return 0, false, fmt.Errorf("-router-pool-size must be >= 0, got %d", poolSize)
+	}
+
+	reactive := flagReactiveWake
+	if !explicit["reactive-wake"] {
+		if v := strings.TrimSpace(getenv("ATE_ENV_REACTIVE_WAKE")); v != "" {
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return 0, false, fmt.Errorf("ATE_ENV_REACTIVE_WAKE=%q: %w", v, err)
+			}
+			reactive = b
+		}
+	}
+	return poolSize, reactive, nil
 }

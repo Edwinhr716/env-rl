@@ -456,7 +456,13 @@ be longer than the image pull plus the template's wakeup-probe timeout (`ate-env
 default covers the 120 s timeout of a `--sidecar-readyz` template plus three minutes for the pull;
 raise it if you set a longer `--wakeup-timeout`. Otherwise the first guest call after a slow wake
 fails with `Unavailable`, and a retry succeeds once the environment is up. A deleted environment
-fails a guest call at once with `NotFound`.
+fails a guest call at once with `NotFound`. To pool router gRPC connections and skip that pre-flight
+wake probe on environments cached as awake, set `-router-pool-size` and `-reactive-wake` (or
+`ATE_ENV_ROUTER_POOL_SIZE` and `ATE_ENV_REACTIVE_WAKE` in the Deployment environment, since `ate-env
+manifest` does not render flags for them). With `-reactive-wake`, if an environment is suspended
+outside that `ate-env-api` replica, idempotent calls and `StartProcess` (to a guest with
+`start-request-id`) wake and retry, while the first `SignalProcess` (or `StartProcess` to an older
+guest) evicts the cache entry and returns `Unavailable`.
 
 Two start failures also end the wait at once, because waiting cannot fix them, and mark the call's
 trailing metadata with `ate-env-start-failure`, so a client can retry the work on a fresh

@@ -25,6 +25,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
@@ -32,6 +33,7 @@ import (
 	"github.com/agent-substrate/env/internal/routertls"
 	"github.com/agent-substrate/env/internal/telemetry"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
+	"github.com/google/uuid"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -39,11 +41,14 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // DefaultTemplate is the ActorTemplate name used when a create request
 // does not specify one.
 const DefaultTemplate = "default-template"
+
+type targetActorCtxKey struct{}
 
 // DefaultNamespace is the default Kubernetes namespace used when deploying
 // ate-env manifests.
@@ -101,10 +106,28 @@ type Server struct {
 	// named in the error when the router rejects it.
 	RouterIdentity string
 
+	// RouterPoolSize, when positive, reuses a striped pool of persistent
+	// round_robin gRPC connections to the atenet router instead of opening and
+	// closing a connection on every guest RPC (0 opens one connection per call).
+	RouterPoolSize int
+	// ReactiveWake, when true, skips the pre-flight ensureAwake probe for
+	// environments cached as awake since creation or suspend. On a fast-path
+	// Unavailable, the cache entry is evicted: idempotent calls and
+	// StartProcess to a guest that advertised start-request-id wake and retry,
+	// whereas SignalProcess and StartProcess to an older guest return
+	// Unavailable without replaying.
+	ReactiveWake bool
+
 	// Metrics, when set, receives the create_to_ready and wake_wait
 	// observations and tracks the atespaces ate_env_api_environments
 	// reports (see EnvironmentCounts). Nil records nothing.
 	Metrics *telemetry.Metrics
+
+	routerPoolMu  sync.Mutex
+	routerClosed  bool
+	routerConns   []*grpc.ClientConn
+	routerConnSeq atomic.Uint64
+	awakeEnvs     *boundedAwakeCache
 
 	readyMu   sync.Mutex
 	pending   map[string]pendingCreate // atespace/id -> creation start, until the guest first answers
@@ -131,11 +154,29 @@ func New(client *ate.Client, routerAddr, hostSuffix string) *Server {
 		hostSuffix:        hostSuffix,
 		WakeBudget:        DefaultWakeBudget,
 		WakeRunningBudget: DefaultWakeRunningBudget,
+		awakeEnvs:         newBoundedAwakeCache(defaultAwakeCapacity, defaultAwakeTTL),
 	}
 }
 
-// Close is a no-op retained for lifecycle compatibility.
-func (s *Server) Close() {}
+// Close releases any pooled router connections held by the server and rejects
+// subsequent guest sessions with Unavailable.
+func (s *Server) Close() {
+	s.routerPoolMu.Lock()
+	s.routerClosed = true
+	conns := s.routerConns
+	s.routerConns = nil
+	s.routerPoolMu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
+func (s *Server) isRouterClosed() bool {
+	s.routerPoolMu.Lock()
+	closed := s.routerClosed
+	s.routerPoolMu.Unlock()
+	return closed
+}
 
 // ============================================================================
 // --- ENVIRONMENT SERVICE ---
@@ -206,6 +247,9 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	actor, err := s.client.Create(ctx, opts)
 	if err != nil {
 		return nil, toGRPCError(err)
+	}
+	if s.ReactiveWake && s.awakeEnvs != nil {
+		s.awakeEnvs.Remove(atespace + "/" + req.GetId())
 	}
 
 	return &ateenvv1alpha.CreateEnvironmentResponse{
@@ -518,6 +562,9 @@ func (s *Server) SuspendEnvironment(ctx context.Context, req *ateenvv1alpha.Susp
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
+	if s.ReactiveWake && s.awakeEnvs != nil {
+		s.awakeEnvs.Remove(atespace + "/" + req.GetId())
+	}
 
 	return &ateenvv1alpha.SuspendEnvironmentResponse{}, nil
 }
@@ -552,6 +599,9 @@ func (s *Server) DeleteEnvironment(ctx context.Context, req *ateenvv1alpha.Delet
 	if err := s.client.Delete(ctx, atespace, req.GetId()); err != nil {
 		return nil, toGRPCError(err)
 	}
+	if s.ReactiveWake && s.awakeEnvs != nil {
+		s.awakeEnvs.Remove(atespace + "/" + req.GetId())
+	}
 	s.finishCreate(atespace, req.GetId(), telemetry.ReadyStatusDeleted)
 	if hasRecord {
 		// The environment is deleted: the actor is the truth. The delete
@@ -573,75 +623,184 @@ func (s *Server) DeleteEnvironment(ctx context.Context, req *ateenvv1alpha.Delet
 // --- PROCESS SERVICE ---
 // ============================================================================
 
-// processClient dials the guest of the environment named in ctx's metadata
-// and returns a ProcessService client plus the outgoing context to use with
-// it. The caller must invoke closeFn when done.
-func (s *Server) processClient(ctx context.Context) (ateenvv1alpha.ProcessServiceClient, context.Context, func(), error) {
+// evictOnGuestUnavailable reports whether err is a router or guest Unavailable
+// not caused by caller context cancellation or deadline expiry. Under
+// ReactiveWake it also removes targetActor from awakeEnvs so neither a cold
+// call nor a post-wake retry that hits Unavailable leaves the environment
+// cached as awake.
+func (s *Server) evictOnGuestUnavailable(ctx context.Context, targetActor string, err error) bool {
+	if err == nil || status.Code(err) != codes.Unavailable || ctx.Err() != nil {
+		return false
+	}
+	if s.ReactiveWake && s.awakeEnvs != nil {
+		s.awakeEnvs.Remove(targetActor)
+	}
+	return true
+}
+
+func (s *Server) callProcessUnary(ctx context.Context, isIdempotent bool, fn func(ateenvv1alpha.ProcessServiceClient, context.Context, ...grpc.CallOption) (*ateenvv1alpha.Process, error)) (*ateenvv1alpha.Process, error) {
 	envID, atespace, err := envFromContext(ctx)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
-	conn, err := s.guestConn(ctx, atespace, envID)
+	targetActor := atespace + "/" + envID
+	conn, outCtx, closeFn, fastPath, err := s.guestSession(ctx, atespace, envID, false)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
-	return ateenvv1alpha.NewProcessServiceClient(conn), ctx, func() { _ = conn.Close() }, nil
+	resp, err := fn(ateenvv1alpha.NewProcessServiceClient(conn), outCtx)
+	closeFn()
+	if s.evictOnGuestUnavailable(ctx, targetActor, err) && fastPath && isIdempotent {
+		conn2, outCtx2, closeFn2, _, werr := s.guestSession(ctx, atespace, envID, true)
+		if werr != nil {
+			return nil, werr
+		}
+		defer closeFn2()
+		resp, err = fn(ateenvv1alpha.NewProcessServiceClient(conn2), outCtx2)
+		s.evictOnGuestUnavailable(ctx, targetActor, err)
+		return resp, err
+	}
+	return resp, err
 }
 
 // StartProcess launches a process inside the target environment container.
 func (s *Server) StartProcess(ctx context.Context, req *ateenvv1alpha.StartProcessRequest) (*ateenvv1alpha.Process, error) {
-	client, outCtx, closeFn, err := s.processClient(ctx)
+	envID, atespace, err := envFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer closeFn()
-	return client.StartProcess(outCtx, req)
+	targetActor := atespace + "/" + envID
+
+	conn, outCtx, closeFn, fastPath, err := s.guestSession(ctx, atespace, envID, false)
+	if err != nil {
+		return nil, err
+	}
+	if !s.ReactiveWake {
+		defer closeFn()
+		return ateenvv1alpha.NewProcessServiceClient(conn).StartProcess(outCtx, req)
+	}
+
+	reqSend := proto.Clone(req).(*ateenvv1alpha.StartProcessRequest)
+	isIdempotent := false
+	if s.hasGuestCap(targetActor, guestCapStartRequestID) {
+		if reqSend.GetRequestId() == "" {
+			reqSend.RequestId = uuid.NewString()
+		}
+		isIdempotent = true
+	} else {
+		// Without observed guest support, clear any client-supplied request_id
+		// and never treat the call as idempotent, preventing double execution on
+		// older guests.
+		reqSend.RequestId = ""
+	}
+
+	resp, err := ateenvv1alpha.NewProcessServiceClient(conn).StartProcess(outCtx, reqSend)
+	closeFn()
+
+	if s.evictOnGuestUnavailable(ctx, targetActor, err) && fastPath && isIdempotent {
+		conn2, outCtx2, closeFn2, _, werr := s.guestSession(ctx, atespace, envID, true)
+		if werr != nil {
+			return nil, werr
+		}
+		defer closeFn2()
+		resp, err = ateenvv1alpha.NewProcessServiceClient(conn2).StartProcess(outCtx2, reqSend)
+		s.evictOnGuestUnavailable(ctx, targetActor, err)
+		return resp, err
+	}
+	return resp, err
 }
 
 // GetProcess retrieves the state of a process inside the environment.
 func (s *Server) GetProcess(ctx context.Context, req *ateenvv1alpha.GetProcessRequest) (*ateenvv1alpha.Process, error) {
-	client, outCtx, closeFn, err := s.processClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer closeFn()
-	return client.GetProcess(outCtx, req)
+	return s.callProcessUnary(ctx, true, func(c ateenvv1alpha.ProcessServiceClient, outCtx context.Context, opts ...grpc.CallOption) (*ateenvv1alpha.Process, error) {
+		return c.GetProcess(outCtx, req, opts...)
+	})
 }
 
 // SignalProcess delivers a signal to a process inside the environment.
 func (s *Server) SignalProcess(ctx context.Context, req *ateenvv1alpha.SignalProcessRequest) (*ateenvv1alpha.Process, error) {
-	client, outCtx, closeFn, err := s.processClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer closeFn()
-	return client.SignalProcess(outCtx, req)
+	// SignalProcess is not idempotent and carries no request_id, so a fast-path
+	// Unavailable evicts the awake cache without replaying.
+	return s.callProcessUnary(ctx, false, func(c ateenvv1alpha.ProcessServiceClient, outCtx context.Context, opts ...grpc.CallOption) (*ateenvv1alpha.Process, error) {
+		return c.SignalProcess(outCtx, req, opts...)
+	})
 }
 
 // ResizeProcess updates the window size of a process's pseudo-terminal inside the environment.
 func (s *Server) ResizeProcess(ctx context.Context, req *ateenvv1alpha.ResizeProcessRequest) (*ateenvv1alpha.ResizeProcessResponse, error) {
-	client, outCtx, closeFn, err := s.processClient(ctx)
+	envID, atespace, err := envFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer closeFn()
-	return client.ResizeProcess(outCtx, req)
+	targetActor := atespace + "/" + envID
+	conn, outCtx, closeFn, fastPath, err := s.guestSession(ctx, atespace, envID, false)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := ateenvv1alpha.NewProcessServiceClient(conn).ResizeProcess(outCtx, req)
+	closeFn()
+	if s.evictOnGuestUnavailable(ctx, targetActor, err) && fastPath {
+		conn2, outCtx2, closeFn2, _, werr := s.guestSession(ctx, atespace, envID, true)
+		if werr != nil {
+			return nil, werr
+		}
+		defer closeFn2()
+		resp, err = ateenvv1alpha.NewProcessServiceClient(conn2).ResizeProcess(outCtx2, req)
+		s.evictOnGuestUnavailable(ctx, targetActor, err)
+		return resp, err
+	}
+	return resp, err
 }
 
 // StreamProcessOutput streams stdout, stderr and the exit message from a process.
 func (s *Server) StreamProcessOutput(req *ateenvv1alpha.StreamProcessOutputRequest, stream grpc.ServerStreamingServer[ateenvv1alpha.ProcessOutput]) error {
-	client, outCtx, closeFn, err := s.processClient(stream.Context())
+	ctx := stream.Context()
+	envID, atespace, err := envFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	defer closeFn()
+	targetActor := atespace + "/" + envID
+	conn, outCtx, closeFn, fastPath, err := s.guestSession(ctx, atespace, envID, false)
+	if err != nil {
+		return err
+	}
+	defer func() { closeFn() }()
 
-	clientStream, err := client.StreamProcessOutput(outCtx, req)
+	clientStream, err := ateenvv1alpha.NewProcessServiceClient(conn).StreamProcessOutput(outCtx, req)
+	if s.evictOnGuestUnavailable(ctx, targetActor, err) && fastPath {
+		closeFn()
+		closeFn = noopClose
+		conn2, outCtx2, closeFn2, fastPath2, werr := s.guestSession(ctx, atespace, envID, true)
+		if werr != nil {
+			return werr
+		}
+		conn, outCtx, closeFn, fastPath = conn2, outCtx2, closeFn2, fastPath2
+		clientStream, err = ateenvv1alpha.NewProcessServiceClient(conn).StreamProcessOutput(outCtx, req)
+		s.evictOnGuestUnavailable(ctx, targetActor, err)
+	}
 	if err != nil {
 		return err
 	}
+	first := true
 	for {
 		msg, err := clientStream.Recv()
+		if s.evictOnGuestUnavailable(ctx, targetActor, err) && first && fastPath {
+			closeFn()
+			closeFn = noopClose
+			conn2, outCtx2, closeFn2, fastPath2, werr := s.guestSession(ctx, atespace, envID, true)
+			if werr != nil {
+				return werr
+			}
+			conn, outCtx, closeFn, fastPath = conn2, outCtx2, closeFn2, fastPath2
+			clientStream, err = ateenvv1alpha.NewProcessServiceClient(conn).StreamProcessOutput(outCtx, req)
+			if err != nil {
+				s.evictOnGuestUnavailable(ctx, targetActor, err)
+				return err
+			}
+			first = false
+			continue
+		}
+		first = false
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
@@ -664,14 +823,21 @@ func (s *Server) WriteProcessInput(stream grpc.ClientStreamingServer[ateenvv1alp
 	if err != nil {
 		return err
 	}
-	client, outCtx, closeFn, err := s.processClient(stream.Context())
+	ctx := stream.Context()
+	envID, atespace, err := envFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	targetActor := atespace + "/" + envID
+	conn, outCtx, closeFn, _, err := s.guestSession(ctx, atespace, envID, true)
 	if err != nil {
 		return err
 	}
 	defer closeFn()
 
-	clientStream, err := client.WriteProcessInput(outCtx)
+	clientStream, err := ateenvv1alpha.NewProcessServiceClient(conn).WriteProcessInput(outCtx)
 	if err != nil {
+		s.evictOnGuestUnavailable(ctx, targetActor, err)
 		return err
 	}
 	for req != nil {
@@ -680,6 +846,7 @@ func (s *Server) WriteProcessInput(stream grpc.ClientStreamingServer[ateenvv1alp
 			if errors.Is(err, io.EOF) {
 				_, err = clientStream.CloseAndRecv()
 			}
+			s.evictOnGuestUnavailable(ctx, targetActor, err)
 			return err
 		}
 		if req, err = nextMessage(stream); err != nil {
@@ -689,6 +856,7 @@ func (s *Server) WriteProcessInput(stream grpc.ClientStreamingServer[ateenvv1alp
 
 	resp, err := clientStream.CloseAndRecv()
 	if err != nil {
+		s.evictOnGuestUnavailable(ctx, targetActor, err)
 		return err
 	}
 	return stream.SendAndClose(resp)
@@ -705,19 +873,49 @@ func (s *Server) ReadFile(req *ateenvv1alpha.ReadFileRequest, stream grpc.Server
 	if err != nil {
 		return err
 	}
-	conn, err := s.guestConn(ctx, atespace, envID)
+	targetActor := atespace + "/" + envID
+	conn, outCtx, closeFn, fastPath, err := s.guestSession(ctx, atespace, envID, false)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { closeFn() }()
 
-	clientStream, err := ateenvv1alpha.NewFileSystemServiceClient(conn).ReadFile(ctx, req)
+	clientStream, err := ateenvv1alpha.NewFileSystemServiceClient(conn).ReadFile(outCtx, req)
+	if s.evictOnGuestUnavailable(ctx, targetActor, err) && fastPath {
+		closeFn()
+		closeFn = noopClose
+		conn2, outCtx2, closeFn2, fastPath2, werr := s.guestSession(ctx, atespace, envID, true)
+		if werr != nil {
+			return werr
+		}
+		conn, outCtx, closeFn, fastPath = conn2, outCtx2, closeFn2, fastPath2
+		clientStream, err = ateenvv1alpha.NewFileSystemServiceClient(conn).ReadFile(outCtx, req)
+		s.evictOnGuestUnavailable(ctx, targetActor, err)
+	}
 	if err != nil {
 		return err
 	}
 
+	first := true
 	for {
 		chunk, err := clientStream.Recv()
+		if s.evictOnGuestUnavailable(ctx, targetActor, err) && first && fastPath {
+			closeFn()
+			closeFn = noopClose
+			conn2, outCtx2, closeFn2, fastPath2, werr := s.guestSession(ctx, atespace, envID, true)
+			if werr != nil {
+				return werr
+			}
+			conn, outCtx, closeFn, fastPath = conn2, outCtx2, closeFn2, fastPath2
+			clientStream, err = ateenvv1alpha.NewFileSystemServiceClient(conn).ReadFile(outCtx, req)
+			if err != nil {
+				s.evictOnGuestUnavailable(ctx, targetActor, err)
+				return err
+			}
+			first = false
+			continue
+		}
+		first = false
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
@@ -737,25 +935,32 @@ func (s *Server) WriteFile(stream grpc.ClientStreamingServer[ateenvv1alpha.Write
 	if err != nil {
 		return err
 	}
+	targetActor := atespace + "/" + envID
 	// Receive the first message before waking the guest, as WriteProcessInput
 	// does.
 	req, err := nextMessage(stream)
 	if err != nil {
 		return err
 	}
-	conn, err := s.guestConn(ctx, atespace, envID)
+	conn, outCtx, closeFn, _, err := s.guestSession(ctx, atespace, envID, true)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer closeFn()
 
-	clientStream, err := ateenvv1alpha.NewFileSystemServiceClient(conn).WriteFile(ctx)
+	clientStream, err := ateenvv1alpha.NewFileSystemServiceClient(conn).WriteFile(outCtx)
 	if err != nil {
+		s.evictOnGuestUnavailable(ctx, targetActor, err)
 		return err
 	}
 
 	for req != nil {
 		if err := clientStream.Send(req); err != nil {
+			// The guest rejected the stream; surface its status instead of io.EOF.
+			if errors.Is(err, io.EOF) {
+				_, err = clientStream.CloseAndRecv()
+			}
+			s.evictOnGuestUnavailable(ctx, targetActor, err)
 			return err
 		}
 		if req, err = nextMessage(stream); err != nil {
@@ -765,6 +970,7 @@ func (s *Server) WriteFile(stream grpc.ClientStreamingServer[ateenvv1alpha.Write
 
 	resp, err := clientStream.CloseAndRecv()
 	if err != nil {
+		s.evictOnGuestUnavailable(ctx, targetActor, err)
 		return err
 	}
 	return stream.SendAndClose(resp)
@@ -791,50 +997,126 @@ func envFromContext(ctx context.Context) (string, string, error) {
 	return ids[0], atespace, nil
 }
 
-// guestConn dials the environment's guest through the router and waits,
-// within WakeBudget, for the guest to answer, so a suspended environment is
-// awake before the caller's request goes through (see ensureAwake). Calls on the
-// returned connection take the caller's context as is, for its deadline and
-// cancellation only: the interceptors below are the only writer of
-// ate-target-actor, and no caller metadata is forwarded. Forwarding it once
-// sent that header twice, which the Substrate router rejects
+func (s *Server) dialEphemeralRouterConn(targetActor string) (*grpc.ClientConn, error) {
+	dialOpts := []grpc.DialOption{
+		grpc.WithTransportCredentials(s.routerCredentials()),
+		grpc.WithChainUnaryInterceptor(s.routerUnaryInterceptor(targetActor)),
+		grpc.WithChainStreamInterceptor(s.routerStreamInterceptor(targetActor)),
+	}
+	if s.client != nil && s.client.TracingEnabled() {
+		dialOpts = append(dialOpts, ate.Options{EnableTracing: true}.TracingDialOptions()...)
+	}
+	return grpc.NewClient(s.routerAddr, dialOpts...)
+}
+
+func noopClose() {}
+
+func (s *Server) pickPooledRouterConn() (*grpc.ClientConn, error) {
+	s.routerPoolMu.Lock()
+	if s.routerClosed {
+		s.routerPoolMu.Unlock()
+		return nil, status.Error(codes.Unavailable, "server is closed")
+	}
+	if len(s.routerConns) == 0 {
+		dialOpts := []grpc.DialOption{
+			grpc.WithTransportCredentials(s.routerCredentials()),
+			grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`),
+			grpc.WithChainUnaryInterceptor(s.routerUnaryInterceptor("")),
+			grpc.WithChainStreamInterceptor(s.routerStreamInterceptor("")),
+		}
+		if s.client != nil && s.client.TracingEnabled() {
+			dialOpts = append(dialOpts, ate.Options{EnableTracing: true}.TracingDialOptions()...)
+		}
+		target := s.routerAddr
+		if !strings.Contains(target, "://") {
+			target = "dns:///" + target
+		}
+		conns := make([]*grpc.ClientConn, 0, s.RouterPoolSize)
+		for range s.RouterPoolSize {
+			c, err := grpc.NewClient(target, dialOpts...)
+			if err != nil {
+				for _, prev := range conns {
+					_ = prev.Close()
+				}
+				s.routerPoolMu.Unlock()
+				return nil, status.Errorf(codes.Internal, "dialing pooled guest router %s: %v", target, err)
+			}
+			conns = append(conns, c)
+		}
+		s.routerConns = conns
+	}
+	conns := s.routerConns
+	s.routerPoolMu.Unlock()
+	idx := (s.routerConnSeq.Add(1) - 1) % uint64(len(conns))
+	return conns[idx], nil
+}
+
+// guestSession prepares a router gRPC connection and outgoing context for an
+// environment's guest, and waits within WakeBudget for the guest to answer
+// unless ReactiveWake is enabled, forceWake is false, and the environment is
+// cached as awake (fastPath == true). The returned closeFn is always non-nil
+// (a no-op on error or when pooled).
+//
+// Calls on the returned connection take ctx for its deadline, cancellation, and
+// trace span (plus targetActorCtxKey when pooled): routerUnaryInterceptor and
+// routerStreamInterceptor are the only writers of ate-target-actor, and no
+// incoming caller metadata is forwarded. Forwarding caller metadata once sent
+// ate-target-actor twice, which the Substrate router rejects
 // (agent-substrate/substrate#2308 answers duplicate ate-target-actor headers
 // with "invalid actor reference"), and it would let a client pass routing
 // headers through the proxy. Nothing in the guest reads caller metadata.
-func (s *Server) guestConn(ctx context.Context, atespace, id string) (*grpc.ClientConn, error) {
+func (s *Server) guestSession(ctx context.Context, atespace, id string, forceWake bool) (*grpc.ClientConn, context.Context, func(), bool, error) {
 	if s.routerAddr == "" {
-		return nil, status.Error(codes.FailedPrecondition, "router address not configured for guest operations")
+		return nil, nil, noopClose, false, status.Error(codes.FailedPrecondition, "router address not configured for guest operations")
 	}
 	if atespace == "" {
 		atespace = DefaultAtespace
 	}
 	targetActor := atespace + "/" + id
-	dialOpts := []grpc.DialOption{
-		grpc.WithTransportCredentials(s.routerCredentials()),
-		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-			ctx = metadata.AppendToOutgoingContext(ctx, ate.TargetActorHeader, targetActor)
-			return invoker(ctx, method, req, reply, cc, opts...)
-		}),
-		grpc.WithChainStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-			ctx = metadata.AppendToOutgoingContext(ctx, ate.TargetActorHeader, targetActor)
-			return streamer(ctx, desc, cc, method, opts...)
-		}),
+
+	var (
+		conn    *grpc.ClientConn
+		outCtx  context.Context
+		closeFn func()
+		err     error
+	)
+	if s.RouterPoolSize > 0 {
+		conn, err = s.pickPooledRouterConn()
+		if err != nil {
+			return nil, nil, noopClose, false, err
+		}
+		outCtx = context.WithValue(ctx, targetActorCtxKey{}, targetActor)
+		closeFn = noopClose
+	} else {
+		if s.isRouterClosed() {
+			return nil, nil, noopClose, false, status.Error(codes.Unavailable, "server is closed")
+		}
+		conn, err = s.dialEphemeralRouterConn(targetActor)
+		if err != nil {
+			return nil, nil, noopClose, false, status.Errorf(codes.Internal, "dialing guest router for %s: %v", targetActor, err)
+		}
+		outCtx = ctx
+		closeFn = func() { _ = conn.Close() }
 	}
-	// With tracing on, the wake probe and the proxied call carry the
-	// caller's trace context (ctx holds the server span), so a resume the
-	// probe triggers in the router shows up in the caller's trace.
-	if s.client != nil && s.client.TracingEnabled() {
-		dialOpts = append(dialOpts, ate.Options{EnableTracing: true}.TracingDialOptions()...)
+
+	var wakeGen uint64
+	if s.ReactiveWake && s.awakeEnvs != nil {
+		if !forceWake && s.awakeEnvs.Contains(targetActor) {
+			return conn, outCtx, closeFn, true, nil
+		}
+		wakeGen = s.awakeEnvs.Generation(targetActor)
 	}
-	conn, err := grpc.NewClient(s.routerAddr, dialOpts...)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "dialing guest router for %s/%s: %v", atespace, id, err)
+	if err := s.ensureAwake(outCtx, conn, atespace, id); err != nil {
+		if s.ReactiveWake && s.awakeEnvs != nil {
+			s.awakeEnvs.Remove(targetActor)
+		}
+		closeFn()
+		return nil, nil, noopClose, false, err
 	}
-	if err := s.ensureAwake(ctx, conn, atespace, id); err != nil {
-		_ = conn.Close()
-		return nil, err
+	if s.ReactiveWake && s.awakeEnvs != nil {
+		s.awakeEnvs.AddIfGen(targetActor, wakeGen)
 	}
-	return conn, nil
+	return conn, outCtx, closeFn, false, nil
 }
 
 // routerCredentials are the transport credentials for the router: TLS with

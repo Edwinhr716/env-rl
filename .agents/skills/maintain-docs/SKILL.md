@@ -51,8 +51,8 @@ When updating documentation across multiple files, proceed in dependency order:
    `Status: describes main at <sha>` line updated in `docs/architecture.md`.
 2. **Real identifiers only**: Spell package paths, binary names, RPC names, CLI flags, and constants
    exactly as they appear in code (`-atenet-ca-file`, `-atenet-client-cert`,
-   `apiservice.(*Server).guestConn`, `DefaultMaxLogBytes`, `ENVIRONMENT_STATUS_UNSPECIFIED`). Never
-   invent shorthand or coin names.
+   `apiservice.(*Server).guestSession`, `DefaultMaxLogBytes`, `ENVIRONMENT_STATUS_UNSPECIFIED`).
+   Never invent shorthand or coin names.
 3. **Canonical invariant syntax**: In `AGENTS.md`, format architecture invariants strictly as:
    `<pkg> owns X; <other> calls it and must not re-implement it; because Y (enforced by <symbol> | not enforced).`
    Every invariant must name its enforcer or state `not enforced`.

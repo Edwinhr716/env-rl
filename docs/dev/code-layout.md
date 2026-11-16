@@ -63,7 +63,7 @@ Put Substrate `ateapi` calls and `internal/mcp` connection pools in `internal/at
 code in `internal/`, in-actor execution in `guest/` (`guest/` imports `internal/unknownfields`;
 `cmd/ate-env-guest` imports `internal/sidecarenv` and `internal/telemetry`), and API handlers in
 `internal/apiservice` (`apiservice` calls `internal/ate` for lifecycle and dials `guest/` via
-`s.guestConn`, and must not run local commands). Neither `guest/` nor `cmd/ate-env-guest` must
+`s.guestSession`, and must not run local commands). Neither `guest/` nor `cmd/ate-env-guest` must
 import `internal/ate` or `go.ate.dev/substrate`, and `internal/`, `clients/`, and `cmd/` (except
 `cmd/ate-env-guest`) must not import `guest/` outside tests (`hack/verify/layers.py`, Go CI job).
 
@@ -115,6 +115,6 @@ enforces this section and top-level dirs; update the tree above and the script t
 
 Never write custom Substrate mocks; reuse `internal/internaltest`: `fakecontrol` (`ateapi`),
 `fakerouter` (`atenet`), `synctestrapid` (`rapid` in `testing/synctest`), and `testcerts` (SPIFFE).
-Skills in `.agents/skills/`: [create-release](../../.agents/skills/create-release/SKILL.md)
-(releases), [extend-env-surface](../../.agents/skills/extend-env-surface/SKILL.md) (proto, guest,
-`s.guestConn`/`ensureAwake`), [maintain-docs](../../.agents/skills/maintain-docs/SKILL.md) (docs).
+Skills in `.agents/skills/`: [create-release](../../.agents/skills/create-release/SKILL.md),
+[extend-env-surface](../../.agents/skills/extend-env-surface/SKILL.md) (proto, guest,
+`s.guestSession`/`ensureAwake`), [maintain-docs](../../.agents/skills/maintain-docs/SKILL.md).

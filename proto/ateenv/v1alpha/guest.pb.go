@@ -416,7 +416,16 @@ type StartProcessRequest struct {
 	// terminal. Stdin, stdout, and stderr are attached to the slave PTY,
 	// combined output is streamed on stdout (exempt from the default log cap),
 	// and stdin is implicitly enabled.
-	Tty           *TTY `protobuf:"bytes,6,opt,name=tty,proto3" json:"tty,omitempty"`
+	Tty *TTY `protobuf:"bytes,6,opt,name=tty,proto3" json:"tty,omitempty"`
+	// Optional client-assigned idempotency key. When non-empty, a guest that
+	// advertises start-request-id deduplicates concurrent or retried
+	// StartProcess calls carrying the same request_id within a bounded retention
+	// window, returning the existing process handle without launching a
+	// duplicate child process (if the tracker has already reaped the process, a
+	// handle containing only process_id with status UNSPECIFIED is returned).
+	// With -reactive-wake enabled, ate-env-api clears request_id when forwarding
+	// to a guest whose start-request-id capability has not been observed.
+	RequestId     string `protobuf:"bytes,7,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -491,6 +500,13 @@ func (x *StartProcessRequest) GetTty() *TTY {
 		return x.Tty
 	}
 	return nil
+}
+
+func (x *StartProcessRequest) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
 }
 
 // Request to get a Process.
@@ -1236,14 +1252,16 @@ const file_proto_ateenv_v1alpha_guest_proto_rawDesc = "" +
 	"_timed_out\"-\n" +
 	"\x03TTY\x12\x12\n" +
 	"\x04rows\x18\x01 \x01(\rR\x04rows\x12\x12\n" +
-	"\x04cols\x18\x02 \x01(\rR\x04cols\"\xab\x02\n" +
+	"\x04cols\x18\x02 \x01(\rR\x04cols\"\xca\x02\n" +
 	"\x13StartProcessRequest\x12\x18\n" +
 	"\acommand\x18\x01 \x03(\tR\acommand\x12\x10\n" +
 	"\x03cwd\x18\x02 \x01(\tR\x03cwd\x12>\n" +
 	"\x03env\x18\x03 \x03(\v2,.ateenv.v1alpha.StartProcessRequest.EnvEntryR\x03env\x12\x14\n" +
 	"\x05stdin\x18\x04 \x01(\bR\x05stdin\x123\n" +
 	"\atimeout\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\atimeout\x12%\n" +
-	"\x03tty\x18\x06 \x01(\v2\x13.ateenv.v1alpha.TTYR\x03tty\x1a6\n" +
+	"\x03tty\x18\x06 \x01(\v2\x13.ateenv.v1alpha.TTYR\x03tty\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\a \x01(\tR\trequestId\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"2\n" +

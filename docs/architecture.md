@@ -41,7 +41,7 @@ flowchart LR
   HTTPClient -->|HTTP / WebSocket| HTTPSvc
   APISvc -->|Actor lifecycle| AteClient
   AteClient -->|gRPC :443| AteAPI
-  APISvc -->|guestConn + ensureAwake| AteNet
+  APISvc -->|guestSession + ensureAwake| AteNet
   HTTPSvc -->|DialGuest & CONNECT :8444| AteNet
   AteNet -->|h2c / HTTP :80| GuestDaemon
   GuestDaemon --> Workspace
@@ -50,7 +50,7 @@ flowchart LR
 Clients interact with `ate-env-api`, which runs as a Kubernetes Deployment inside the cluster.
 `ate-env-api` translates environment lifecycle calls into Substrate control plane requests
 (`ateapi`), forwards guest process and filesystem calls across the Substrate router (`atenet`) via
-`guestConn`, serves MCP tools over pooled connections, and proxies arbitrary TCP ports via HTTP
+`guestSession`, serves MCP tools over pooled connections, and proxies arbitrary TCP ports via HTTP
 `CONNECT` tunnels. Inside each actor, `ate-env-guest` runs as PID 1 in gVisor, spawns supervised
 child processes, and serves `ProcessService` and `FileSystemService`.
 
@@ -58,15 +58,14 @@ child processes, and serves `ProcessService` and `FileSystemService`.
 
 ### `ate-env-api` and `internal/apiservice`
 
-- **Owns**: In-cluster gRPC API (`EnvironmentService`, `ProcessService`, `FileSystemService`),
-  bearer authentication, on-demand `ActorTemplate` derivation (`imagetemplate.go`), wake retries
-  (`wakeretry.go`), placement discovery (`ListPlacementDomains`), and node warming (`WarmImage`,
-  capped per node of a worker selector by `-warm-max-probes-per-node` via `placement.go`).
-- **Calls**: `internal/ate.Client` for lifecycle (and `internal/envstore.Store` under
-  `-environment-store=configmaps`), and `atenet` via `s.guestConn` for guest RPCs.
-- **Must not do**: Must not execute commands locally, buffer full files in memory, or manage
-  in-memory process tracking. `guestConn` opens a connection per call, verifies actor readiness via
-  `s.ensureAwake`, and closes the connection on completion.
+- **Owns**: gRPC API (`EnvironmentService`, `ProcessService`, `FileSystemService`), bearer auth,
+  `ActorTemplate` derivation (`imagetemplate.go`), wake retries (`wakeretry.go`), router pooling
+  (`-router-pool-size`), `boundedAwakeCache` (`-reactive-wake`), `ListPlacementDomains`, and
+  `WarmImage` (`-warm-max-probes-per-node`, `placement.go`).
+- **Calls**: `internal/ate.Client` (`internal/envstore.Store` under `-environment-store=configmaps`)
+  and `atenet` via `s.guestSession` (`routerConns` when pooled).
+- **Must not do**: Must not run local commands, buffer full files, or track processes in memory.
+  `guestSession` checks `s.ensureAwake` (or `boundedAwakeCache`) and closes unpooled conns.
 
 ### Substrate client boundary (`internal/ate` and `internal/routertls`)
 
@@ -226,9 +225,9 @@ sequenceDiagram
   participant Tracker as guest/process.Tracker
 
   Client->>API: StartProcess(env_id, command, args, tty)
-  API->>Router: guestConn dials with ate-target-actor
+  API->>Router: guestSession dials (or picks pooled conn) with ate-target-actor
   API->>API: ensureAwake(ctx, conn, atespace, env_id)
-  Note over API,Router: Polls GetProcess while router returns Unavailable
+  Note over API,Router: Polls GetProcess while router returns Unavailable (skipped when cached awake under -reactive-wake)
   API->>Router: Forward StartProcess
   Router->>Guest: StartProcess
   Guest->>Tracker: Start(opts)
@@ -237,7 +236,7 @@ sequenceDiagram
   API-->>Client: Process{id}
 
   Client->>API: StreamProcessOutput(process_id)
-  API->>Router: guestConn -> StreamProcessOutput
+  API->>Router: guestSession -> StreamProcessOutput
   Router->>Guest: Forward StreamProcessOutput
   loop Until process exits and spool reaches EOF
     Guest->>Tracker: OutputChanged() notification
@@ -249,16 +248,19 @@ sequenceDiagram
 
 Key non-obvious points:
 
-- `s.guestConn` opens a connection per request and runs `ensureAwake`. If suspended, `atenet`
-  traffic starts restoration; `ensureAwake` polls `GetProcess("ate-env-wake-probe")` across
-  `DefaultWakeBudget` (5m whole wait), `DefaultWakeRunningBudget` (20s once `RUNNING`), and
-  `DefaultWakeStateReadCap` (5s per state read).
+- `s.guestSession` dials (`defer conn.Close()`) or pools `routerConns` (`-router-pool-size`),
+  running `ensureAwake` unless in `boundedAwakeCache` (`defaultAwakeCapacity`, `defaultAwakeTTL`,
+  `-reactive-wake`). `atenet` wakes actors as `ensureAwake` polls `GetProcess("ate-env-wake-probe")`
+  (`DefaultWakeBudget` 5m, `DefaultWakeRunningBudget` 20s `RUNNING`, `DefaultWakeStateReadCap` 5s).
+  On `-reactive-wake` `codes.Unavailable`, `boundedAwakeCache` evicts, and idempotent RPCs plus
+  `StartProcess` (`x-ate-env-guest-caps: start-request-id`, `StartProcessRequest.request_id`) retry
+  once (`SignalProcess` and old-guest `StartProcess` do not; `WriteProcessInput`, `WriteFile`, and
+  `Server.Wake` probe).
 - `ensureAwake` fails fast on unrecoverable states: `routertls.RejectedCertificate` or `CRASHED`
   returns `codes.FailedPrecondition`, `DELETING` returns `codes.NotFound`, and sustained no-capacity
   responses over a positive `WakeNoCapacityGrace` (`-wake-no-capacity-grace`) return
   `codes.ResourceExhausted`. Crash and no-capacity failures attach trailing metadata
   `StartFailureKey` (`ate-env-start-failure`: `"crashed"` or `"no-capacity"`).
-- The connection closes with `defer conn.Close()` when the RPC completes.
 
 ### 3. Suspend and delete an environment
 
@@ -274,11 +276,11 @@ Key non-obvious points:
 
 ## State and persistence
 
-- **`ate-env-api` keeps no local durable state**: In-memory state is `ate.Client.guestPool` (evicted
-  on `Delete` via `evictGuest`), `mcp.Server`, `imageTemplateLocks`, and the `internal/envstore`
-  informer; streams reconnect on restart. With `-environment-store=configmaps`
-  (`-environment-store-qps`, `-environment-store-burst`), `internal/envstore` stores one `ConfigMap`
-  per labeled/deadlined environment (by actor UID) and runs `SweepOrphans` (`ActorUIDs`).
+- **`ate-env-api` keeps no local durable state**: In-memory state is `ate.Client.guestPool`
+  (`evictGuest` on `Delete`), `routerConns` (`-router-pool-size`), `boundedAwakeCache`
+  (`-reactive-wake`), `mcp.Server`, `imageTemplateLocks`, and `internal/envstore`. Under
+  `-environment-store=configmaps` (`-environment-store-qps`, `-environment-store-burst`),
+  `internal/envstore` keeps one `ConfigMap` per actor UID (`SweepOrphans`, `ActorUIDs`).
 - **Substrate control plane (`ateapi`) is the source of truth**: Stores actor records, templates,
   worker pool allocations, and state transitions in PostgreSQL.
 - **Snapshots**: Suspended actors persist memory pages and filesystem layers in object storage
@@ -327,10 +329,10 @@ risks.
   `FileSystemService` streams directly to `ate-env-guest` over `atenet`. Keeping execution logic
   inside the guest ensures identical behavior whether invoked via gRPC, CLI, MCP, or Python SDK.
 - **Router dial paths and wake gaps (Position A)**: Three paths dial `atenet`: (1)
-  `apiservice.(*Server).guestConn` (ephemeral per call with `ensureAwake`; required for new gRPC
-  proxy RPCs); (2) `internal/ate.Client.DialGuest` (pooled per actor, duplicates interceptor logic
-  from `guestConn`, and is used only by `internal/mcp` without `ensureAwake`, a known gap); (3)
-  `internal/portproxy` (`CONNECT` tunnels with its own wake loop and `X-Env-Wake-Wait` holds).
+  `apiservice.(*Server).guestSession` (`-router-pool-size`, `ensureAwake`/`boundedAwakeCache`, gRPC
+  RPCs), (2) `internal/ate.Client.DialGuest` (actor-pooled for `internal/mcp` without `ensureAwake`,
+  duplicating `guestSession` interceptors, a known gap), and (3) `internal/portproxy` (`CONNECT`
+  wake loop and `X-Env-Wake-Wait` holds).
 - **Interceptors append `ate-target-actor` without forwarding caller metadata**: Forwarding incoming
   headers caused duplicate `ate-target-actor: <atespace>/<id>` headers, which `atenet-router`
   rejects with "invalid actor reference".
@@ -345,5 +347,4 @@ risks.
   `DefaultMaxConcurrentStreams = 4096` (vs Go's 250 default) and `clients/python` opens
   `ceil(max_concurrent / 200)` connections to prevent stream exhaustion during massive RL rollouts.
 
-See [docs/dev/code-layout.md](./dev/code-layout.md) and
-[docs/dev/concurrency-and-pitfalls.md](./dev/concurrency-and-pitfalls.md).
+See [code layout](./dev/code-layout.md) and [pitfalls](./dev/concurrency-and-pitfalls.md).

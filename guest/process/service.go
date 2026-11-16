@@ -23,22 +23,33 @@ import (
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
 // Service implements ateenvv1alpha.ProcessServiceServer on top of a Tracker.
 type Service struct {
 	ateenvv1alpha.UnimplementedProcessServiceServer
-	tracker *Tracker
+	tracker     *Tracker
+	idempotency *idempotencyTable
 }
 
 // NewService creates a new ProcessServiceServer instance.
 func NewService(tracker *Tracker) *Service {
-	return &Service{tracker: tracker}
+	return &Service{
+		tracker:     tracker,
+		idempotency: newIdempotencyTable(defaultIdempotencyCapacity, defaultIdempotencyTTL),
+	}
+}
+
+func (s *Service) setGuestCapsTrailer(ctx context.Context) {
+	_ = grpc.SetTrailer(ctx, metadata.Pairs("x-ate-env-guest-caps", "start-request-id"))
 }
 
 // StartProcess launches a process in the background and returns its resource.
 func (s *Service) StartProcess(ctx context.Context, req *ateenvv1alpha.StartProcessRequest) (*ateenvv1alpha.Process, error) {
+	s.setGuestCapsTrailer(ctx)
+
 	if len(req.GetCommand()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "command cannot be empty")
 	}
@@ -46,9 +57,41 @@ func (s *Service) StartProcess(ctx context.Context, req *ateenvv1alpha.StartProc
 		return nil, status.Error(codes.InvalidArgument, "timeout is invalid")
 	}
 
+	var (
+		entry     *idempotencyEntry
+		processID string
+		rpcErr    error
+	)
+	if requestID := req.GetRequestId(); requestID != "" && s.idempotency != nil {
+		var exists bool
+		var err error
+		entry, exists, err = s.idempotency.getOrCreate(requestID, req)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			select {
+			case <-entry.done:
+				if entry.err != nil {
+					return nil, entry.err
+				}
+				if state, err := s.tracker.Get(entry.processID); err == nil {
+					return state.ToProto(), nil
+				}
+				return &ateenvv1alpha.Process{ProcessId: entry.processID}, nil
+			case <-ctx.Done():
+				return nil, status.FromContextError(ctx.Err()).Err()
+			}
+		}
+		defer func() {
+			s.idempotency.complete(entry, processID, rpcErr)
+		}()
+	}
+
 	var tty *TTYOptions
 	if req.GetTty() != nil {
 		if err := checkWindowSize(req.GetTty().GetRows(), req.GetTty().GetCols()); err != nil {
+			rpcErr = err
 			return nil, err
 		}
 		tty = &TTYOptions{
@@ -66,13 +109,16 @@ func (s *Service) StartProcess(ctx context.Context, req *ateenvv1alpha.StartProc
 		Timeout: req.GetTimeout().AsDuration(),
 	})
 	if err != nil {
-		return nil, rpcError(err, "")
+		rpcErr = rpcError(err, "")
+		return nil, rpcErr
 	}
+	processID = state.ProcessID
 	return state.ToProto(), nil
 }
 
 // GetProcess returns the current state of a process.
 func (s *Service) GetProcess(ctx context.Context, req *ateenvv1alpha.GetProcessRequest) (*ateenvv1alpha.Process, error) {
+	s.setGuestCapsTrailer(ctx)
 	state, err := s.lookup(req.GetProcessId())
 	if err != nil {
 		return nil, err
@@ -209,6 +255,7 @@ func (s *Service) WriteProcessInput(stream grpc.ClientStreamingServer[ateenvv1al
 // SignalProcess delivers a signal to the process group and returns the
 // process state right after delivery.
 func (s *Service) SignalProcess(ctx context.Context, req *ateenvv1alpha.SignalProcessRequest) (*ateenvv1alpha.Process, error) {
+	s.setGuestCapsTrailer(ctx)
 	state, err := s.lookup(req.GetProcessId())
 	if err != nil {
 		return nil, err

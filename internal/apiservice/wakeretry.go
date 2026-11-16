@@ -372,11 +372,12 @@ func identityNote(id string) string {
 // with no call after it. The port proxy holds a request on it when the caller
 // asks (portproxy.Options.Wake).
 func (s *Server) Wake(ctx context.Context, atespace, id string) error {
-	conn, err := s.guestConn(ctx, atespace, id)
+	_, _, closeFn, _, err := s.guestSession(ctx, atespace, id, true)
 	if err != nil {
 		return err
 	}
-	return conn.Close()
+	closeFn()
+	return nil
 }
 
 // ActorState is the state read ensureAwake uses, for the port proxy

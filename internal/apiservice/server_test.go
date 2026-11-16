@@ -605,7 +605,7 @@ func waitProcess(t *testing.T, client ateenvv1alpha.ProcessServiceClient, ctx co
 
 // TestProxyGuestServicesClientTargetActorHeader covers the two ways a
 // caller-supplied ate-target-actor header used to break guest calls. Forwarded
-// next to the one guestConn adds, the router saw the header twice and rejected
+// next to the one guestSession adds, the router saw the header twice and rejected
 // the request as an invalid actor reference (agent-substrate/substrate#2308).
 // Forwarded alone, it would have let the caller retarget the call. The server
 // must not forward it, so a call that names another actor still reaches the

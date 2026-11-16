@@ -17,6 +17,8 @@ package apiservice
 import (
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 // SetWarmTimings shortens the backoff between the attempts of a WarmImage
@@ -63,4 +65,31 @@ func SetWarmLateCreateSettle(t *testing.T, d time.Duration) {
 	old := warmLateCreateSettle.Load()
 	warmLateCreateSettle.Store(d)
 	t.Cleanup(func() { warmLateCreateSettle.Store(old) })
+}
+
+// RouterConns returns a slice copy of the active pooled router connections.
+func (s *Server) RouterConns() []*grpc.ClientConn {
+	s.routerPoolMu.Lock()
+	defer s.routerPoolMu.Unlock()
+	out := make([]*grpc.ClientConn, len(s.routerConns))
+	copy(out, s.routerConns)
+	return out
+}
+
+// IsAwakeCached reports whether targetActor is currently recorded as awake in the awake cache.
+func (s *Server) IsAwakeCached(targetActor string) bool {
+	if s.awakeEnvs == nil {
+		return false
+	}
+	return s.awakeEnvs.Contains(targetActor)
+}
+
+// AwakeCacheLen reports the total number of entries held in boundedAwakeCache.
+func (s *Server) AwakeCacheLen() int {
+	if s.awakeEnvs == nil {
+		return 0
+	}
+	s.awakeEnvs.mu.Lock()
+	defer s.awakeEnvs.mu.Unlock()
+	return len(s.awakeEnvs.entries)
 }

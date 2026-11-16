@@ -24,12 +24,12 @@ Keep responsibilities strictly separated across layers:
    processes, streaming spools, reading or writing files) lives exclusively inside `ate-env-guest`.
 2. **`internal/apiservice` is a thin proxy**: `ate-env-api` handles authentication, manages wake
    retries via `ensureAwake`, and forwards requests to `ate-env-guest` over `atenet` via
-   `s.guestConn`. Never execute commands or buffer whole files inside `ate-env-api`.
+   `s.guestSession`. Never execute commands or buffer whole files inside `ate-env-api`.
 3. **Router dial paths and wake boundaries (Position A)**: All new gRPC proxy RPCs on `ate-env-api`
-   must dial via `s.guestConn(ctx, atespace, envID)`, which executes `s.ensureAwake` and attaches
-   `ate-target-actor`. `internal/ate.Client.DialGuest` is used exclusively by `internal/mcp` and
-   lacks `ensureAwake` (known gap). Never dial `atenet` directly without going through `guestConn`
-   or `DialGuest`.
+   must dial via `s.guestSession(ctx, atespace, envID, false)`, which executes `s.ensureAwake` and
+   attaches `ate-target-actor`. `internal/ate.Client.DialGuest` is used exclusively by
+   `internal/mcp` and lacks `ensureAwake` (known gap). Never dial `atenet` directly without going
+   through `guestSession` or `DialGuest`.
 4. **`internal/mcp` adapts to guest RPCs**: Tools (`shell`, `read_file`, `write_file`) translate
    JSON inputs into `ProcessService` and `FileSystemService` calls over `DialGuest`. Never bypass
    the guest gRPC interface.
@@ -61,9 +61,10 @@ Keep responsibilities strictly separated across layers:
 ### 3. Add the proxy handler in `ate-env-api` (`internal/apiservice/`)
 
 - Add the corresponding handler in `internal/apiservice/server.go`.
-- Dial the guest connection via `conn, err := s.guestConn(ctx, atespace, envID)` (which executes
+- Dial the guest connection via
+  `conn, outCtx, closeFn, _, err := s.guestSession(ctx, atespace, envID, false)` (which executes
   `s.ensureAwake` and attaches `ate-target-actor`).
-- Defer `conn.Close()` and forward the RPC over the generated client.
+- Defer `closeFn()` and forward the RPC over the generated client using `outCtx`.
 
 ### 4. Expose in MCP (`internal/mcp/`)
 

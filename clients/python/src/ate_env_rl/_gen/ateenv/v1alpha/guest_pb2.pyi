@@ -126,7 +126,7 @@ class TTY(_message.Message):
     def __init__(self, rows: _Optional[int] = ..., cols: _Optional[int] = ...) -> None: ...
 
 class StartProcessRequest(_message.Message):
-    __slots__ = ("command", "cwd", "env", "stdin", "timeout", "tty")
+    __slots__ = ("command", "cwd", "env", "stdin", "timeout", "tty", "request_id")
     class EnvEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -140,13 +140,15 @@ class StartProcessRequest(_message.Message):
     STDIN_FIELD_NUMBER: _ClassVar[int]
     TIMEOUT_FIELD_NUMBER: _ClassVar[int]
     TTY_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     command: _containers.RepeatedScalarFieldContainer[str]
     cwd: str
     env: _containers.ScalarMap[str, str]
     stdin: bool
     timeout: _duration_pb2.Duration
     tty: TTY
-    def __init__(self, command: _Optional[_Iterable[str]] = ..., cwd: _Optional[str] = ..., env: _Optional[_Mapping[str, str]] = ..., stdin: _Optional[bool] = ..., timeout: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., tty: _Optional[_Union[TTY, _Mapping]] = ...) -> None: ...
+    request_id: str
+    def __init__(self, command: _Optional[_Iterable[str]] = ..., cwd: _Optional[str] = ..., env: _Optional[_Mapping[str, str]] = ..., stdin: _Optional[bool] = ..., timeout: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., tty: _Optional[_Union[TTY, _Mapping]] = ..., request_id: _Optional[str] = ...) -> None: ...
 
 class GetProcessRequest(_message.Message):
     __slots__ = ("process_id",)

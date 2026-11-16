@@ -46,15 +46,16 @@ tools, and Python fleet scheduling. See [README.md](./README.md) and
 ## Architecture invariants
 
 - `internal/apiservice` owns host adapter translation and proxy routing; `guest/process` and
-  `guest/filesystem` own in-environment execution; callers forward through `s.guestConn` with
+  `guest/filesystem` own in-environment execution; callers forward through `s.guestSession` with
   `ensureAwake` and must not buffer full files or track process state in `ate-env-api`; because
   `ate-env-api` is an unbuffered horizontal adapter (not enforced).
-- `apiservice.(*Server).guestConn` owns per-call guest gRPC dialing with wake verification; new
-  proxy handlers call it and must not dial `atenet` directly; because `ensureAwake` handles actor
-  restoration from storage (not enforced). `internal/ate.Client.DialGuest` dials `atenet` for
-  `internal/mcp` without `ensureAwake` (known gap; not enforced). `internal/portproxy` owns raw
-  `CONNECT` dialing, managing its own tunnel wake loop and holding `X-Env-Wake-Wait` requests via
-  `apiservice.(*Server).Wake` (not enforced).
+- `apiservice.(*Server).guestSession` owns guest gRPC dialing (`-router-pool-size`) and wake
+  verification (`ensureAwake`, or `boundedAwakeCache` under `-reactive-wake`); new proxy handlers
+  call it and must not dial `atenet` directly; because `ensureAwake` handles actor restoration from
+  storage (not enforced). `internal/ate.Client.DialGuest` dials `atenet` for `internal/mcp` without
+  `ensureAwake` (known gap; not enforced). `internal/portproxy` owns raw `CONNECT` dialing, managing
+  its own tunnel wake loop and holding `X-Env-Wake-Wait` requests via `apiservice.(*Server).Wake`
+  (not enforced).
 - `proto/ateenv/v1alpha` owns the contract between `ate-env-api` and `ate-env-guest`; `internal/`
   and `clients/` call generated stubs and must not import `guest/` in production (`guest/` and
   `cmd/ate-env-guest` must not import `internal/ate` or `go.ate.dev/substrate`); because
