@@ -162,7 +162,9 @@ applied) select the base:
    template, image digest, worker selector, session and context ids; never the token). A verifier that Harbor runs in a separate environment
    (`[verifier] environment_mode = "separate"`) records its own environment in
    `trial_dir/ate_env.verifier.<step>.json`, so the agent's record is kept.
-2. `exec`: `sh -c <command>` through the guest, with the working directory
+2. `exec`: `bash -c <command>` through the guest when the image has bash, as
+   Harbor's Docker and GKE environments run it; `sh -c <command>` when it has
+   none (Alpine). `start` checks for bash once. The working directory comes
    from the call, the task, the Dockerfile's `WORKDIR` or the kwarg, in that
    order. At `timeout_sec` (or `exec_timeout_sec` when Harbor passes none) the
    guest kills the process group and the exit code is 137. A `user` that is the

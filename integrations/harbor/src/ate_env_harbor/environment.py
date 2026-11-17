@@ -229,6 +229,7 @@ class AteEnvEnvironment(BaseEnvironment):
         self._env: Env | None = None
         self._image_user: str | None = None
         self._switch_tool: str | None = None  # "sudo", "su" or "" once probed
+        self._exec_shell: str = "bash"  # "bash" when present, else "sh" (probed at start)
         self._template_used: str | None = None
         self._image_ref: str | None = None
         self._archives = itertools.count(1)
@@ -362,6 +363,7 @@ class AteEnvEnvironment(BaseEnvironment):
             env = await self._create(client, image)
             await self._wait_ready(env, deadline)
             await self._probe_user(env)
+            await self._probe_shell(env)
             await self._check_tool_paths(env)
             await self._write_tool_profile(env)
             self._env = env
@@ -474,6 +476,16 @@ class AteEnvEnvironment(BaseEnvironment):
             return
         if result.exit_code == 0 and result.stdout.strip():
             self._image_user = result.stdout.strip()
+
+    async def _probe_shell(self, env: Env) -> None:
+        """HB-30: bash runs the commands when the image has it, else sh."""
+        try:
+            result = await env.shell("command -v bash >/dev/null 2>&1", timeout=30)
+        except EnvError as e:
+            self.logger.debug("shell probe failed, commands run under sh: %s", e)
+            self._exec_shell = "sh"
+            return
+        self._exec_shell = "bash" if result.exit_code == 0 else "sh"
 
     async def _ensure_workdir(self, env: Env) -> None:
         """Create the configured working directory; a prebuilt image may lack it."""
@@ -612,8 +624,8 @@ class AteEnvEnvironment(BaseEnvironment):
             effective_exec_cwd(cwd, self.task_env_config.workdir, self._dockerfile_workdir)
             or self._workdir_kwarg
         )
-        # The tool paths go inside the command, thus inside the `sh -c` a user
-        # switch wraps, where sudo's reset of the environment cannot drop them.
+        # The tool paths go inside the command, thus inside the `<shell> -c`
+        # wrapper, where sudo's reset of the environment cannot drop them.
         command = self._as_user_command(
             self._tooled(command), resolved_user, merged, await self._switch_tool_for(resolved_user)
         )
@@ -632,16 +644,21 @@ class AteEnvEnvironment(BaseEnvironment):
     def _as_user_command(
         self, command: str, user: str | int | None, env: dict[str, str] | None, tool: str | None
     ) -> str:
-        """Wrap ``command`` so it runs as ``user`` when that differs from the image's.
+        """Wrap ``command`` in bash (when available) and switch to ``user`` if needed.
 
-        The environment is inlined with ``env K=V ...``: sudo's ``env_reset``
-        drops the caller's variables, and the guest applied them to the outer
-        process only.
+        Matches Harbor's Docker and GKE providers, which execute commands under
+        ``bash -c`` so scripts whose first line is not a shebang still run under
+        bash rather than POSIX sh (dash). Falls back to ``sh`` on images without
+        bash (such as Alpine).
+
+        The environment is inlined with ``env K=V ...`` on user switch: sudo's
+        ``env_reset`` drops the caller's variables, and the guest applied them to
+        the outer process only.
         """
+        inner = f"{self._exec_shell} -c {shlex.quote(command)}"
         if not self._needs_switch(user):
-            return command
+            return inner if self._exec_shell != "sh" else command
         name = str(user)
-        inner = "sh -c " + shlex.quote(command)
         if env:
             inner = "env " + " ".join(shlex.quote(f"{k}={v}") for k, v in env.items()) + " " + inner
         if tool == "sudo":

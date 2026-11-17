@@ -14,6 +14,14 @@ user needs to know across them.
   its `-preflight-*` knobs the same way. A value above the range (more than
   8 probes per node, more than 10 rounds) is now refused with the other flag
   checks, before the command reads the plan or the token.
+- Harbor provider: `exec` runs each command under `bash -c` when the image
+  has bash, as Harbor's Docker and GKE environments do, and the user switch
+  wraps the command in bash as well. Before, every command ran under `sh`,
+  which is dash on Debian and Ubuntu images: a task script whose shebang is
+  not on its first line (the `solve.sh` and `test.sh` of
+  `swebench-verified@1.0`) stopped at `set -o pipefail`, and the trial ended
+  without a reward. An image without bash keeps `sh`. `start` checks for bash
+  once per environment (see `docs/plans/harbor`, HB-30).
 - `ate-env manifest` and `ate-env manifest template`: validate existing
   template, WorkerPool and namespace flags up front instead of printing objects
   with empty or invalid names. Both commands refuse an explicit empty or
