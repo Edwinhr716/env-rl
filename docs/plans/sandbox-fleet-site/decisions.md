@@ -131,3 +131,40 @@ Append-only. Each entry: date, who, what, why.
   shell, so its files are not read. On the host, with `-out-dir` and a token of the same
   ServiceAccount, where `TestE2ESnapshotDir` decodes the files and compares the counts. The
   manifest's Deployment uses the `Recreate` strategy: `latest.json` has one writer.
+- 2026-11-16, orchestrator: drift check against `main` at `66b0e526` (research.md, "Audit of main,
+  2026-11-16"). The seven steps hold; open #392 (`ListEnvironments`) does not change the reporter.
+- 2026-11-16, orchestrator, pull request 3: the collector is `ate-env manifest collector`, not a
+  static `manifests/telemetry/collector.yaml`. The bucket and the project are inputs, the reporter's
+  manifest is rendered the same way, a test checks the rendered pipeline, and a new top-level
+  directory would need an entry in `hack/verify/layers.py`. The namespace and the names are
+  `ate-env-collector`, not the fixture's `ate-env-telemetry` and `otel-collector`: an apply over the
+  fixture would replace its ConfigMap and Deployment and drop its `files` container. The endpoint is
+  `http://ate-env-collector.ate-env-collector:4317`.
+- 2026-11-16, orchestrator, pull request 3: the collector renders two traces pipelines from one OTLP
+  receiver, one per exporter, because the bucket's batch waits up to 30 s to make fewer objects and
+  Cloud Trace keeps the default batch. Both set `gcp.project_id` with `upsert`, so a sender cannot
+  direct spans into another cluster's project with the collector's identity, which holds
+  `roles/cloudtrace.agent` in every cluster project. The collector renders traces only. The metrics
+  pipeline is left out, because `--pod-monitoring` covers `ate-env-api`, and the logs pipeline comes
+  with phase 7, when Substrate sends its records over OTLP. The image is
+  `otel/opentelemetry-collector-contrib` 0.165.0 pinned by digest: the `google_cloud_storage`
+  exporter takes traces and a partition from 0.145.0, and 0.165.0 renames the components the
+  configuration uses (`google_client_auth`, `otlp_http`, `google_cloud_storage`).
+- 2026-11-16, orchestrator, pull request 3: the collector's Google service account needs
+  `storage.buckets.get` on the bucket next to `roles/storage.objectCreator`, because the exporter
+  with `reuse_if_exists: true` reads the bucket's attributes at start and fails without them. The
+  quickstart grants `roles/storage.legacyBucketReader`, which adds `storage.objects.list`; the
+  Terraform of pull request 6 can use a custom role with `storage.buckets.get` alone. The span
+  objects are `v1/traces/year=YYYY/month=MM/day=DD/spans_<uuid>.gz`, one export request each.
+  `telemetry.googleapis.com` must be enabled in the cluster project and in the project of the
+  collector's Google service account; the quickstart and `docs/observability.md` say so.
+- 2026-11-16, orchestrator, pull request 3: the reporter's `-enable-tracing` and
+  `-metrics-listen-addr` (2026-11-10) are not in pull request 3, which stays the manifests. They are
+  a pull request of their own, with the reporter's section in `docs/metrics.md` and a
+  `PodMonitoring` for the reporter.
+- 2026-11-16, orchestrator, from the review of #415: the collector's pod template carries the
+  SHA-256 of its configuration as `ate-env.dev/config-sha256`, so `kubectl apply` of a new
+  `--project` or `--bucket` restarts it. The check that loads the rendered configuration in the real
+  collector (`TestManifestCollectorConfigValidates`) is manual: CI has no `otelcol-contrib` binary.
+  Drift check after the rebase onto `9fed77fc`: #392 adds `ListEnvironments`, which does not change
+  the reporter (research.md).

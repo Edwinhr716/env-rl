@@ -658,6 +658,21 @@ the whole control plane, so first read it with `kubectl ate get access-policy --
 
 The Deployment turns ready when the first snapshot is written.
 
+### 4. Optional: the fleet telemetry collector
+
+`ate-env manifest collector` prints one OpenTelemetry collector per cluster, which sends the traces
+of `ate-env-api` and the trainers to Cloud Trace and as files under `v1/traces/` in a bucket.
+`--pod-monitoring` adds a Managed Prometheus `PodMonitoring` that scrapes `ate-env-api` every 5 s.
+See [docs/observability.md](docs/observability.md#the-fleet-collector) for the roles the Google
+service account needs and the APIs to enable.
+
+```bash
+ate-env manifest collector --bucket <bucket> --project <project> \
+  --gcp-service-account ate-env-collector@<central-project>.iam.gserviceaccount.com | kubectl apply -f -
+ate-env manifest --enable-tracing --otlp-endpoint http://ate-env-collector.ate-env-collector:4317 \
+  --otlp-insecure --metrics-port 9090 --pod-monitoring ... | kubectl apply -f -
+```
+
 ## CLI
 
 File operations and remote command execution take the environment ID first, followed by the operation:

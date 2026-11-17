@@ -168,6 +168,14 @@ user needs to know across them.
   and `cluster` to be one path segment each (no `/` or `\`, not `.` or `..`);
   the reporter refuses such a `-project` or `-cluster` at start, and `-out-dir`
   writes stay under the directory.
+- `ate-env manifest collector` prints the fleet telemetry collector, one per
+  cluster in namespace `ate-env-collector`: OTLP traces in on 4317 and 4318,
+  out to Cloud Trace in `--project` through `telemetry.googleapis.com` and as
+  gzip OTLP/JSON files under `v1/traces/` in `--bucket`. It runs
+  `otel/opentelemetry-collector-contrib` 0.165.0, pinned by digest, as the
+  Google service account that `--gcp-service-account` binds through Workload
+  Identity. `ate-env manifest --pod-monitoring`, with `--metrics-port`, adds a
+  Managed Prometheus `PodMonitoring` that scrapes `ate-env-api` every 5 s.
 - Pre-flight knobs on `FleetConfig` (they apply with `preflight=True`):
   `preflight_probes_per_node` (2, at most 8), `preflight_rounds` (3, at most
   10), `preflight_probe_timeout_s` (600, at least a microsecond and at most

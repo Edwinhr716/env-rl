@@ -1,6 +1,6 @@
 # Quickstart: deploy the fleet site
 
-Status: plan-stage runbook, written 2026-11-04; last checked 2026-11-10 against `3dd8bab2`. The
+Status: plan-stage runbook, written 2026-11-04; last checked 2026-11-16 against `9fed77fc`. The
 Terraform in pull request 6 of the [execution plan](./execution-plan.md) replaces the `gcloud`
 commands below with one `apply` per project; `docs/fleet-site.md` then becomes the user-facing
 guide. Until then this is the order of operations and the exact resources, with the open parameters
@@ -24,7 +24,7 @@ Enable the services:
 ```bash
 gcloud services enable run.googleapis.com iap.googleapis.com pubsub.googleapis.com \
   bigquery.googleapis.com storage.googleapis.com monitoring.googleapis.com \
-  logging.googleapis.com artifactregistry.googleapis.com --project "$CENTRAL_PROJECT"
+  logging.googleapis.com artifactregistry.googleapis.com telemetry.googleapis.com --project "$CENTRAL_PROJECT"
 gcloud artifacts repositories create ate-env --repository-format docker \
   --location "$REGION" --project "$CENTRAL_PROJECT"
 ```
@@ -112,6 +112,8 @@ for b in "${BENCH_BUCKETS[@]}"; do
   [ -n "$b" ] && gcloud storage buckets add-iam-policy-binding "gs://$b" --member "serviceAccount:ate-fleet-site@$P" --role roles/storage.objectViewer
 done
 gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-env-collector@$P" --role roles/storage.objectCreator
+# The span exporter reads the bucket's attributes before it starts (storage.buckets.get).
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-env-collector@$P" --role roles/storage.legacyBucketReader
 gcloud projects add-iam-policy-binding "$CENTRAL_PROJECT" --member "serviceAccount:ate-fleet-site@$P" --role roles/monitoring.viewer
 gcloud projects add-iam-policy-binding "$CENTRAL_PROJECT" --member "serviceAccount:ate-fleet-site@$P" --role roles/bigquery.jobUser
 bq add-iam-policy-binding --member "serviceAccount:ate-fleet-site@$P" --role roles/bigquery.dataViewer "$CENTRAL_PROJECT:fleet"
@@ -139,15 +141,17 @@ gcloud pubsub topics add-iam-policy-binding ate-actor-events --project "$CENTRAL
 
 Workload Identity for the two in-cluster components (after PR 2 and PR 3, which add the Deployments;
 the namespaces and Kubernetes service accounts are `ate-env-reporter/ate-env-reporter` and
-`ate-env-telemetry/otel-collector`):
+`ate-env-collector/ate-env-collector`):
 
 ```bash
-for pair in "ate-env-reporter:ate-env-reporter:ate-env-reporter" "ate-env-collector:ate-env-telemetry:otel-collector"; do
+for pair in "ate-env-reporter:ate-env-reporter:ate-env-reporter" "ate-env-collector:ate-env-collector:ate-env-collector"; do
   IFS=: read -r sa ns ksa <<<"$pair"
   gcloud iam service-accounts add-iam-policy-binding "$sa@$P" --project "$CENTRAL_PROJECT" \
     --role roles/iam.workloadIdentityUser --member "serviceAccount:$CLUSTER_PROJECT.svc.id.goog[$ns/$ksa]"
 done
 gcloud projects add-iam-policy-binding "$CLUSTER_PROJECT" --member "serviceAccount:ate-env-collector@$P" --role roles/cloudtrace.agent
+# The collector exports through the Telemetry API; enable it here and in the central project, which owns its account.
+gcloud services enable telemetry.googleapis.com cloudtrace.googleapis.com --project "$CLUSTER_PROJECT"
 ```
 
 The reporter writes under two prefixes of its own cluster. Overwriting `latest.json` needs
@@ -170,10 +174,15 @@ gcloud container clusters update "$CLUSTER" --project "$CLUSTER_PROJECT" --locat
 
 In the cluster, after the components exist:
 
-- PR 3: `kubectl apply -f manifests/telemetry/collector.yaml` and the `PodMonitoring` that
-  `ate-env manifest --metrics-port 9090 --pod-monitoring` renders for each `ate-env` namespace.
-- PR 2:
-  `ate-env manifest reporter --bucket "$BUCKET" --project "$CLUSTER_PROJECT" --cluster "$CLUSTER" | kubectl apply -f -`,
+- PR 3:
+  `ate-env manifest collector --bucket "$BUCKET" --project "$CLUSTER_PROJECT" --gcp-service-account "ate-env-collector@$P" | kubectl apply -f -`,
+  and in each `ate-env` namespace the `PodMonitoring` that
+  `ate-env manifest --metrics-port 9090 --pod-monitoring` renders, with `--enable-tracing`,
+  `--otlp-endpoint http://ate-env-collector.ate-env-collector:4317` and `--otlp-insecure` so
+  `ate-env-api` sends its spans to the collector.
+- PR 2 (no reporter image is published yet; build one with
+  `KO_DOCKER_REPO=... ko build -B ./cmd/ate-env-reporter`):
+  `ate-env manifest reporter --image "$REPORTER_IMAGE" --bucket "$BUCKET" --project "$CLUSTER_PROJECT" --cluster "$CLUSTER" --gcp-service-account "ate-env-reporter@$P" | kubectl apply -f -`,
   then merge `user:system:serviceaccount:ate-env-reporter:ate-env-reporter` into the global
   AccessPolicy's `viewer` binding with `kubectl ate get access-policy --global -o yaml` and
   `kubectl ate update access-policy --global -f <file>` (both commands refuse to run without `-a` or

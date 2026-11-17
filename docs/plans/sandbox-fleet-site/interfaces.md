@@ -1,6 +1,6 @@
 # Interface contracts: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-10 against `3dd8bab2`. The snapshot schema in the next
+Status: accepted (#223); last checked 2026-11-16 against `9fed77fc`. The snapshot schema in the next
 section is code since pull request 1 (#226, `internal/inventory`): its object kinds, field names and
 rules are fixed, and a change to them is a schema change. The names in the other sections (bucket
 layout, reporter flags and identity, event stream and tables, collector pipelines, site routes and
@@ -13,7 +13,7 @@ lead confirms them and records changes in [decisions.md](./decisions.md).
 gs://<bucket>/v1/inventory/<project>/<cluster>/latest.json          rewritten every interval by that cluster's reporter, its only writer
 gs://<bucket>/v1/snapshots/<project>/<cluster>/<ts>.json            hourly, lifecycle 30 days (its own prefix, so no rule can touch latest.json)
 gs://<bucket>/v1/events/<dt=YYYY-MM-DD>/...                          Cloud Storage subscription output, lifecycle 400 days
-gs://<bucket>/v1/traces/<year>/<month>/<day>/...                     google_cloud_storage exporter output, gzip
+gs://<bucket>/v1/traces/year=<YYYY>/month=<MM>/day=<DD>/spans_<uuid>.gz   google_cloud_storage exporter output, one OTLP/JSON export request per object, gzip
 gs://<bucket>/v1/runs/<run_id>/                                      RunReport .txt and .json, spans.jsonl, run.json and report.html (FS-11 lists the three steps)
 gs://<bench bucket>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>[_traced]/   benchmark bundles from bench upload (#270)
 ```
@@ -252,16 +252,32 @@ Phase 2: the collector receives the OTLP log events and routes `event.name` in
 `{ate.actor.state_changed, ate.actor.crashed}` to `googlecloudpubsub` with no sampling and no
 filtering processor on that pipeline, and `ate.actor.usage_sampled` to GCS only.
 
-## Collector pipelines, `manifests/telemetry/collector.yaml`
+## Collector pipelines, `ate-env manifest collector`
 
-| Pipeline | Receivers                                                                  | Exporters                                                                                                                                |
-| -------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| traces   | `otlp` (4317, 4318)                                                        | `otlphttp` to `https://telemetry.googleapis.com`, `google_cloud_storage` (prefix `v1/traces`, gzip, partition `year=%Y/month=%m/day=%d`) |
-| metrics  | `prometheus` scraping `ate-env-api` only when PodMonitoring is unavailable | `googlemanagedprometheus` or none                                                                                                        |
-| logs     | `otlp`                                                                     | `googlecloudpubsub` for the two lifecycle events; `google_cloud_storage` for usage samples                                               |
+Pull request 3 renders the traces row as two pipelines, `traces/cloudtrace` with the default batch
+and `traces/files` with a 30 s batch, both after `memory_limiter` and `resource/gcp_project_id`
+(`upsert`); the metrics row is not rendered, because PodMonitoring covers `ate-env-api`; the logs
+pipeline comes with phase 7. The image is `otel/opentelemetry-collector-contrib` 0.165.0, pinned by
+digest, whose component names are the ones below. Flags: `--bucket` and `--project` (required; the
+project is `gcp.project_id` and the project of `google_client_auth`), `--namespace`
+(`ate-env-collector`), `--image`, `--gcp-service-account`. Kubernetes names: ServiceAccount,
+ConfigMap, Deployment and Service `ate-env-collector`; endpoint
+`http://ate-env-collector.ate-env-collector:4317`.
 
-The collector's service account holds `roles/cloudtrace.agent`, `roles/storage.objectCreator` on the
-bucket and `roles/pubsub.publisher` on the topic.
+| Pipeline | Receivers                                                                  | Exporters                                                                                                                                                                                                |
+| -------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| traces   | `otlp` (4317, 4318)                                                        | `otlp_http/cloudtrace` to `https://telemetry.googleapis.com` with `google_client_auth`, `google_cloud_storage` (`reuse_if_exists`, partition prefix `v1/traces`, format `year=%Y/month=%m/day=%d`, gzip) |
+| metrics  | `prometheus` scraping `ate-env-api` only when PodMonitoring is unavailable | `googlemanagedprometheus` or none                                                                                                                                                                        |
+| logs     | `otlp`                                                                     | `googlecloudpubsub` for the two lifecycle events; `google_cloud_storage` for usage samples                                                                                                               |
+
+The collector's service account holds `roles/cloudtrace.agent`, `roles/storage.objectCreator` and
+`storage.buckets.get` (for example `roles/storage.legacyBucketReader`) on the bucket, because the
+exporter reads the bucket's attributes before it starts, and in phase 7 `roles/pubsub.publisher` on
+the topic.
+
+PodMonitoring, `ate-env manifest --metrics-port <port> --pod-monitoring`:
+`monitoring.googleapis.com/v1`, name `ate-env-api` in the deployment's namespace, selector
+`app: ate-env-api`, one endpoint on port `metrics`, path `/metrics`, interval `5s`.
 
 ## Site, `cmd/ate-env-fleet-site`
 
