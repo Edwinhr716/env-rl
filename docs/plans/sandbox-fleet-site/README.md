@@ -1,13 +1,14 @@
 # Sandbox fleet site: design
 
 Status: accepted plan (#223); pull requests 1, 2 and 2b (`internal/inventory`, the reporter and its
-manifest) merged as #226, #348 and #349; pull request 3, the telemetry manifests, in review. Last
-checked 2026-11-16 against `ai-on-gke/sandboxenv-rl` at `9fed77fc` and the Substrate `go.mod`
-requires, `274605f1`; the audit is in [research.md](./research.md), which first read `3b03b03` and
-`28520c0d` on 2026-10-30. The decisions taken so far are in [decisions.md](./decisions.md).
-Companions: [prd.md](./prd.md), [execution-plan.md](./execution-plan.md),
-[interfaces.md](./interfaces.md), [acceptance-criteria.md](./acceptance-criteria.md) and, for the
-order of operations with `gcloud`, [quickstart.md](./quickstart.md).
+manifest) merged as #226, #348 and #349; pull requests 3 and 4, the telemetry manifests and the site
+with the Fleet and Cluster pages, in review. Last checked 2026-11-16 against
+`ai-on-gke/sandboxenv-rl` at `9fed77fc` and the Substrate `go.mod` requires, `274605f1`; the audit
+is in [research.md](./research.md), which first read `3b03b03` and `28520c0d` on 2026-10-30. The
+decisions taken so far are in [decisions.md](./decisions.md). Companions: [prd.md](./prd.md),
+[execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
+[acceptance-criteria.md](./acceptance-criteria.md) and, for the order of operations with `gcloud`,
+[quickstart.md](./quickstart.md).
 
 ## Goal
 

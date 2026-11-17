@@ -673,6 +673,17 @@ ate-env manifest --enable-tracing --otlp-endpoint http://ate-env-collector.ate-e
   --otlp-insecure --metrics-port 9090 --pod-monitoring ... | kubectl apply -f -
 ```
 
+### 5. Optional: the fleet site
+
+`ate-env-fleet-site` is one read-only website for every cluster, on Cloud Run behind
+Identity-Aware Proxy. It reads the reporters' snapshots from the bucket and the actor events from
+BigQuery; [the plan's quickstart](docs/plans/sandbox-fleet-site/quickstart.md) has the deployment.
+To look at the snapshots of a reporter run with `--out-dir` on your machine:
+
+```bash
+go run ./cmd/ate-env-fleet-site -dir /tmp/snap -insecure-no-iap -listen 127.0.0.1:8080
+```
+
 ## CLI
 
 File operations and remote command execution take the environment ID first, followed by the operation:

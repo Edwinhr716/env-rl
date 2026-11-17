@@ -168,3 +168,50 @@ Append-only. Each entry: date, who, what, why.
   collector (`TestManifestCollectorConfigValidates`) is manual: CI has no `otelcol-contrib` binary.
   Drift check after the rebase onto `9fed77fc`: #392 adds `ListEnvironments`, which does not change
   the reporter (research.md).
+- 2026-11-16, orchestrator, pull request 4: the site is `cmd/ate-env-fleet-site` over
+  `internal/fleetsite`. It verifies the IAP assertion with `google.golang.org/api/idtoken` and
+  queries BigQuery with `google.golang.org/api/bigquery/v2`; both are in `google.golang.org/api`,
+  already in the module graph, so no module is added. It pins `ES256` before `idtoken` sees the
+  token, because `idtoken` also accepts `RS256` ID tokens that any Google service account can mint
+  for any audience, and checks the issuer, which `idtoken` does not.
+- 2026-11-16, orchestrator, pull request 4: `GET /api/v1/clusters/{project}/{cluster}` returns the
+  snapshot inside an envelope with `generation`, `age_s` and `stale`, not the bare snapshot. FS-9
+  asks the API for `"stale": true`, and a field added to the snapshot itself would fail
+  `DecodeSnapshot`, which refuses unknown fields.
+- 2026-11-16, orchestrator, pull request 4: `FLEET_EVENTS_TABLE` names the view `actor_events_v`,
+  which the site queries, and `FLEET_IAP_AUDIENCE` is a new variable for the assertion's audience.
+  `-dir` reads a reporter's `-out-dir` output and `-insecure-no-iap` serves it without IAP on a
+  loopback address only, so the pages can be checked without a deployment.
+- 2026-11-16, orchestrator, pull request 4: the pages have no script, so the policy is
+  `default-src 'none'` with the stylesheet from the site; the Live page of pull request 5 decides
+  whether it needs a script and its nonce. The site serves `GET` and `HEAD` only and limits each
+  user to 10 requests a second per instance, because each events request is a BigQuery job.
+- 2026-11-16, orchestrator, from the review of pull request 4: `fleet.actor_events` is partitioned
+  by `publish_time` (day). The view takes every other column from the JSON `data` column, so only
+  `publish_time` can prune; without the partition each events request would bill the whole table and
+  fail once the table passed the 10 GiB cap. FS-2 records the bytes one query processed.
+- 2026-11-16, orchestrator, same review: the site's Cloud Run service gets `--memory 2Gi` and
+  `--concurrency 20`. A 100,000-actor snapshot measured about 600 MB resident once decoded and 1.5
+  GB at peak with four concurrent downloads; the API writes compact JSON. A refresh runs on its own
+  context with a 20 s timeout, requests get the last listing while it runs, and a snapshot whose
+  read failed is read again, so one storage error or a closed tab does not stick to a generation. A
+  `generated_at` more than a minute ahead of the site's clock counts as stale.
+- 2026-11-16, orchestrator, from the second review of pull request 4: a request gets the last
+  listing during a refresh only while it is younger than two cache periods, so the first view after
+  an idle night waits for a fresh one instead of showing every cluster stale; `?nocache=1` waits for
+  a refresh that started after it. The deployment sets `GOMEMLIMIT=1600MiB` under `--memory 2Gi`: 20
+  concurrent downloads of a 100,000-actor snapshot reached 2.1 GB without it and 1.6 GB with 1500
+  MiB.
+- 2026-11-16, orchestrator, from the third review of pull request 4: staleness is judged at the
+  listing that read the snapshot, not at the request, because a listing serves up to 30 s and the
+  reporter's default limit is 15 s: a healthy cluster showed stale in 18 of 25 samples. A snapshot
+  is also stale when it is older than the limit plus 60 s now, which covers a listing that went old
+  in a bucket outage; such an outage serves the last listing to requests without `?nocache=1`. FS-9
+  clears within one interval plus the cache period.
+- 2026-11-16, orchestrator, from the review of #416: the site decodes a snapshot without refusing
+  unknown fields and then runs `Snapshot.Validate`, so a field added to `v1` later does not turn a
+  cluster with a newer reporter into an error before the site is redeployed; the reporter and the
+  tests keep the strict `inventory.DecodeSnapshot`. Staleness and `age_s` use the object's update
+  time from the bucket, not the reporter's clock, when the store has one. The events route has its
+  own limit, 1 request a second per user, burst 5, because each request is a BigQuery job; the
+  reader follows the result's page tokens up to 1000 rows.

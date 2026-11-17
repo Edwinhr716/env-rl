@@ -53,7 +53,10 @@ it creates an export subscription, so the agent and its grants come before the s
 ```bash
 gcloud pubsub topics create ate-actor-events --project "$CENTRAL_PROJECT"
 bq --project_id "$CENTRAL_PROJECT" mk --dataset --location "$REGION" fleet
-bq --project_id "$CENTRAL_PROJECT" mk --table fleet.actor_events \
+# Partitioned by publish_time, so the site's events query, bounded by publish_time, scans only
+# the days it asks for, not the whole table.
+bq --project_id "$CENTRAL_PROJECT" mk --table --time_partitioning_field publish_time \
+  --time_partitioning_type DAY fleet.actor_events \
   subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,data:JSON,attributes:JSON
 gcloud services identity create --service pubsub.googleapis.com --project "$CENTRAL_PROJECT"
 NUMBER=$(gcloud projects describe "$CENTRAL_PROJECT" --format 'value(projectNumber)')
@@ -204,11 +207,14 @@ balancer:
 ```bash
 KO_DOCKER_REPO="$REGION-docker.pkg.dev/$CENTRAL_PROJECT/ate-env" ko build -B ./cmd/ate-env-fleet-site
 gcloud services identity create --service iap.googleapis.com --project "$CENTRAL_PROJECT"
+NUMBER=$(gcloud projects describe "$CENTRAL_PROJECT" --format 'value(projectNumber)')
+# The site refuses a request whose IAP assertion is not for this audience.
+AUDIENCE="/projects/$NUMBER/locations/$REGION/services/ate-fleet-site"
 gcloud run deploy ate-fleet-site --project "$CENTRAL_PROJECT" --region "$REGION" \
   --image "$REGION-docker.pkg.dev/$CENTRAL_PROJECT/ate-env/ate-env-fleet-site:latest" \
   --service-account "ate-fleet-site@$P" --no-allow-unauthenticated --iap --min-instances 1 \
-  --set-env-vars "^;^FLEET_BUCKET=$BUCKET;FLEET_EVENTS_TABLE=$CENTRAL_PROJECT.fleet.actor_events;FLEET_METRICS_PROJECT=$CENTRAL_PROJECT;FLEET_BENCH_BUCKETS=${BENCH_BUCKET:-}"
-NUMBER=$(gcloud projects describe "$CENTRAL_PROJECT" --format 'value(projectNumber)')
+  --memory 2Gi --concurrency 20 \
+  --set-env-vars "^;^FLEET_BUCKET=$BUCKET;FLEET_EVENTS_TABLE=$CENTRAL_PROJECT.fleet.actor_events_v;FLEET_IAP_AUDIENCE=$AUDIENCE;GOMEMLIMIT=1600MiB;FLEET_METRICS_PROJECT=$CENTRAL_PROJECT;FLEET_BENCH_BUCKETS=${BENCH_BUCKET:-}"
 gcloud run services add-iam-policy-binding ate-fleet-site --project "$CENTRAL_PROJECT" --region "$REGION" \
   --member "serviceAccount:service-$NUMBER@gcp-sa-iap.iam.gserviceaccount.com" --role roles/run.invoker
 gcloud iap web add-iam-policy-binding --project "$CENTRAL_PROJECT" --region "$REGION" \
@@ -222,8 +228,16 @@ the site account `roles/storage.objectViewer` on each bucket of that list; pull 
 both ends with a two-bucket `BENCH_BUCKET`.
 
 IAP on Cloud Run authenticates users of the organization with a Google-managed OAuth client; a
-project without an organization needs the console once. The environment variable names are the
-proposal for PR 4 and may change with it.
+project without an organization needs the console once. `FLEET_EVENTS_TABLE` names the typed view of
+section 1, not the raw table. The site reads `FLEET_METRICS_PROJECT` and `FLEET_BENCH_BUCKETS` from
+PR 5 on; PR 4 ignores them. `--memory 2Gi` holds the decoded snapshots of the cluster list and a
+refresh: one snapshot of 100,000 actors is about 40 MB as JSON and takes some 600 MB once decoded.
+Memory grows with the sum of the clusters' decoded snapshots, plus a second copy of the changed ones
+during a refresh. `GOMEMLIMIT=1600MiB` makes the Go runtime collect before the instance reaches its
+limit when many large downloads run at once; raise both together for a larger fleet.
+
+For a look before the deployment, run the site on a workstation over a reporter's `-out-dir` output:
+`go run ./cmd/ate-env-fleet-site -dir /tmp/snap -insecure-no-iap -listen 127.0.0.1:8080`.
 
 ## 4. Verify
 

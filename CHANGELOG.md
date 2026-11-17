@@ -176,6 +176,18 @@ user needs to know across them.
   and `cluster` to be one path segment each (no `/` or `\`, not `.` or `..`);
   the reporter refuses such a `-project` or `-cluster` at start, and `-out-dir`
   writes stay under the directory.
+- `ate-env-fleet-site` (`cmd/ate-env-fleet-site`): the read-only fleet site
+  for Cloud Run behind Identity-Aware Proxy. It serves the Fleet page (every
+  cluster's `ate-env-api` deployments, WorkerPools, actors by state and
+  snapshot age, stale after three reporter intervals), the Cluster page
+  (deployments, WorkerPools with capacity and allocation, workers, actors
+  filtered by atespace, template, state and node, templates, atespaces, tags)
+  and a JSON API: `/api/v1/clusters`, `/api/v1/clusters/{project}/{cluster}`
+  (`?nocache=1` revalidates at once) and `/api/v1/actors/{uid}/events` from the
+  BigQuery view `FLEET_EVENTS_TABLE`. It verifies the IAP assertion against
+  `FLEET_IAP_AUDIENCE` on every request, serves `GET` and `HEAD` only, and
+  reads the snapshots from `FLEET_BUCKET`, or `-dir` for a local run with
+  `-insecure-no-iap` on a loopback address. No image is published yet.
 - `ate-env manifest collector` prints the fleet telemetry collector, one per
   cluster in namespace `ate-env-collector`: OTLP traces in on 4317 and 4318,
   out to Cloud Trace in `--project` through `telemetry.googleapis.com` and as

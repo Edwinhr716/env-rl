@@ -10,6 +10,7 @@ cmd/
   ate-env-api/           # API server daemon: gRPC services, MCP handler, port proxy
   ate-env-guest/         # Guest daemon: Linux PID 1 subreaper init, sidecar supervision
   ate-env-reporter/      # Fleet inventory reporter daemon: one snapshot per interval to a bucket or a directory
+  ate-env-fleet-site/    # Fleet site server: read-only pages and JSON API over the snapshots, behind IAP on Cloud Run
   benchmarking/
     bench/               # Composable RL benchmark CLI (scenario lifecycle subcommands)
     swebench-loader/     # Benchmark driver: SWE-bench trajectories, placement, preflight, event recording, reports
@@ -17,6 +18,7 @@ internal/
   apiservice/            # gRPC server implementation: auth, image template derivation, wake retries
   ate/                   # Substrate client adapter: dials ateapi control plane and atenet router
   benchmarking/          # Benchmark packages: job, measure, overlay, schema, sut, swebench, trace
+  fleetsite/             # Fleet site: IAP assertion check, snapshot cache, BigQuery actor events, pages, JSON API
   hostcheck/             # HTTP middleware: DNS-rebinding defense on Host headers
   internaltest/          # Test doubles and bridges: fakecontrol, fakerouter, synctestrapid, testcerts
   inventory/             # Fleet inventory snapshot: v1 JSON Schema, strict decoder, Substrate state vocabulary

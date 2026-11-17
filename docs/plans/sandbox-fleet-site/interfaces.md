@@ -281,34 +281,67 @@ PodMonitoring, `ate-env manifest --metrics-port <port> --pod-monitoring`:
 
 ## Site, `cmd/ate-env-fleet-site`
 
-Go, standard library HTTP, server-rendered HTML with inline SVG and small inline scripts, no
-external assets, the same zero-dependency style as the explorer plan and `build_report.py`.
+Go, standard library HTTP, server-rendered HTML (`html/template`) with inline SVG, one stylesheet
+served by the site, no script and no external assets, the same zero-dependency style as the explorer
+plan and `build_report.py`. The code is `internal/fleetsite`; pull request 4 ships the Fleet and
+Cluster pages and the first three API routes.
 
-Runs page sources: `v1/runs/` in the inventory bucket for trainer run reports, and the benchmark
-buckets in `FLEET_BENCH_BUCKETS` (comma-separated), where a run is a folder whose name passes
-`bench`'s `ValidateGCSFolderName` and whose `run_window.json`, `report.json` and
+Configuration, each flag with an environment variable for Cloud Run:
+
+| Flag               | Environment          | Meaning                                                                                        |
+| ------------------ | -------------------- | ---------------------------------------------------------------------------------------------- |
+| `-bucket`          | `FLEET_BUCKET`       | the inventory bucket; exactly one of `-bucket` and `-dir`                                      |
+| `-dir`             |                      | the bucket layout under a local directory, as `ate-env-reporter -out-dir` writes it            |
+| `-events-table`    | `FLEET_EVENTS_TABLE` | the view `<project>.fleet.actor_events_v`; required with IAP; the query runs in `<project>`    |
+| `-iap-audience`    | `FLEET_IAP_AUDIENCE` | `/projects/<number>/locations/<region>/services/<service>`; required unless `-insecure-no-iap` |
+| `-insecure-no-iap` |                      | serve without an IAP assertion, for a local run; `-listen` must then be a loopback address     |
+| `-listen`          | `PORT`               | `:$PORT`, else `:8080`                                                                         |
+
+Runs page sources (pull request 5): `v1/runs/` in the inventory bucket for trainer run reports, and
+the benchmark buckets in `FLEET_BENCH_BUCKETS` (comma-separated), where a run is a folder whose name
+passes `bench`'s `ValidateGCSFolderName` and whose `run_window.json`, `report.json` and
 `system_description.json` the page reads.
 
-| Route                                                    | Returns                                                                                    |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `GET /`                                                  | Fleet page                                                                                 |
-| `GET /clusters/{project}/{cluster}`                      | Cluster page                                                                               |
-| `GET /actors/{uid}`                                      | Actor page                                                                                 |
-| `GET /runs`, `GET /runs/{id}`                            | the run index; one run, where `{id}` is a trainer `run_id` or a bundle folder name (FS-11) |
-| `GET /live`                                              | last 200 transitions                                                                       |
-| `GET /api/v1/clusters`                                   | the index built from `latest.json` objects                                                 |
-| `GET /api/v1/clusters/{project}/{cluster}`               | that snapshot                                                                              |
-| `GET /api/v1/actors/{uid}/events?since=`                 | rows from `actor_events`                                                                   |
-| `GET /api/v1/metrics/{name}?cluster=&namespace=&window=` | a named PromQL query from an allow-list, never free-form                                   |
-| `GET /healthz`                                           | 200                                                                                        |
+| Route                                                    | Returns                                                                                                                                                             | Pull request |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| `GET /`                                                  | Fleet page                                                                                                                                                          | 4            |
+| `GET /clusters/{project}/{cluster}`                      | Cluster page; `?atespace=&template=&state=&node=` filter the actors, the first 1000 shown                                                                           | 4            |
+| `GET /actors/{uid}`                                      | Actor page                                                                                                                                                          | 5            |
+| `GET /runs`, `GET /runs/{id}`                            | the run index; one run, where `{id}` is a trainer `run_id` or a bundle folder name (FS-11)                                                                          | 5            |
+| `GET /live`                                              | last 200 transitions                                                                                                                                                | 5            |
+| `GET /api/v1/clusters`                                   | `{"clusters": [...]}`, one row per `latest.json`: project, cluster, location, `generated_at`, `age_s`, `stale`, reporter, counts, deployments, WorkerPools, `error` | 4            |
+| `GET /api/v1/clusters/{project}/{cluster}`               | `{"project", "cluster", "generation", "age_s", "stale", "error", "snapshot"}`, where `snapshot` is the object as the reporter wrote it                              | 4            |
+| `GET /api/v1/actors/{uid}/events?since=`                 | `{"uid", "since", "events", "truncated"}`: rows of `actor_events_v`, oldest first, the newest 1000; `since` RFC 3339, default 24 h ago, at most 30 days ago         | 4            |
+| `GET /api/v1/metrics/{name}?cluster=&namespace=&window=` | a named PromQL query from an allow-list, never free-form                                                                                                            | 5            |
+| `GET /healthz`                                           | 200, without IAP                                                                                                                                                    | 4            |
 
-Auth: IAP in front; the service verifies `x-goog-iap-jwt-assertion` against the IAP audience on
-every request and reads the user email from it. Service account roles: `roles/storage.objectViewer`
-on the bucket, `roles/bigquery.dataViewer` and `roles/bigquery.jobUser` on the events dataset,
-`roles/monitoring.viewer` on the metrics scope. No other role.
+`?nocache=1` on the cluster routes lists the bucket at once (FS-1). A cluster is stale when its
+write time was older than three of its reporter's `interval_s` at the listing that read it, is older
+than that plus 60 s now (the listing itself is old), is more than a minute ahead of the site's
+clock, or when its object cannot be read or decoded; such a row carries `error` and no snapshot
+(FS-9). The write time is the object's update time from the bucket, so a reporter whose clock is off
+neither looks stale nor hides; a local `-dir` has none and uses `generated_at`. `age_s` is the age
+by the same time. The site ignores a field it does not know and checks the rest as the schema and
+`Snapshot.Validate` do, so a later `v1` field can reach the reporters before the site is deployed
+again; the reporter's side keeps the strict `inventory.DecodeSnapshot`. A snapshot whose `project`
+or `cluster` differs from its object path is such an error.
 
-Caching: snapshots cached in memory per instance for 30 s and revalidated by object generation;
-PromQL results cached 10 s; event queries bounded to 24 h by default.
+Auth: IAP in front; the service verifies `x-goog-iap-jwt-assertion` on every request but `/healthz`:
+`ES256`, IAP's keys, the audience, issuer `https://cloud.google.com/iap`, `exp`, `iat`, and an
+`email`, which the pages show. Any failure answers 403. Methods other than `GET` and `HEAD` answer
+405; each user gets 10 requests a second per instance, burst 40, and on the events route 1 a second,
+burst 5. Service account roles: `roles/storage.objectViewer` on the bucket,
+`roles/bigquery.dataViewer` on the events dataset, `roles/bigquery.jobUser` in the central project
+(it runs the query jobs), `roles/monitoring.viewer` on the metrics scope (pull request 5). No other
+role.
+
+Caching: snapshots cached in memory per instance for 30 s and revalidated by object generation; a
+refresh runs apart from the request that started it, other requests get the last listing meanwhile
+if it is younger than 60 s and wait for the refresh otherwise, `?nocache=1` waits for a refresh that
+started after it, and a snapshot whose read failed is read again on the next refresh. PromQL results
+cached 10 s. Event queries: `publish_time >= @since`, 24 h by default; `fleet.actor_events` is
+partitioned by `publish_time`, so the query scans only those days; each job may bill 10 GiB at most
+and returns the newest 1000 rows, oldest first.
 
 ## Named PromQL queries
 

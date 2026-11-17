@@ -1,10 +1,10 @@
 # Execution plan: sandbox fleet site
 
-Status: accepted (#223); pull requests 1, 2 and 2b merged (#226, #348, #349); pull request 3 is the
-telemetry manifests. Last checked 2026-11-16 against `9fed77fc`. Design: [README.md](./README.md).
-Contracts: [interfaces.md](./interfaces.md). Done when every criterion in
-[acceptance-criteria.md](./acceptance-criteria.md) passes on two clusters in two projects and the
-pull requests below are merged.
+Status: accepted (#223); pull requests 1, 2 and 2b merged (#226, #348, #349); pull requests 3 and 4
+are the telemetry manifests and the site's first pages. Last checked 2026-11-16 against `9fed77fc`.
+Design: [README.md](./README.md). Contracts: [interfaces.md](./interfaces.md). Done when every
+criterion in [acceptance-criteria.md](./acceptance-criteria.md) passes on two clusters in two
+projects and the pull requests below are merged.
 
 ## Where the code lives
 

@@ -127,6 +127,9 @@ child processes, and serves `ProcessService` and `FileSystemService`.
   `read`/`write`, and `ate-env manifest`.
 - **`cmd/ate-env-reporter`**: Daemon (`internal/reporter`) writing cluster fleet inventory snapshots
   (`internal/inventory`) on an interval to a bucket or directory.
+- **`cmd/ate-env-fleet-site`**: Read-only web server (`internal/fleetsite`) for Cloud Run behind
+  Identity-Aware Proxy: the Fleet and Cluster pages and a JSON API over every cluster's snapshot,
+  and actor events from BigQuery. It holds no cluster credential.
 - **`clients/go`**: Public Go SDK client (`Client`, `ClientOptions` with `Connections`,
   `DialOptions`, and `MetricsRegisterer`, `Env`, `Process`, `StartError`).
 - **`clients/python`**: `ate-env-rl` (`ate_env_rl`): async `Client` (with `credentials` TLS) and
