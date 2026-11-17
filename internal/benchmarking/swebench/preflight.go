@@ -72,6 +72,9 @@ type PreflightOptions struct {
 	// the baking goldens are polled; default 10 s.
 	GoldenTimeout time.Duration
 	GoldenPoll    time.Duration
+	// Golden is what the pass does about a golden that is not ready, one
+	// of the GoldenPolicy constants; empty is GoldenPolicyWait.
+	Golden string
 	// ProbeTimeout bounds one probe on the server: create, resume and node
 	// read; default 10 min. The delete has the server's own bound, 60 s.
 	ProbeTimeout time.Duration
@@ -86,6 +89,36 @@ type PreflightOptions struct {
 	wakeBackoff time.Duration
 }
 
+// The defaults of a pass. The preflight and run commands show them as the
+// defaults of their flags.
+const (
+	DefaultPreflightProbesPerNode = 2
+	DefaultPreflightMaxRounds     = 3
+	DefaultPreflightProbeTimeout  = 10 * time.Minute
+	DefaultPreflightGoldenTimeout = 30 * time.Minute
+)
+
+// The golden policies of a pass, the ones FleetConfig.preflight_golden has
+// in the Python client.
+const (
+	// GoldenPolicyWait waits for each golden (up to GoldenTimeout without
+	// progress) and then probes the image whether or not its golden is
+	// ready: a boot fills the layer caches too.
+	GoldenPolicyWait = "wait"
+	// GoldenPolicySkip does not wait for a golden that is still baking once
+	// its template is ensured: the image is probed at once and its golden is
+	// recorded as pending, so the coverage is not complete.
+	GoldenPolicySkip = "skip"
+	// GoldenPolicyFail waits as GoldenPolicyWait does and makes no WarmImage
+	// call for an image whose golden is not ready after the wait: its pairs
+	// are short, and Run's error wraps ErrGoldenNotReady.
+	GoldenPolicyFail = "fail"
+)
+
+// ErrGoldenNotReady is in the error of a pass with GoldenPolicyFail that
+// left an image unprobed because its golden was not ready.
+var ErrGoldenNotReady = errors.New("golden policy fail: a golden is not ready")
+
 // PreflightWarmer fills the node caches an image placement plan describes.
 // It ensures each image's derived template, which starts the golden bake,
 // then per domain warms images as their goldens become ready: one
@@ -95,6 +128,30 @@ type PreflightOptions struct {
 // the node each probe landed on, and deletes them.
 type PreflightWarmer struct {
 	opts PreflightOptions
+}
+
+// ValidatePreflightKnobs checks the knobs of a pass that need only their
+// values: the probes per node and the rounds against what ate-env-api's
+// WarmImage takes, and the golden policy against the three policies. A zero
+// count and an empty policy are the defaults and pass. NewPreflightWarmer
+// calls it, and so does a command that must refuse a knob before it writes
+// a file (swebench-loader run), so the limits are in one place.
+//
+// What WarmImage refuses is refused here: a refused call only shows as a
+// short pair, after the goldens were waited for.
+func ValidatePreflightKnobs(probesPerNode, maxRounds int, golden string) error {
+	switch golden {
+	case "", GoldenPolicyWait, GoldenPolicySkip, GoldenPolicyFail:
+	default:
+		return fmt.Errorf("preflight: golden policy %q is not one of %s, %s, %s", golden, GoldenPolicyWait, GoldenPolicySkip, GoldenPolicyFail)
+	}
+	if probesPerNode > apiservice.MaxWarmProbesPerNode {
+		return fmt.Errorf("preflight: %d probes per node exceed the %d ate-env-api takes", probesPerNode, apiservice.MaxWarmProbesPerNode)
+	}
+	if maxRounds > apiservice.MaxWarmRounds {
+		return fmt.Errorf("preflight: %d rounds exceed the %d ate-env-api takes", maxRounds, apiservice.MaxWarmRounds)
+	}
+	return nil
 }
 
 // NewPreflightWarmer validates opts and applies the defaults.
@@ -120,33 +177,31 @@ func NewPreflightWarmer(opts PreflightOptions) (*PreflightWarmer, error) {
 		opts.Logger = slog.Default()
 	}
 	if opts.ProbesPerNode <= 0 {
-		opts.ProbesPerNode = 2
+		opts.ProbesPerNode = DefaultPreflightProbesPerNode
 	}
 	if opts.ImageConcurrency <= 0 {
 		opts.ImageConcurrency = 4
 	}
 	if opts.MaxRounds <= 0 {
-		opts.MaxRounds = 3
+		opts.MaxRounds = DefaultPreflightMaxRounds
 	}
 	if opts.GoldenTimeout <= 0 {
-		opts.GoldenTimeout = 30 * time.Minute
+		opts.GoldenTimeout = DefaultPreflightGoldenTimeout
 	}
 	if opts.GoldenPoll <= 0 {
 		opts.GoldenPoll = 10 * time.Second
 	}
 	if opts.ProbeTimeout <= 0 {
-		opts.ProbeTimeout = 10 * time.Minute
+		opts.ProbeTimeout = DefaultPreflightProbeTimeout
+	}
+	if opts.Golden == "" {
+		opts.Golden = GoldenPolicyWait
 	}
 	if opts.EnsureWidth <= 0 {
 		opts.EnsureWidth = 8
 	}
-	// What ate-env-api's WarmImage refuses is refused here: a refused call
-	// only shows as a short pair, after the goldens were waited for.
-	if opts.ProbesPerNode > apiservice.MaxWarmProbesPerNode {
-		return nil, fmt.Errorf("preflight: %d probes per node exceed the %d ate-env-api takes", opts.ProbesPerNode, apiservice.MaxWarmProbesPerNode)
-	}
-	if opts.MaxRounds > apiservice.MaxWarmRounds {
-		return nil, fmt.Errorf("preflight: %d rounds exceed the %d ate-env-api takes", opts.MaxRounds, apiservice.MaxWarmRounds)
+	if err := ValidatePreflightKnobs(opts.ProbesPerNode, opts.MaxRounds, opts.Golden); err != nil {
+		return nil, err
 	}
 	if opts.now == nil {
 		opts.now = time.Now
@@ -204,7 +259,8 @@ func (w *PreflightWarmer) highestIndexes() (domain, image int) {
 
 // Run executes the pre-flight and returns the coverage report. The error is
 // non-nil when the pass is incomplete (a golden not ready, a pair short of
-// its nodes), when the context ended, or when the pass is complete but left
+// its nodes; it wraps ErrGoldenNotReady when GoldenPolicyFail left an image
+// unprobed), when the context ended, or when the pass is complete but left
 // probes it could not delete (the report's undeleted_probes; Complete stays
 // true then, and the error names them). The report is returned either way,
 // so the caller can write it.
@@ -223,6 +279,15 @@ func (w *PreflightWarmer) Run(ctx context.Context) (*schema.PreflightCoverage, e
 
 	goldens := newGoldenTracker(images, started)
 	w.ensureTemplates(ctx, images, goldens)
+	if o.Golden == GoldenPolicySkip && ctx.Err() == nil {
+		// No wait: what the ensure left baking is settled as pending here,
+		// so its probes start at once and the poller has nothing to do.
+		// After a cancel the ensure left images it never started; the
+		// poller records those with the context's error, as with wait.
+		for _, img := range goldens.pending() {
+			w.settleGolden(goldens, img, schema.GoldenRecord{Image: img, Template: goldens.template(img), State: "pending", Error: "golden not waited for"}, false)
+		}
+	}
 	polled := make(chan struct{})
 	go func() {
 		defer close(polled)
@@ -243,7 +308,11 @@ func (w *PreflightWarmer) Run(ctx context.Context) (*schema.PreflightCoverage, e
 		return report, ctx.Err()
 	}
 	if !report.Complete {
-		return report, fmt.Errorf("pre-flight incomplete: %s", w.shortfall(report))
+		err := fmt.Errorf("pre-flight incomplete: %s", w.shortfall(report))
+		if o.Golden == GoldenPolicyFail && !goldens.allOK() {
+			err = fmt.Errorf("%w: %w", ErrGoldenNotReady, err)
+		}
+		return report, err
 	}
 	if len(undeleted) > 0 {
 		// The coverage holds; the leftovers hold slots until swept, so the
@@ -382,6 +451,14 @@ func (t *goldenTracker) template(img string) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.waits[img].template
+}
+
+// ok reports whether the image's golden settled ready, or as none on a base
+// template with goldens disabled.
+func (t *goldenTracker) ok(img string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.waits[img].ok
 }
 
 func (t *goldenTracker) pending() []string {
@@ -589,7 +666,11 @@ func (w *PreflightWarmer) cover(ctx context.Context, domains []schema.PlacementD
 			go func(k int, it item) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				covs[k] = w.coverImage(ctx, planDI, it.index, d, it.image)
+				if w.opts.Golden == GoldenPolicyFail && !t.ok(it.image) {
+					covs[k] = schema.ImageCoverage{Image: it.image, Nodes: []string{}, Wanted: d.Nodes, Error: "golden not ready"}
+				} else {
+					covs[k] = w.coverImage(ctx, planDI, it.index, d, it.image)
+				}
 				ran[k] = true
 			}(pick, items[pick])
 		}

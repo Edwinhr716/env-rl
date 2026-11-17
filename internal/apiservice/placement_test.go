@@ -17,6 +17,7 @@ package apiservice_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"regexp"
@@ -340,16 +341,15 @@ func TestWarmImageValidation(t *testing.T) {
 	client, control := newTestEnv(t)
 	seedDomains(t, control)
 	for name, req := range map[string]*ateenvv1alpha.WarmImageRequest{
-		"no image":           {},
-		"unpinned image":     {RootfsImage: "docker.io/library/python:3.11"},
-		"negative nodes":     {RootfsImage: testRootfsImage, Nodes: -1},
-		"too many probes":    {RootfsImage: testRootfsImage, ProbesPerNode: apiservice.MaxWarmProbesPerNode + 1},
-		"too many rounds":    {RootfsImage: testRootfsImage, MaxRounds: apiservice.MaxWarmRounds + 1},
-		"bad run id":         {RootfsImage: testRootfsImage, RunId: "Not Valid"},
-		"long run id":        {RootfsImage: testRootfsImage, RunId: strings.Repeat("a", 21)},
-		"round over the cap": {RootfsImage: testRootfsImage, Nodes: apiservice.MaxWarmProbes, ProbesPerNode: 2},
-		"negative timeout":   {RootfsImage: testRootfsImage, ProbeTimeout: durationpb.New(-time.Second)},
-		"zero timeout":       {RootfsImage: testRootfsImage, ProbeTimeout: durationpb.New(0)},
+		"no image":         {},
+		"unpinned image":   {RootfsImage: "docker.io/library/python:3.11"},
+		"negative nodes":   {RootfsImage: testRootfsImage, Nodes: -1},
+		"too many probes":  {RootfsImage: testRootfsImage, ProbesPerNode: apiservice.MaxWarmProbesPerNode + 1},
+		"too many rounds":  {RootfsImage: testRootfsImage, MaxRounds: apiservice.MaxWarmRounds + 1},
+		"bad run id":       {RootfsImage: testRootfsImage, RunId: "Not Valid"},
+		"long run id":      {RootfsImage: testRootfsImage, RunId: strings.Repeat("a", 21)},
+		"negative timeout": {RootfsImage: testRootfsImage, ProbeTimeout: durationpb.New(-time.Second)},
+		"zero timeout":     {RootfsImage: testRootfsImage, ProbeTimeout: durationpb.New(0)},
 	} {
 		_, _, err := warm(t, client, req)
 		if status.Code(err) != codes.InvalidArgument {
@@ -372,6 +372,46 @@ func TestWarmImageValidation(t *testing.T) {
 	again, _, err := warm(t, client, &ateenvv1alpha.WarmImageRequest{RootfsImage: testRootfsImage, WorkerSelector: map[string]string{"ate-env/domain": "d0"}, MaxRounds: 1})
 	if err != nil || !runID.MatchString(again[0].GetId()) || again[0].GetId() == probes[0].GetId() {
 		t.Errorf("second call: err=%v first probe=%v, want a run id of its own (first call's %v)", err, again[0], probes[0])
+	}
+}
+
+// PW-6: one round starts at most MaxWarmProbes probes. A request that asks
+// for more is refused before a probe exists: with the nodes counted from the
+// workers, with the nodes named in the request, and with the request's nodes
+// trusted because the server cannot list the workers.
+func TestWarmImageRefusesARoundOverTheProbeLimit(t *testing.T) {
+	client, control := newTestEnv(t)
+	seedDomains(t, control)
+	// A domain of one node more than half the limit: 2 probes per node on
+	// each of its nodes are 2 probes over the limit.
+	nodes := apiservice.MaxWarmProbes/2 + 1
+	wide := map[string]string{"workload": "default-env", "ate-env/domain": "wide"}
+	for i := 0; i < nodes; i++ {
+		control.AddWorker(fakecontrol.Worker("ate-system", "pool-wide", fmt.Sprintf("node-wide-%d", i), wide, 4))
+	}
+	selector := map[string]string{"ate-env/domain": "wide"}
+	want := fmt.Sprintf("%d nodes x 2 probes per node exceed the %d probes a round may start", nodes, apiservice.MaxWarmProbes)
+	refused := func(name string, req *ateenvv1alpha.WarmImageRequest) {
+		t.Helper()
+		_, _, err := warm(t, client, req)
+		if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want InvalidArgument with %q", name, err, want)
+		}
+		if n := control.ActorCount(); n != 0 {
+			t.Errorf("%s: %d probes created by a refused request, want 0", name, n)
+		}
+	}
+	refused("nodes from the workers", &ateenvv1alpha.WarmImageRequest{RootfsImage: testRootfsImage, WorkerSelector: selector, ProbesPerNode: 2})
+	refused("nodes in the request", &ateenvv1alpha.WarmImageRequest{RootfsImage: testRootfsImage, WorkerSelector: selector, Nodes: int32(nodes), ProbesPerNode: 2})
+	control.DenyListWorkers = true
+	refused("nodes trusted", &ateenvv1alpha.WarmImageRequest{RootfsImage: testRootfsImage, WorkerSelector: selector, Nodes: int32(nodes), ProbesPerNode: 2})
+	control.DenyListWorkers = false
+
+	// A round of exactly the limit passes the check: one node fewer, and
+	// the call runs its round.
+	_, cov, err := warm(t, client, &ateenvv1alpha.WarmImageRequest{RootfsImage: testRootfsImage, WorkerSelector: selector, Nodes: int32(nodes - 1), ProbesPerNode: 2, MaxRounds: 1})
+	if err != nil || int(cov.GetWanted()) != nodes-1 || int(cov.GetProbes()) != apiservice.MaxWarmProbes {
+		t.Errorf("a round of the limit: err=%v coverage=%v, want %d probes for %d nodes", err, cov, apiservice.MaxWarmProbes, nodes-1)
 	}
 }
 

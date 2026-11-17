@@ -44,6 +44,27 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `swebench-loader run -preflight` takes the pre-flight's knobs:
+  `-preflight-probes-per-node`, `-preflight-max-rounds`,
+  `-preflight-probe-timeout`, `-preflight-golden-timeout` and
+  `-preflight-golden`. Without them the pass runs with the defaults of the
+  `preflight` subcommand, as before. A `-preflight-*` flag without
+  `-preflight`, `-preflight` without `-placement`, or a value out of range
+  ends the command before it creates a file: the converted trace of
+  `-convert-trace` and the schedule of `-resolve-out` included.
+- `swebench-loader preflight -golden` and `run -preflight-golden` take a
+  golden policy, with the meanings of `FleetConfig.preflight_golden` in the
+  Python client: `wait` (the default, and the behavior until now) probes an
+  image after the golden wait whether or not its golden is ready; `skip`
+  does not wait, probes at once and records the goldens still baking as
+  `pending`; `fail` waits and does not probe an image whose golden is not
+  ready (its pairs are short with `golden not ready`), and `run` then ends
+  with an error before the first task, after it wrote the coverage file.
+- OpenHands integration: `ate_env_openhands.agent_sandbox_rl.FleetConfig`
+  takes `preflight=True`, an ate-env-only field. The fleet's `run()` then
+  puts the tasks' images on the nodes of the pools once, before its first
+  pass, as `ate_env_rl.FleetConfig.preflight` does. Until now this fleet's
+  own `run()` skipped the pre-flight for every strategy but `naive`.
 - Python client: `FleetConfig.warm_create_budget` caps the warm creates in
   flight across all images that `setup()` and `warm_images()` warm at once, on
   `SandboxFleet` and `AsyncSandboxFleet`; unset keeps each pool's own limit.

@@ -379,6 +379,18 @@ environment:
 code; they exist only here, not in agent-sandbox-rl. `auth_token` is a `SecretStr`: `repr`,
 `model_dump()`, `model_dump_json()` and validation errors do not show it. Prefer the variable for
 the token, so that it is not in the program; surrounding white space is removed from it.
+`FleetConfig(preflight=True)` also exists only here: `run()` then puts the tasks' images on the
+nodes of the pools once, before its first pass, as `ate_env_rl.FleetConfig.preflight` does (the
+token needs the global viewer role; the coverage is in `fleet.preflight_coverage` and in the
+report).
+
+The pass has the full size, and this model cannot narrow it: it maps no `node_selector` and no
+placement of an image (`placement` is ignored on ate-env, see the list below). Thus each task image
+goes on each node of each pool that the template addresses, with 2 probes for each node. For 500
+images on a pool of 100 nodes that is 100,000 probe boots, and each node must hold the 500 images in
+its cache. Only an image that is pinned by digest is warmed; the others are skipped with a log
+line. A run that needs a placement plan uses `ate_env_rl.FleetConfig` or
+`swebench-loader plan-placement`.
 
 | agent-sandbox-rl | on ate-env |
 |---|---|

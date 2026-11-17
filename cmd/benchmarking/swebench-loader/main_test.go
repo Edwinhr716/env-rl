@@ -796,6 +796,10 @@ type fakeWarmer struct {
 	// failDeletes is how many probe deletes fail (the first ones); those
 	// probes stay undeleted.
 	failDeletes int
+	// pending leaves every golden baking for the whole pass.
+	pending bool
+	// calls keeps the options of each WarmImage call.
+	calls []swebench.WarmOptions
 }
 
 // spanSink is an in-process OTLP trace collector: the spans the exporter
@@ -847,7 +851,11 @@ func (s *spanSink) all() []string {
 func (f *fakeWarmer) EnsureImageTemplate(ctx context.Context, _ string) (swebench.ImageState, error) {
 	f.mu.Lock()
 	f.pass = ctx
+	pending := f.pending
 	f.mu.Unlock()
+	if pending {
+		return swebench.ImageState{Template: "default-template-x", Exists: true, Golden: swebench.GoldenPending}, nil
+	}
 	return swebench.ImageState{Template: "default-template-x", Exists: true, Golden: swebench.GoldenReady, Tag: "golden-x"}, nil
 }
 
@@ -859,6 +867,9 @@ func (f *fakeWarmer) ImageStatus(ctx context.Context, image string) (swebench.Im
 // does, and reports the probes it "deleted".
 func (f *fakeWarmer) WarmImage(_ context.Context, _ string, opts swebench.WarmOptions, onProbe func(swebench.WarmProbe)) (swebench.WarmCoverage, error) {
 	domain := opts.WorkerSelector["ate-env/domain"]
+	f.mu.Lock()
+	f.calls = append(f.calls, opts)
+	f.mu.Unlock()
 	cov := swebench.WarmCoverage{Wanted: opts.Nodes, Rounds: 1}
 	seen := map[string]bool{}
 	for k := 0; k < opts.Nodes*opts.ProbesPerNode; k++ {
@@ -1478,6 +1489,304 @@ func TestRunCmdPreflightUndeletedProbesLog(t *testing.T) {
 	}
 }
 
+// preflightRunFixture writes a one-image manifest and its one-domain,
+// two-node plan, and installs a fake warmer as the run's backend.
+func preflightRunFixture(t *testing.T) (dir, manifest, plan string, warmer *fakeWarmer) {
+	t.Helper()
+	dir = t.TempDir()
+	imgA := "registry.example/swebench/a@sha256:" + strings.Repeat("a", 64)
+	manifest = filepath.Join(dir, "tasks.jsonl")
+	if err := os.WriteFile(manifest, []byte(`{"instance_id":"a","repo":"r","image":"`+imgA+`","patch":"diff","eval_script":"#!/bin/sh\nexit 0","log_parser":"parse_log_pytest"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plan = filepath.Join(dir, "image-placement.json")
+	if err := os.WriteFile(plan, []byte(`{"schema_version":"v1","unpack_factor":1,"replication":1,
+		"domains":[{"name":"d0","selector":{"ate-env/domain":"d0"},"nodes":2,"node_cache_bytes":0,"assigned_bytes":1,"image_count":1}],
+		"images":[{"image":"`+imgA+`","domains":["d0"],"bytes_compressed":1,"bytes_unpacked":1}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	warmer = &fakeWarmer{counter: map[string]int{}, nodes: map[string]string{}}
+	testBackendOverride = e2ePreflightBackend{fakeWarmer: warmer}
+	t.Cleanup(func() { testBackendOverride = nil })
+	return dir, manifest, plan, warmer
+}
+
+// PW-39: the -preflight-* flags of run reach the pass, and without them the
+// pass runs with the defaults of the preflight subcommand.
+func TestRunCmdPreflightKnobs(t *testing.T) {
+	dir, manifest, plan, warmer := preflightRunFixture(t)
+	base := []string{"-dataset", manifest, "-mode", "eval", "-width", "1", "-trajectory", "workload-file-read-one", "-placement", plan, "-preflight"}
+
+	if err := runCmd(append([]string{"-run-id", "pf-def", "-events-dir", filepath.Join(dir, "defaults")}, base...)); err != nil {
+		t.Fatalf("run -preflight: %v", err)
+	}
+	if len(warmer.calls) != 1 || warmer.calls[0].ProbesPerNode != 2 || warmer.calls[0].MaxRounds != 3 || warmer.calls[0].ProbeTimeout != 10*time.Minute {
+		t.Fatalf("default call = %+v, want 2 probes per node, 3 rounds, 10m", warmer.calls)
+	}
+
+	warmer.calls = nil
+	if err := runCmd(append([]string{"-run-id", "pf-knobs", "-events-dir", filepath.Join(dir, "knobs"),
+		"-preflight-probes-per-node", "1", "-preflight-max-rounds", "5", "-preflight-probe-timeout", "90s"}, base...)); err != nil {
+		t.Fatalf("run -preflight with knobs: %v", err)
+	}
+	if len(warmer.calls) != 1 || warmer.calls[0].ProbesPerNode != 1 || warmer.calls[0].MaxRounds != 5 || warmer.calls[0].ProbeTimeout != 90*time.Second {
+		t.Fatalf("call = %+v, want 1 probe per node, 5 rounds, 90s", warmer.calls)
+	}
+
+	// The golden timeout ends the wait: with a golden that never becomes
+	// ready, the pass gives up after 30ms, not after the default 30 minutes,
+	// probes the image (the wait policy) and the run goes on.
+	warmer.pending = true
+	warmer.calls = nil
+	events := filepath.Join(dir, "golden-timeout")
+	started := time.Now()
+	if err := runCmd(append([]string{"-run-id", "pf-gold", "-events-dir", events, "-preflight-golden-timeout", "30ms"}, base...)); err != nil {
+		t.Fatalf("run with a golden that stays pending: %v, want the run to go on", err)
+	}
+	if took := time.Since(started); took > time.Minute {
+		t.Fatalf("the run took %s: -preflight-golden-timeout did not end the wait", took)
+	}
+	cov, err := swebench.ReadPreflightCoverage(filepath.Join(events, "preflight-coverage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cov.Complete || len(cov.Goldens) != 1 || cov.Goldens[0].State != "pending" || !strings.Contains(cov.Goldens[0].Error, "still pending after 30ms") {
+		t.Errorf("coverage goldens = %+v, want one pending after the 30ms timeout", cov.Goldens)
+	}
+	if len(warmer.calls) != 1 {
+		t.Errorf("warm calls = %d, want the image probed after the wait", len(warmer.calls))
+	}
+
+	// -preflight-golden reaches the pass: with skip the same golden is not
+	// waited for, the image is probed at once and the run goes on.
+	warmer.calls = nil
+	events = filepath.Join(dir, "golden-skip")
+	if err := runCmd(append([]string{"-run-id", "pf-skip", "-events-dir", events, "-preflight-golden", "skip"}, base...)); err != nil {
+		t.Fatalf("run -preflight-golden skip: %v, want the run to go on", err)
+	}
+	cov, err = swebench.ReadPreflightCoverage(filepath.Join(events, "preflight-coverage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cov.Goldens) != 1 || cov.Goldens[0].Error != "golden not waited for" || len(warmer.calls) != 1 {
+		t.Errorf("coverage goldens = %+v, warm calls = %d; want the golden not waited for and one call", cov.Goldens, len(warmer.calls))
+	}
+}
+
+// PW-40: a -preflight-* flag without -preflight, and a value the warmer
+// refuses, end run before it creates a file, also with -dry-run.
+func TestRunCmdPreflightKnobsAreValidated(t *testing.T) {
+	dir, manifest, plan, warmer := preflightRunFixture(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"probes without -preflight", []string{"-preflight-probes-per-node", "1"}, "-preflight-probes-per-node needs -preflight"},
+		{"rounds without -preflight", []string{"-preflight-max-rounds", "2"}, "-preflight-max-rounds needs -preflight"},
+		{"probe timeout without -preflight", []string{"-preflight-probe-timeout", "1m"}, "-preflight-probe-timeout needs -preflight"},
+		{"golden timeout without -preflight", []string{"-preflight-golden-timeout", "1m"}, "-preflight-golden-timeout needs -preflight"},
+		{"policy without -preflight", []string{"-preflight-golden", "skip"}, "-preflight-golden needs -preflight"},
+		{"zero probes", []string{"-preflight", "-preflight-probes-per-node", "0"}, "must be at least 1"},
+		{"nine probes", []string{"-preflight", "-preflight-probes-per-node", "9"}, "9 probes per node exceed"},
+		{"zero rounds", []string{"-preflight", "-preflight-max-rounds", "0"}, "must be at least 1"},
+		{"eleven rounds", []string{"-preflight", "-preflight-max-rounds", "11"}, "11 rounds exceed"},
+		{"zero probe timeout", []string{"-preflight", "-preflight-probe-timeout", "0s"}, "must be positive"},
+		{"negative golden timeout", []string{"-preflight", "-preflight-golden-timeout", "-1s"}, "must be positive"},
+		{"unknown policy", []string{"-preflight", "-preflight-golden", "never"}, `golden policy "never"`},
+		{"empty policy", []string{"-preflight", "-preflight-golden", ""}, "-preflight-golden must be wait, skip or fail"},
+	} {
+		for _, dry := range []bool{false, true} {
+			events := filepath.Join(dir, strings.ReplaceAll(tc.name, " ", "-"), fmt.Sprint(dry))
+			args := append([]string{"-dataset", manifest, "-mode", "eval", "-width", "1", "-run-id", "pf-val", "-events-dir", events, "-placement", plan}, tc.args...)
+			if dry {
+				args = append(args, "-dry-run")
+			}
+			if err := runCmd(args); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("%s (dry run %v): err = %v, want %q", tc.name, dry, err, tc.want)
+			}
+			if _, err := os.Stat(events); err == nil {
+				t.Errorf("%s (dry run %v): the refused run created %s", tc.name, dry, events)
+			}
+		}
+	}
+	if len(warmer.calls) != 0 {
+		t.Errorf("warm calls = %d, want none from a refused run", len(warmer.calls))
+	}
+}
+
+// PW-40: a refused -preflight-* flag leaves no schedule file either. A steps
+// run with -resolve-out writes the resolved schedule before it starts.
+func TestRunCmdPreflightKnobsAreValidatedBeforeTheScheduleIsWritten(t *testing.T) {
+	dir, manifest, plan, warmer := preflightRunFixture(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"probes without -preflight", []string{"-preflight-probes-per-node", "1"}, "-preflight-probes-per-node needs -preflight"},
+		{"zero rounds", []string{"-preflight", "-preflight-max-rounds", "0"}, "must be at least 1"},
+		{"nine probes", []string{"-preflight", "-preflight-probes-per-node", "9"}, "9 probes per node exceed"},
+		{"unknown policy", []string{"-preflight", "-preflight-golden", "never"}, `golden policy "never"`},
+	} {
+		for _, dry := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/dry=%v", tc.name, dry), func(t *testing.T) {
+				sub := filepath.Join(dir, strings.ReplaceAll(tc.name, " ", "-"), fmt.Sprint(dry))
+				if err := os.MkdirAll(sub, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				sched := filepath.Join(sub, "sched.json")
+				events := filepath.Join(sub, "events")
+				args := append([]string{"-dataset", manifest, "-mode", "steps", "-steps", "1", "-rollouts", "1", "-width", "1", "-run-id", "pf-sched",
+					"-events-dir", events, "-placement", plan, "-resolve-out", sched}, tc.args...)
+				if dry {
+					args = append(args, "-dry-run")
+				}
+				if err := runCmd(args); err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("err = %v, want %q", err, tc.want)
+				}
+				for _, path := range []string{sched, events} {
+					if _, err := os.Stat(path); err == nil {
+						t.Errorf("the refused run created %s", path)
+					}
+				}
+			})
+		}
+	}
+	if len(warmer.calls) != 0 {
+		t.Errorf("warm calls = %d, want none from a refused run", len(warmer.calls))
+	}
+}
+
+// PW-40: the same refusals come before run -convert-trace writes the
+// converted trace, with a dataset (the run would follow) and without one
+// (the command would only convert). The upper bounds and the golden policy
+// are the warmer's own limits, read through swebench.ValidatePreflightKnobs.
+func TestRunCmdPreflightKnobsAreValidatedBeforeTheTraceIsConverted(t *testing.T) {
+	dir, manifest, plan, warmer := preflightRunFixture(t)
+	trace := filepath.Join(dir, "trace.jsonl")
+	const digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	lines := strings.Join([]string{
+		`{"schema_version":"v1","ts":"2026-10-22T12:00:00.005Z","job":"grpo","step":1,"env":"sb-1","instance":"inst-1","image":"reg/img@` + digest + `","op":"create","dur_ms":5,"ok":true}`,
+		`{"schema_version":"v1","ts":"2026-10-22T12:00:00.045Z","job":"grpo","step":1,"env":"sb-1","instance":"inst-1","op":"exec","command":["pytest","-q"],"dur_ms":10,"exit":0,"ok":true}`,
+		`{"schema_version":"v1","ts":"2026-10-22T12:00:00.050Z","job":"grpo","step":1,"env":"sb-1","instance":"inst-1","op":"delete","dur_ms":5,"ok":true}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(trace, []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"probes without -preflight", []string{"-placement", plan, "-preflight-probes-per-node", "1"}, "-preflight-probes-per-node needs -preflight"},
+		{"zero rounds", []string{"-placement", plan, "-preflight", "-preflight-max-rounds", "0"}, "must be at least 1"},
+		{"nine probes", []string{"-placement", plan, "-preflight", "-preflight-probes-per-node", "9"}, "9 probes per node exceed"},
+		{"unknown policy", []string{"-placement", plan, "-preflight", "-preflight-golden", "never"}, `golden policy "never"`},
+		{"eleven rounds", []string{"-placement", plan, "-preflight", "-preflight-max-rounds", "11"}, "11 rounds exceed"},
+		{"policy in upper case", []string{"-placement", plan, "-preflight", "-preflight-golden", "WAIT"}, `golden policy "WAIT"`},
+		{"no placement", []string{"-preflight"}, "-preflight needs -placement"},
+	} {
+		for _, withDataset := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/dataset=%v", tc.name, withDataset), func(t *testing.T) {
+				out := filepath.Join(dir, strings.ReplaceAll(tc.name, " ", "-"), fmt.Sprint(withDataset), "trace-out")
+				args := []string{"-convert-trace", trace, "-trace-out", out}
+				if withDataset {
+					args = append(args, "-dataset", manifest)
+				}
+				args = append(args, tc.args...)
+				if err := runCmd(args); err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("err = %v, want %q", err, tc.want)
+				}
+				if _, err := os.Stat(out); err == nil {
+					t.Errorf("the refused run created %s", out)
+				}
+			})
+		}
+	}
+	if len(warmer.calls) != 0 {
+		t.Errorf("warm calls = %d, want none from a refused run", len(warmer.calls))
+	}
+}
+
+// PW-43: with -preflight-golden fail, a golden that is not ready ends run
+// before the first task, after the coverage file is written.
+func TestRunCmdPreflightGoldenFailEndsTheRun(t *testing.T) {
+	dir, manifest, plan, warmer := preflightRunFixture(t)
+	warmer.pending = true
+	events := filepath.Join(dir, "run")
+	err := runCmd([]string{"-dataset", manifest, "-mode", "eval", "-width", "1", "-trajectory", "workload-file-read-one", "-run-id", "pf-fail", "-events-dir", events, "-placement", plan,
+		"-preflight", "-preflight-golden", "fail", "-preflight-golden-timeout", "20ms"})
+	if !errors.Is(err, swebench.ErrGoldenNotReady) {
+		t.Fatalf("err = %v, want the command to end with ErrGoldenNotReady", err)
+	}
+	cov, cerr := swebench.ReadPreflightCoverage(filepath.Join(events, "preflight-coverage.json"))
+	if cerr != nil {
+		t.Fatalf("the coverage file was not written: %v", cerr)
+	}
+	if cov.Complete || len(cov.Domains) != 1 || len(cov.Domains[0].Images) != 1 || cov.Domains[0].Images[0].Error != "golden not ready" {
+		t.Errorf("coverage = %+v, want the pair short with golden not ready", cov)
+	}
+	if len(warmer.calls) != 0 {
+		t.Errorf("warm calls = %d, want none for an image whose golden is not ready", len(warmer.calls))
+	}
+	// No task ran: the run's shard has no event.
+	shards, _ := filepath.Glob(filepath.Join(events, "events", "*.jsonl"))
+	for _, shard := range shards {
+		if raw, _ := os.ReadFile(shard); len(bytes.TrimSpace(raw)) != 0 {
+			t.Errorf("the run recorded events after a refused pre-flight:\n%s", raw)
+		}
+	}
+
+	// With the golden ready, the same command runs.
+	warmer.pending = false
+	if err := runCmd([]string{"-dataset", manifest, "-mode", "eval", "-width", "1", "-trajectory", "workload-file-read-one", "-run-id", "pf-ok", "-events-dir", filepath.Join(dir, "ok"), "-placement", plan,
+		"-preflight", "-preflight-golden", "fail"}); err != nil {
+		t.Fatalf("run with a ready golden: %v", err)
+	}
+}
+
+// PW-42, on the command: preflight -golden skip probes at once and records
+// the golden as pending; an unknown policy is refused.
+func TestPreflightCmdGoldenPolicy(t *testing.T) {
+	dir, _, plan, warmer := preflightRunFixture(t)
+	warmer.pending = true
+	testPreflightBackend = warmer
+	t.Cleanup(func() { testPreflightBackend = nil })
+	events := filepath.Join(dir, "skip")
+	var stderr bytes.Buffer
+	err := preflightCmd([]string{"-plan", plan, "-events-dir", events, "-run-id", "pf-s", "-golden", "skip", "-golden-timeout", "1h", "-golden-poll", "1h"}, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "1 goldens not ready") {
+		t.Fatalf("preflight -golden skip: err = %v, want an incomplete pass\n%s", err, stderr.String())
+	}
+	cov, cerr := swebench.ReadPreflightCoverage(filepath.Join(events, "preflight-coverage.json"))
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	if len(cov.Goldens) != 1 || cov.Goldens[0].Error != "golden not waited for" || len(cov.Domains) != 1 || !cov.Domains[0].Complete {
+		t.Errorf("coverage = %+v, want the golden not waited for and the domain covered", cov)
+	}
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", filepath.Join(dir, "bad"), "-golden", "never"}, &stderr); err == nil || !strings.Contains(err.Error(), `-golden must be wait, skip or fail, got "never"`) {
+		t.Errorf("preflight -golden never: err = %v, want a refusal", err)
+	}
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", filepath.Join(dir, "empty"), "-golden", ""}, &stderr); err == nil || !strings.Contains(err.Error(), "-golden must be wait, skip or fail") {
+		t.Errorf("preflight -golden with no value: err = %v, want a refusal", err)
+	}
+}
+
+// An unknown -golden is refused with the other flag checks, before the
+// command reads the auth token or dials the API.
+func TestPreflightCmdRefusesAnUnknownGoldenBeforeAuth(t *testing.T) {
+	dir, _, plan, _ := preflightRunFixture(t)
+	testPreflightBackend = nil
+	var stderr bytes.Buffer
+	err := preflightCmd([]string{"-plan", plan, "-events-dir", filepath.Join(dir, "bad"), "-golden", "never",
+		"-auth-token-file", filepath.Join(dir, "no-such-token")}, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "-golden must be wait, skip or fail") {
+		t.Errorf("preflight -golden never: err = %v, want the -golden refusal before the token file is read", err)
+	}
+}
+
 // TestPreflightVerdict covers what run -preflight does with the pass's
 // outcome; the cancel that lands after the pass returned without an error
 // cannot be timed through runCmd.
@@ -1506,6 +1815,10 @@ func TestPreflightVerdict(t *testing.T) {
 			warn: coldBoots + "; 1 probes not deleted and still holding slots"},
 		{name: "complete, an error that names no probe", coverage: complete, perr: errors.New("other"),
 			warn: "preflight returned an error with a complete coverage; the run goes on"},
+		{name: "golden policy fail, a golden not ready", coverage: short, perr: fmt.Errorf("%w: %w", swebench.ErrGoldenNotReady, incomplete),
+			want: "-preflight: golden policy fail: a golden is not ready: pre-flight incomplete: d0 short"},
+		{name: "golden policy fail, probes left", coverage: leftover(false, "pf-x-0-0-1-0"), perr: fmt.Errorf("%w: %w", swebench.ErrGoldenNotReady, incomplete),
+			want: "-preflight: golden policy fail: a golden is not ready: pre-flight incomplete: d0 short"},
 		{name: "no coverage", perr: errors.New("writing coverage to x: denied"), want: "-preflight: writing coverage to x: denied"},
 		{name: "no coverage, no error", want: "-preflight: no coverage"},
 		{name: "cancelled during the pass", ctxErr: context.Canceled, coverage: short, perr: context.Canceled, want: "-preflight: context canceled"},

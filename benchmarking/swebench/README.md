@@ -91,7 +91,7 @@ smoke test and a 500-wide run differ only in numbers.
 | single-shard strategy sweep (`none`, `naive`, `sliding`, `pipelined`) | `-mode steps -steps 1 -images 20 -rollouts 5 -width 100 -strategy pipelined -window-size 8` | Single-pass sweep of the four warm-pool orchestration strategies on `swebench-loader`: `none` (on-demand create and delete per rollout), `naive` (prewarm and suspend all `images * rollouts` sandboxes upfront), `sliding` (warm `window-size` distinct images, execute, retire, advance), or `pipelined` (double-buffer window `N+1` prefetch behind window `N` execution while sharing `-width`). |
 | eval (SWE-bench Verified evaluation) | `-mode eval -images 500 -tasks-per-image 6 -width 500` | 500 in flight. Each task: create from the image, replay the trajectory, record the reward, delete. With the offline exclusion list the 500 become 445 images and 2,670 tasks; the loader prints the reduced count. |
 | steps (training loop) | `-mode steps -images 500 -rollouts 2 -steps 8 -park suspend` | 1,000 environments created once. Each step replays the trajectory on all of them, waits for the last (the barrier), then parks the fleet. `-park` is `suspend`, `suspend-sync`, `suspend-async`, `fork`, `delete` or `none`. |
-| steps, parked one by one (fleet larger than the slots) | `-mode steps -images 500 -rollouts 16 -steps 8 -park suspend -width 64 -park-each` | 8,000 environments, created on their first step. Each environment is parked as soon as its own step ends instead of after the whole fleet's, so at most 64 are awake at once and the fleet can be many times the running slots: the shape of a trainer that releases a sandbox at the end of its episode, and the way to measure how many parked environments a node can hold. The barrier includes the parking and there is no `park` event. On the last step each environment is deleted right after its replay instead of parked (unless `-keep`), so the run ends with no cleanup burst. With `-park suspend-async` each parked environment stays pinned to its node until its upload lands; a wake that finds no room on that node pays the detach (Substrate issue #3482; `docs/plans/preflight-warmer.md`). |
+| steps, parked one by one (fleet larger than the slots) | `-mode steps -images 500 -rollouts 16 -steps 8 -park suspend -width 64 -park-each` | 8,000 environments, created on their first step. Each environment is parked as soon as its own step ends instead of after the whole fleet's, so at most 64 are awake at once and the fleet can be many times the running slots: the shape of a trainer that releases a sandbox at the end of its episode, and the way to measure how many parked environments a node can hold. The barrier includes the parking and there is no `park` event. On the last step each environment is deleted right after its replay instead of parked (unless `-keep`), so the run ends with no cleanup burst. With `-park suspend-async` each parked environment stays pinned to its node until its upload lands; a wake that finds no room on that node pays the detach (Substrate issue #3482; `docs/plans/preflight-warmer/README.md`). |
 | steps with a window (pools per step) | `-mode steps -images-per-step 32 -rollouts 16 -steps 6 -park delete` | Each step takes the next 32 images (wrapping around the dataset), creates 16 fresh environments per image, 512 in all, runs the step behind a barrier, and retires them. Nothing survives a step, so every task pays the cold path, and a new image is a new derived template and a golden bake on first use: the shape of a trainer that creates and retires pools every step. Run several loaders at once, one run id each, for several jobs on one cluster. |
 
 The trajectory is YAML (`internal/benchmarking/swebench/trajectories/`,
@@ -466,7 +466,16 @@ configured by `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_INSECURE`.
    reported its deletes) are listed per image under `undeleted_probes` and hold
    a node slot each until swept with `ate-env delete`. `-golden-timeout` (default 30 min)
    gives up on the goldens still baking once none became ready for that
-   long. The probes are deleted: the planner keeps each node's assigned
+   long. `-golden` says what the pass does about a golden that is not ready:
+   `wait` (the default) probes the image after the wait whether or not its
+   golden is ready, because a boot fills the layer caches too; `skip` does
+   not wait and probes at once, and records the goldens still baking as
+   `pending`, which makes the coverage incomplete: such a pass cannot be the
+   Rule 1 evidence of a report on warm footing
+   (`report -validate -footing warm -preflight-coverage` fails on it), so use
+   `skip` only when each golden is ready before the pass or when the run needs
+   no warm-footing report; `fail` waits and does not probe an image whose golden is not
+   ready, and reports its pairs short with `golden not ready`. The probes are deleted: the planner keeps each node's assigned
    images under atelet's GC low watermark, so the layers stay until the run.
 
 ## Run
@@ -504,13 +513,21 @@ its images unplaced: 19 domains at `-domain-width 24` are 456. Set
 records `domain_width` in place of `width`, so `report -arm` pools reps
 whatever their `-width`. `-preflight` next
 to `-placement` runs the pre-flight
-(step 5, with its defaults) inside the same command before the run, writing
+(step 5) inside the same command before the run, with that step's defaults
+unless `-preflight-probes-per-node`, `-preflight-max-rounds`,
+`-preflight-probe-timeout`, `-preflight-golden-timeout` or
+`-preflight-golden` say otherwise (they need `-preflight`; a value out of
+range ends the command before it writes a file, the converted trace of
+`-convert-trace` included), writing
 `preflight-events.jsonl` and `preflight-coverage.json` next to the run's
 events (`-events-dir`, or the directory of `-out`; the directory above when
 that one is named `events`, so `events/*.jsonl` stays the run's shards); an
 incomplete pre-flight is logged and the run goes on (as is a complete one that
 left probes it could not delete: they hold slots until swept), a cancel during
-it ends the command, and `-out` cannot be one of the two file names. Give the report the pre-flight's result too:
+it ends the command, as does a golden that is not ready with
+`-preflight-golden fail` (after the coverage file is written), and `-out`
+cannot be one of the two file names. With `-preflight-golden skip` the coverage
+is incomplete while a golden bakes, and the report below then fails Rule 1. Give the report the pre-flight's result too:
 `swebench-loader report run.jsonl -validate -footing warm -preflight-coverage preflight-coverage.json`
 takes a complete pre-flight as Validity Rule 1's prewarm evidence and fails
 on an incomplete one, naming the shortfall; the report's `validity.evidence`

@@ -38,8 +38,10 @@ type PreflightCoverage struct {
 	// Goldens is the golden state the pre-flight left each image in.
 	Goldens []GoldenRecord   `json:"goldens"`
 	Domains []DomainCoverage `json:"domains"`
-	// Complete is true when every golden the pre-flight waited for is ready
-	// and every (image, domain) pair reached its node count.
+	// Complete is true when every golden is ready, or none by design, and
+	// every (image, domain) pair reached its node count. A golden that the
+	// pre-flight did not wait for (the skip policy) and that is still baking
+	// makes it false.
 	Complete bool `json:"complete"`
 }
 
@@ -49,7 +51,9 @@ type GoldenRecord struct {
 	Image    string `json:"image"`
 	Template string `json:"template,omitempty"`
 	// State is ready, none (goldens are disabled on the base template),
-	// failed, or pending when the pre-flight gave up waiting.
+	// failed, or pending: the golden was still baking when the pre-flight
+	// gave up waiting, or the pre-flight did not wait for it (the skip
+	// policy; Error is then "golden not waited for").
 	State string `json:"state"`
 	Tag   string `json:"tag,omitempty"`
 	Error string `json:"error,omitempty"`

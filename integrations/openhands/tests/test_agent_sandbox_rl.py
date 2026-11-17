@@ -29,7 +29,9 @@ import json
 import logging
 import runpy
 from contextlib import redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import ate_env_rl
 import pydantic
@@ -37,6 +39,7 @@ import pytest
 from ate_env_rl import DEFAULT_ATESPACE
 from ate_env_rl.backend.mock import MockBackendDriver
 from ate_env_rl.errors import InfrastructureError, PreflightError
+from ate_env_rl.preflight import PreflightCoverage
 
 import ate_env_openhands.agent_sandbox_rl.adapters.openhands as compat_openhands
 from ate_env_openhands import fleet as oh_fleet
@@ -241,6 +244,70 @@ def test_epochs_give_one_list_for_each_pass():
     assert fleet.run(lambda task, handle: task.id, epochs=2) == [["t1"], ["t1"]]
     with pytest.raises(ValueError, match="epochs"):
         fleet.run(lambda task, handle: None, epochs=0)
+
+
+# PW-46 (docs/plans/preflight-warmer/acceptance-criteria.md).
+@pytest.mark.parametrize("strategy", ["none", "naive", "sliding", "pipelined"])
+@pytest.mark.parametrize("epochs", [1, 2])
+def test_the_compat_fleet_runs_the_preflight_flag(monkeypatch, strategy, epochs):
+    config = FleetConfig(preflight=True)
+    assert config.to_ate_env().preflight is True
+    fleet = _mock_fleet(config)
+    fleet.load_tasks([Task(id="t1", image=IMAGE), Task(id="t2", image=IMAGE)])
+    order: list[Any] = []
+    monkeypatch.setattr(fleet.backend, "preflight_images",
+                        lambda images, **knobs: order.append(("preflight", list(images))))
+    fleet.run(lambda task, handle: order.append(task.id), strategy, epochs=epochs)
+    # One pass over the tasks' images, before the first task of the first epoch.
+    assert order[0] == ("preflight", [IMAGE])
+    assert [o for o in order if isinstance(o, tuple)] == [("preflight", [IMAGE])]
+    assert len(order) == 1 + 2 * epochs
+    # The teardown ends the reuse: the next run() makes the pass again.
+    fleet.run(lambda task, handle: None, strategy)
+    assert [o for o in order if isinstance(o, tuple)] == [("preflight", [IMAGE])] * 2
+
+
+# PW-46: the coverage of the pass is on the fleet and in the run report.
+@pytest.mark.parametrize("strategy", ["none", "naive", "sliding", "pipelined"])
+def test_the_compat_fleet_reports_the_preflight_coverage(monkeypatch, strategy):
+    fleet = _mock_fleet(FleetConfig(preflight=True))
+    fleet.load_tasks([Task(id="t1", image=IMAGE)])
+    coverage = PreflightCoverage(
+        run_id="pf-compat", started_at=datetime.now(UTC), complete=True
+    )
+    monkeypatch.setattr(fleet.backend, "preflight_images", lambda images, **knobs: coverage)
+    fleet.run(lambda task, handle: None, strategy)
+    assert fleet.preflight_coverage is coverage
+    summary = fleet.report.environment[fleet.backend_label]["preflight"]
+    assert summary["run_id"] == "pf-compat" and summary["complete"] is True
+
+
+def test_the_compat_fleet_makes_no_preflight_by_default(monkeypatch):
+    assert FleetConfig().to_ate_env().preflight is False
+    fleet = _mock_fleet()
+    fleet.load_tasks([Task(id="t1", image=IMAGE)])
+    calls: list[Any] = []
+    monkeypatch.setattr(fleet.backend, "preflight_images",
+                        lambda images, **knobs: calls.append(list(images)))
+    fleet.run(lambda task, handle: None, "naive", epochs=2)
+    assert calls == []
+
+
+def test_a_failed_image_preflight_tears_down_and_keeps_its_error(monkeypatch):
+    fleet = _mock_fleet(FleetConfig(preflight=True))
+    fleet.load_tasks([Task(id="t1", image=IMAGE)])
+    teardowns: list[int] = []
+    teardown = fleet.teardown
+    monkeypatch.setattr(fleet, "teardown", lambda: (teardowns.append(1), teardown()))
+
+    def refuse(images, **knobs):
+        raise PreflightError("no global viewer role")
+
+    monkeypatch.setattr(fleet.backend, "preflight_images", refuse)
+    ran: list[str] = []
+    with pytest.raises(PreflightError, match="no global viewer role"):
+        fleet.run(lambda task, handle: ran.append(task.id), "sliding")
+    assert ran == [] and teardowns == [1]
 
 
 def test_epochs_keep_the_pools_and_share_one_report(monkeypatch):

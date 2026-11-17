@@ -131,6 +131,17 @@ class SandboxFleet(AteSandboxFleet):
         ``fleet.report`` covers all passes. ``max_reuses``, ``reset_timeout``,
         ``use_session`` and ``scale_on_hold`` only tune session reuse, thus they
         have no effect here.
+
+        With ``FleetConfig(preflight=True)`` (an ate-env-only field) the fleet
+        puts the tasks' images on the nodes once, before the first pass, as
+        ``ate_env_rl.SandboxFleet.run`` does; the coverage is in
+        ``fleet.preflight_coverage`` and in the report.
+        The pass cannot be narrowed on this model, which maps no
+        ``node_selector`` and no placement: each task image goes on each node
+        of each pool that the template addresses, with 2 probes for each node.
+        Only an image that is pinned by digest is warmed; the others are
+        skipped with a log line. For a placement plan use
+        ``ate_env_rl.FleetConfig``.
         """
         unsupported = [name for name, value, default in (
             ("keep_warm", keep_warm, False), ("recycle", recycle, False), ("reset", reset, None),
@@ -162,6 +173,11 @@ class SandboxFleet(AteSandboxFleet):
                 # before their own try, thus a failure there skips the
                 # strategy's teardown, also on the last pass.
                 try:
+                    # One image pre-flight for all passes: the teardown below
+                    # ends its reuse, and a setup() inside a pass (naive)
+                    # does not repeat it.
+                    if self.config.preflight:
+                        self._preflight_images(report)
                     for e in range(epochs):
                         if epochs > 1:
                             logger.info("epoch %d/%d", e + 1, epochs)

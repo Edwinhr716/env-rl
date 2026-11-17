@@ -560,12 +560,13 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 		eventsDir     = fs.String("events-dir", "", "Directory for preflight-events.jsonl and preflight-coverage.json (the directory above, when this one is named events: a run's shards directory); required unless -out is given.")
 		out           = fs.String("out", "", "Events file to write instead of -events-dir.")
 		coverageOut   = fs.String("coverage-out", "", "Where to write preflight-coverage.json; default <events-dir>/preflight-coverage.json.")
-		probesPerNode = fs.Int("probes-per-node", 2, "Probes a round starts per node of a domain; the round holds them until all are placed. ate-env-api refuses more than its -warm-max-probes-per-node (2 unless raised).")
+		probesPerNode = fs.Int("probes-per-node", swebench.DefaultPreflightProbesPerNode, "Probes a round starts per node of a domain; the round holds them until all are placed. ate-env-api refuses more than its -warm-max-probes-per-node (2 unless raised).")
 		imageConc     = fs.Int("image-concurrency", 4, "Images a domain warms at once, each one WarmImage call; node_slots in the plan caps it at node_slots / probes-per-node, and ate-env-api's per-node cap makes calls beyond it wait for slots.")
-		maxRounds     = fs.Int("max-rounds", 3, "Rounds per (image, domain) before the pair is reported short.")
-		goldenTimeout = fs.Duration("golden-timeout", 30*time.Minute, "Give up on the goldens still baking once none became ready for this long.")
+		maxRounds     = fs.Int("max-rounds", swebench.DefaultPreflightMaxRounds, "Rounds per (image, domain) before the pair is reported short.")
+		goldenTimeout = fs.Duration("golden-timeout", swebench.DefaultPreflightGoldenTimeout, "Give up on the goldens still baking once none became ready for this long.")
 		goldenPoll    = fs.Duration("golden-poll", 10*time.Second, "How often to poll a baking golden.")
-		probeTimeout  = fs.Duration("probe-timeout", 10*time.Minute, "Bound on one probe on the server: create, resume and node read (the server deletes a probe within its own 60s).")
+		golden        = fs.String("golden", swebench.GoldenPolicyWait, "What the pass does about a golden that is not ready: "+preflightGoldenPolicies+".")
+		probeTimeout  = fs.Duration("probe-timeout", swebench.DefaultPreflightProbeTimeout, "Bound on one probe on the server: create, resume and node read (the server deletes a probe within its own 60s).")
 		images        = fs.String("images", "", "Comma-separated images to restrict the pass to; default every image of the plan.")
 		domains       = fs.String("domains", "", "Comma-separated domains to restrict the pass to; default every domain of the plan.")
 	)
@@ -583,6 +584,14 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 	}
 	if *eventsDir != "" && *out != "" {
 		return fmt.Errorf("-events-dir and -out exclude each other")
+	}
+	switch *golden {
+	case swebench.GoldenPolicyWait, swebench.GoldenPolicySkip, swebench.GoldenPolicyFail:
+	default:
+		// Checked here, before the token is read and the API is dialed. The
+		// warmer reads an empty policy as its default; a flag set to nothing
+		// is a mistake.
+		return fmt.Errorf("-golden must be %s, %s or %s, got %q", swebench.GoldenPolicyWait, swebench.GoldenPolicySkip, swebench.GoldenPolicyFail, *golden)
 	}
 	placement, err := swebench.ReadImagePlacement(*plan)
 	if err != nil {
@@ -637,12 +646,17 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 		MaxRounds:        *maxRounds,
 		GoldenTimeout:    *goldenTimeout,
 		GoldenPoll:       *goldenPoll,
+		Golden:           *golden,
 		ProbeTimeout:     *probeTimeout,
 		Images:           splitList(*images),
 		Domains:          splitList(*domains),
 	}, eventsPath, coveragePath, nil, stderr)
 	return err
 }
+
+// preflightGoldenPolicies describes the values of preflight -golden and
+// run -preflight-golden.
+const preflightGoldenPolicies = "wait (wait for each golden, up to the golden timeout without progress, then probe the image whether or not its golden is ready), skip (probe at once; the goldens still baking are recorded as pending and the coverage is not complete) or fail (wait, then do not probe an image whose golden is not ready; its pairs are short)"
 
 // eventTracing is the tracer and the parent span context a recorder's events
 // become spans under (-enable-tracing).
@@ -677,7 +691,9 @@ func preflightFilesDir(dir string) string {
 // warning to log ("" for a clean pass). No coverage on disk (a pass that
 // could not run, a file that could not be written) and a cancel both end it,
 // the cancel also when it lands after the pass returned without an error.
-// A pass that returned an error with a coverage lets the run go on; the
+// A pass that -preflight-golden fail stopped short of an image whose golden
+// is not ready ends it too, with the coverage on disk. Any other
+// pass that returned an error with a coverage lets the run go on; the
 // warning tells a short coverage (cold first boots) from a complete one
 // whose probes could not all be deleted (slots held until a sweep).
 func preflightVerdict(ctxErr error, coverage *schema.PreflightCoverage, perr error) (warn string, err error) {
@@ -695,6 +711,9 @@ func preflightVerdict(ctxErr error, coverage *schema.PreflightCoverage, perr err
 	}
 	if perr == nil {
 		return "", nil
+	}
+	if errors.Is(perr, swebench.ErrGoldenNotReady) {
+		return "", fmt.Errorf("-preflight: %w", perr)
 	}
 	left := len(swebench.UndeletedProbes(coverage))
 	switch {
@@ -976,7 +995,12 @@ func runCmd(args []string) (retErr error) {
 		stepPause        = fs.Duration("step-pause", 0, "steps: simulated trainer pause between steps.")
 		prefetch         = fs.Bool("prefetch", false, "steps: asynchronously prewarm next step's prefetch_images off the critical path.")
 		placementPath    = fs.String("placement", "", "image-placement.json from plan-placement: each create carries the worker selector of one of its image's domains, round-robin, so environments land where the pre-flight put the image. ate-env API backend only.")
-		preflightFlag    = fs.Bool("preflight", false, "With -placement: run the pre-flight (the preflight subcommand, with its defaults) over the plan before the run, writing preflight-events.jsonl and preflight-coverage.json next to the run's events (-events-dir, or the directory of -out; the directory above, when that one is named events). An incomplete pre-flight is logged and the run goes on, as is a complete one that left probes it could not delete; a cancelled one ends the command; report -preflight-coverage reads the file for Validity Rule 1.")
+		preflightFlag    = fs.Bool("preflight", false, "With -placement: run the pre-flight (the preflight subcommand, with its defaults unless a -preflight-* flag sets a knob) over the plan before the run, writing preflight-events.jsonl and preflight-coverage.json next to the run's events (-events-dir, or the directory of -out; the directory above, when that one is named events). An incomplete pre-flight is logged and the run goes on, as is a complete one that left probes it could not delete; a cancelled one ends the command, as does a golden that is not ready with -preflight-golden fail; report -preflight-coverage reads the file for Validity Rule 1.")
+		pfProbesPerNode  = fs.Int("preflight-probes-per-node", swebench.DefaultPreflightProbesPerNode, "With -preflight: probes a round starts per node of a domain. ate-env-api refuses more than its -warm-max-probes-per-node (2 unless raised).")
+		pfMaxRounds      = fs.Int("preflight-max-rounds", swebench.DefaultPreflightMaxRounds, "With -preflight: rounds per (image, domain) before the pair is reported short.")
+		pfProbeTimeout   = fs.Duration("preflight-probe-timeout", swebench.DefaultPreflightProbeTimeout, "With -preflight: bound on one probe on the server: create, resume and node read.")
+		pfGoldenTimeout  = fs.Duration("preflight-golden-timeout", swebench.DefaultPreflightGoldenTimeout, "With -preflight: give up on the goldens still baking once none became ready for this long.")
+		pfGolden         = fs.String("preflight-golden", swebench.GoldenPolicyWait, "With -preflight: what the pass does about a golden that is not ready: "+preflightGoldenPolicies+". With fail, a golden that is not ready ends the command before the first task, after the coverage file is written.")
 		createTimeout    = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
 		stepTimeout      = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget       = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked, and how long the step loop's park retries a suspend that fails with a transient error.")
@@ -1042,6 +1066,34 @@ func runCmd(args []string) (retErr error) {
 				return fmt.Errorf("-strategy is single-pass (requires -steps 1 in steps mode; omit -strategy for multi-step reset loops)")
 			}
 			*park = string(strategyPark(swebench.Strategy(*strategy)))
+		}
+	}
+	// The -preflight checks that need only the flags, before the command
+	// writes anything (the converted trace, the resolved schedule): a
+	// -preflight-* flag without -preflight, -preflight without -placement,
+	// and each knob's range. The warmer reads a zero knob as its default, so
+	// a value below 1 is refused here; the upper bounds and the golden
+	// policy are the warmer's own, through swebench.ValidatePreflightKnobs.
+	for _, name := range []string{"preflight-probes-per-node", "preflight-max-rounds", "preflight-probe-timeout", "preflight-golden-timeout", "preflight-golden"} {
+		if visited[name] && !*preflightFlag {
+			return fmt.Errorf("-%s needs -preflight", name)
+		}
+	}
+	if *preflightFlag {
+		if *pfProbesPerNode < 1 || *pfMaxRounds < 1 {
+			return fmt.Errorf("-preflight-probes-per-node and -preflight-max-rounds must be at least 1, got %d and %d", *pfProbesPerNode, *pfMaxRounds)
+		}
+		if *pfGolden == "" {
+			return fmt.Errorf("-preflight-golden must be %s, %s or %s", swebench.GoldenPolicyWait, swebench.GoldenPolicySkip, swebench.GoldenPolicyFail)
+		}
+		if *pfProbeTimeout <= 0 || *pfGoldenTimeout <= 0 {
+			return fmt.Errorf("-preflight-probe-timeout and -preflight-golden-timeout must be positive, got %s and %s", *pfProbeTimeout, *pfGoldenTimeout)
+		}
+		if err := swebench.ValidatePreflightKnobs(*pfProbesPerNode, *pfMaxRounds, *pfGolden); err != nil {
+			return fmt.Errorf("-preflight: %w", err)
+		}
+		if *placementPath == "" {
+			return fmt.Errorf("-preflight needs -placement, the plan to warm the nodes from")
 		}
 	}
 	if *convertTrace != "" {
@@ -1166,11 +1218,6 @@ func runCmd(args []string) (retErr error) {
 			return err
 		}
 	}
-	if *resolveOut != "" && sched != nil {
-		if err := swebench.WriteSchedule(*resolveOut, sched); err != nil {
-			return err
-		}
-	}
 
 	fanout := *tasksPerImage
 	if swebench.Mode(*mode) == swebench.ModeSteps {
@@ -1245,9 +1292,6 @@ func runCmd(args []string) (retErr error) {
 	if *domainWidth > 0 && *placementPath == "" {
 		return fmt.Errorf("-domain-width needs -placement, the plan that names the domains")
 	}
-	if *preflightFlag && *placementPath == "" {
-		return fmt.Errorf("-preflight needs -placement, the plan to warm the nodes from")
-	}
 	if *preflightFlag && *eventsDir == "" {
 		// The pass writes these two names into the directory of -out; a run
 		// that writes its events to one of them would share the file.
@@ -1255,11 +1299,36 @@ func runCmd(args []string) (retErr error) {
 			return fmt.Errorf("-out %s: the pre-flight writes %s next to the run's events; give the run's events another name", *out, name)
 		}
 	}
+	// The pre-flight's knobs, without the backend. The flag-only checks ran
+	// before the first write, above.
+	preflightOpts := swebench.PreflightOptions{
+		Plan:          placement,
+		PlanPath:      *placementPath,
+		Logger:        log,
+		RunID:         preflightRunID(*runID, *worker),
+		ProbesPerNode: *pfProbesPerNode,
+		MaxRounds:     *pfMaxRounds,
+		ProbeTimeout:  *pfProbeTimeout,
+		GoldenTimeout: *pfGoldenTimeout,
+		Golden:        *pfGolden,
+	}
 	if *preflightFlag {
-		// The pass's own checks (a plan that places no image, a run id that
-		// leaves no room for the indexes) fail here, also under -dry-run.
-		if _, err := swebench.NewPreflightWarmer(swebench.PreflightOptions{Plan: placement, PlanPath: *placementPath, Backend: noWarmer{}, Logger: log, RunID: preflightRunID(*runID, *worker)}); err != nil {
+		// The pass's checks that need the plan or the run id (a plan that
+		// places no image, a run id that leaves no room for the indexes,
+		// more probes per node than a domain has slots) fail here, also
+		// under -dry-run. The knob ranges were refused before the first
+		// write, above.
+		check := preflightOpts
+		check.Backend = noWarmer{}
+		if _, err := swebench.NewPreflightWarmer(check); err != nil {
 			return fmt.Errorf("-preflight: %w", err)
+		}
+	}
+	// The resolved schedule is written after each check above, so a refused
+	// run leaves no file. A dry run writes it too.
+	if *resolveOut != "" && sched != nil {
+		if err := swebench.WriteSchedule(*resolveOut, sched); err != nil {
+			return err
 		}
 	}
 	if *dryRun {
@@ -1374,13 +1443,8 @@ func runCmd(args []string) (retErr error) {
 		if *eventsDir == "" {
 			dir = preflightFilesDir(filepath.Dir(*out))
 		}
-		coverage, perr := runPreflightPass(ctx, swebench.PreflightOptions{
-			Plan:     placement,
-			PlanPath: *placementPath,
-			Backend:  preflightWarmer,
-			Logger:   log,
-			RunID:    preflightRunID(*runID, *worker),
-		}, filepath.Join(dir, "preflight-events.jsonl"), filepath.Join(dir, "preflight-coverage.json"), tracing, os.Stderr)
+		preflightOpts.Backend = preflightWarmer
+		coverage, perr := runPreflightPass(ctx, preflightOpts, filepath.Join(dir, "preflight-events.jsonl"), filepath.Join(dir, "preflight-coverage.json"), tracing, os.Stderr)
 		warn, err := preflightVerdict(ctx.Err(), coverage, perr)
 		if err != nil {
 			return err

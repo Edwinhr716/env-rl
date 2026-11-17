@@ -25,6 +25,7 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1098,5 +1099,174 @@ func TestPreflightTreatsNotFoundOnDeleteAsGone(t *testing.T) {
 	}
 	if got := UndeletedProbes(report); len(got) != 0 {
 		t.Errorf("undeleted = %v, want none for a NotFound delete", got)
+	}
+}
+
+// warmedImages is the image of each WarmImage call the fake ran, sorted.
+func warmedImages(api *fakeAPI) []string {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	var out []string
+	for _, req := range api.warmRequests {
+		out = append(out, req.GetRootfsImage())
+	}
+	sort.Strings(out)
+	return out
+}
+
+// PW-41: wait is the default policy. An image is probed once the wait for
+// its golden gave up, whether or not the golden is ready, and the error
+// does not ask a caller to stop.
+func TestPreflightGoldenPolicyWait(t *testing.T) {
+	for _, policy := range []string{"", GoldenPolicyWait} {
+		api := newPreflightFake()
+		api.goldenReadyAfter = 1 << 20
+		report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
+			o.Golden = policy
+			o.GoldenTimeout = 5 * time.Millisecond
+		})
+		if err == nil || errors.Is(err, ErrGoldenNotReady) || !strings.Contains(err.Error(), "2 goldens not ready") {
+			t.Fatalf("policy %q: Run error = %v, want two goldens not ready and no ErrGoldenNotReady", policy, err)
+		}
+		if got := warmedImages(api); !slices.Equal(got, []string{pfImgA, pfImgB, pfImgB}) {
+			t.Errorf("policy %q: warm calls = %v, want every pair probed after the wait", policy, got)
+		}
+		// The wait ran to its timeout: this is what tells wait from skip.
+		for _, g := range report.Goldens {
+			if g.State != "pending" || !strings.Contains(g.Error, "still pending after") {
+				t.Errorf("policy %q: golden = %+v, want pending after the wait gave up", policy, g)
+			}
+		}
+		for _, d := range report.Domains {
+			if !d.Complete {
+				t.Errorf("policy %q: domain %s not covered: %+v", policy, d.Name, d)
+			}
+		}
+	}
+	if _, err := NewPreflightWarmer(PreflightOptions{Plan: twoDomainPlan(), Backend: newFakeBackend(t, newPreflightFake()), Golden: "never"}); err == nil || !strings.Contains(err.Error(), `golden policy "never"`) {
+		t.Errorf("unknown policy: err = %v, want a refusal that names it", err)
+	}
+}
+
+// PW-40: the limits a command checks before it writes a file are the ones
+// the warmer checks, with the same text, because both call
+// ValidatePreflightKnobs.
+func TestValidatePreflightKnobs(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		probes, round int
+		golden        string
+		want          string
+	}{
+		{"defaults", 0, 0, "", ""},
+		{"at the limits", 8, 10, GoldenPolicyFail, ""},
+		{"nine probes", 9, 3, GoldenPolicyWait, "preflight: 9 probes per node exceed the 8 ate-env-api takes"},
+		{"eleven rounds", 2, 11, GoldenPolicyWait, "preflight: 11 rounds exceed the 10 ate-env-api takes"},
+		{"unknown policy", 2, 3, "never", `preflight: golden policy "never" is not one of wait, skip, fail`},
+		{"policy in upper case", 2, 3, "WAIT", `preflight: golden policy "WAIT" is not one of wait, skip, fail`},
+		{"policy with a space", 2, 3, " wait", `preflight: golden policy " wait" is not one of wait, skip, fail`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidatePreflightKnobs(tc.probes, tc.round, tc.golden)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("err = %v, want none", err)
+				}
+			} else if err == nil || err.Error() != tc.want {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+			// The warmer gives the same answer for the same knobs.
+			_, werr := NewPreflightWarmer(PreflightOptions{Plan: twoDomainPlan(), Backend: newFakeBackend(t, newPreflightFake()),
+				ProbesPerNode: tc.probes, MaxRounds: tc.round, Golden: tc.golden})
+			if (werr == nil) != (err == nil) || (err != nil && werr.Error() != err.Error()) {
+				t.Errorf("NewPreflightWarmer err = %v, ValidatePreflightKnobs err = %v", werr, err)
+			}
+		})
+	}
+}
+
+// PW-42: skip does not wait for a golden that is still baking after the
+// ensure. The image is probed at once and its golden is recorded as pending.
+func TestPreflightGoldenPolicySkip(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenReadyAfter = 1 << 20
+	started := time.Now()
+	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
+		o.Golden = GoldenPolicySkip
+		o.GoldenTimeout = time.Minute
+		o.GoldenPoll = time.Minute
+	})
+	if took := time.Since(started); took > 20*time.Second {
+		t.Fatalf("the pass took %s: it waited for the goldens", took)
+	}
+	if err == nil || errors.Is(err, ErrGoldenNotReady) || report.Complete {
+		t.Fatalf("Run error = %v, complete = %v; want an incomplete pass and no ErrGoldenNotReady", err, report.Complete)
+	}
+	for _, g := range report.Goldens {
+		if g.State != "pending" || g.Error != "golden not waited for" || g.Template == "" {
+			t.Errorf("golden = %+v, want pending, not waited for, with its template", g)
+		}
+	}
+	if got := warmedImages(api); !slices.Equal(got, []string{pfImgA, pfImgB, pfImgB}) {
+		t.Errorf("warm calls = %v, want every pair probed", got)
+	}
+	for _, d := range report.Domains {
+		if !d.Complete {
+			t.Errorf("domain %s not covered: %+v", d.Name, d)
+		}
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	for _, img := range []string{pfImgA, pfImgB} {
+		if n := api.statusCalls[img]; n != 1 {
+			t.Errorf("status calls for %s = %d, want the one of the ensure: no poll", img, n)
+		}
+	}
+}
+
+// PW-43: fail waits, then makes no WarmImage call for an image whose golden
+// is not ready. Its pairs are short, an image with a ready golden is warmed,
+// and the error wraps ErrGoldenNotReady.
+func TestPreflightGoldenPolicyFail(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenFail = map[string]string{pfImgB: "GoldenActorCrashed: boom"}
+	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) { o.Golden = GoldenPolicyFail })
+	if !errors.Is(err, ErrGoldenNotReady) || !strings.Contains(err.Error(), "1 goldens not ready") {
+		t.Fatalf("Run error = %v, want ErrGoldenNotReady with the shortfall", err)
+	}
+	if got := warmedImages(api); !slices.Equal(got, []string{pfImgA}) {
+		t.Errorf("warm calls = %v, want the image with a ready golden only", got)
+	}
+	for _, d := range report.Domains {
+		for _, ic := range d.Images {
+			switch ic.Image {
+			case pfImgA:
+				if !ic.Complete || ic.Probes == 0 {
+					t.Errorf("%s in %s = %+v, want warmed", ic.Image, d.Name, ic)
+				}
+			case pfImgB:
+				if ic.Complete || ic.Probes != 0 || ic.Error != "golden not ready" {
+					t.Errorf("%s in %s = %+v, want short, unprobed, golden not ready", ic.Image, d.Name, ic)
+				}
+			}
+		}
+	}
+
+	// A golden that is still pending after the wait is not ready either.
+	api = newPreflightFake()
+	api.goldenReadyAfter = 1 << 20
+	_, err, _ = runPreflight(t, api, func(o *PreflightOptions) {
+		o.Golden = GoldenPolicyFail
+		o.GoldenTimeout = 5 * time.Millisecond
+	})
+	if !errors.Is(err, ErrGoldenNotReady) || len(warmedImages(api)) != 0 {
+		t.Errorf("pending goldens: err = %v, warm calls = %v; want ErrGoldenNotReady and no call", err, warmedImages(api))
+	}
+
+	// With each golden ready, fail is a clean pass.
+	api = newPreflightFake()
+	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) { o.Golden = GoldenPolicyFail })
+	if err != nil || !report.Complete {
+		t.Errorf("ready goldens: err = %v, complete = %v; want a complete pass", err, report.Complete)
 	}
 }

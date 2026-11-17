@@ -196,7 +196,9 @@ class GoldenRecord:
     """One image's derived template and golden snapshot after the pre-flight.
 
     ``state`` is ``ready``, ``none`` (goldens are disabled on the base
-    template), ``failed``, or ``pending`` when the warmer gave up waiting.
+    template), ``failed``, or ``pending``: the golden was still baking when the
+    warmer gave up waiting, or the warmer did not wait for it (``golden_wait=False``;
+    ``error`` is then ``golden not waited for``).
     """
 
     image: str
@@ -248,8 +250,9 @@ class DomainCoverage:
 class PreflightCoverage:
     """What a pre-flight did for a plan: ``preflight-coverage.json``.
 
-    ``complete`` is True when every golden the warmer waited for is ready (or
-    none by design) and every (image, domain) pair reached its node count.
+    ``complete`` is True when every golden is ready (or none by design) and
+    every (image, domain) pair reached its node count. A golden that the warmer
+    did not wait for (``golden_wait=False``) and that is still baking makes it False.
     """
 
     run_id: str

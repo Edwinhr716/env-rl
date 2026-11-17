@@ -52,6 +52,9 @@ What maps, and what does not:
   INFO log names each set field that is ignored. ``adopt_existing=True`` and
   ``run_isolation`` other than ``"none"`` change what a run creates; ate-env
   cannot honour them, thus they raise.
+- ``FleetConfig.preflight`` is an ate-env-only field: it maps to
+  ``ate_env_rl.FleetConfig.preflight``, and ``SandboxFleet.run`` then puts
+  the tasks' images on the nodes before its first pass.
 """
 
 from __future__ import annotations
@@ -238,6 +241,10 @@ class FleetConfig(BaseModel):
     node_ephemeral_gb: float | None = None
     disk_headroom: float = 0.25
     cluster_nodes: int | None = None
+    # ate-env only: warm the loaded tasks' images on the nodes their
+    # environments can land on, before the first pass of run()
+    # (ate_env_rl.FleetConfig.preflight).
+    preflight: bool = False
 
     @field_validator("max_concurrent", "max_warmpool_size")
     @classmethod
@@ -394,6 +401,7 @@ class FleetConfig(BaseModel):
             acquire_timeout_s=float(self.ready_timeout),
             ready_timeout_s=float(self.ready_timeout),
             run_id=self.run_id,
+            preflight=self.preflight,
             auth_token=AteSecretStr(token) if token else None,
             observability=AteObservabilityConfig(**observability),
         )
