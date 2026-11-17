@@ -1,6 +1,6 @@
 # Interface contracts: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-16 against `9fed77fc`. The snapshot schema in the next
+Status: accepted (#223); last checked 2026-11-16 against `a12f48a0`. The snapshot schema in the next
 section is code since pull request 1 (#226, `internal/inventory`): its object kinds, field names and
 rules are fixed, and a change to them is a schema change. The names in the other sections (bucket
 layout, reporter flags and identity, event stream and tables, collector pipelines, site routes and
@@ -169,7 +169,10 @@ vocabulary as the event stream; `worker` and `name` of workers are opaque contro
 parsed; a label or selector key that names a credential (`token`, `password`, `authorization`,
 `secret`, `credential`, in any letter case) is refused by both validators, and the reporter leaves
 such a key out. Substrate's actors carry no labels at the version `go.mod` requires, so
-`actors[].labels` stays empty until they do.
+`actors[].labels` stays empty until they do. The environment labels of
+[environment-metadata.md](../ate-env-api/environment-metadata.md) are a second possible source: its
+store is merged (#407), its label field on `CreateEnvironment` is not, and no pull request of this
+plan reads the store.
 
 ## Reporter, `cmd/ate-env-reporter`
 
@@ -185,8 +188,8 @@ such a key out. Substrate's actors carry no labels at the version `go.mod` requi
 | `-health-listen-addr`               | `:9091`                                 | `/healthz`, and `/readyz`, which answers 200 while the last tick wrote its snapshot                                                               |
 
 Not in pull request 2: `-enable-tracing` and `-metrics-listen-addr` with
-`ate_env_reporter_poll_duration_seconds{status}`. They come with the telemetry manifests (pull
-request 3), where a scrape configuration exists; see [decisions.md](./decisions.md).
+`ate_env_reporter_poll_duration_seconds{status}`. They are pull request 2c, with a `PodMonitoring`
+for the reporter; pull request 3 stayed the manifests. See [decisions.md](./decisions.md).
 
 Identity (pull request 2b, `ate-env manifest reporter`): Kubernetes ServiceAccount
 `ate-env-reporter` in namespace `ate-env-reporter` labeled `ate.dev/api-access=true`; projected

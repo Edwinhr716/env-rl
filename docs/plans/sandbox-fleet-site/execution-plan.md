@@ -1,10 +1,10 @@
 # Execution plan: sandbox fleet site
 
-Status: accepted (#223); pull requests 1, 2 and 2b merged (#226, #348, #349); pull requests 3 and 4
-are the telemetry manifests and the site's first pages. Last checked 2026-11-16 against `9fed77fc`.
-Design: [README.md](./README.md). Contracts: [interfaces.md](./interfaces.md). Done when every
-criterion in [acceptance-criteria.md](./acceptance-criteria.md) passes on two clusters in two
-projects and the pull requests below are merged.
+Status: accepted (#223); pull requests 1, 2, 2b, 3 and 4 merged (#226, #348, #349, #415, #416); pull
+requests 2c, 5, 6 and 7 are not started. Last checked 2026-11-16 against `a12f48a0`. Design:
+[README.md](./README.md). Contracts: [interfaces.md](./interfaces.md). Done when every criterion in
+[acceptance-criteria.md](./acceptance-criteria.md) passes on two clusters in two projects and the
+pull requests below are merged.
 
 ## Where the code lives
 
@@ -43,6 +43,7 @@ Phases 2, 3 and 4 run in parallel after phase 1.
 | 1   | `internal/inventory`: the snapshot schema, JSON tags, a golden file                                                                                                                                                                                                                     | small  |
 | 2   | `cmd/ate-env-reporter` and `internal/reporter`: poll loop, atomic writes, health endpoint, `-bucket` and `-out-dir`, tests against `fakecontrol` extended with `ListAtespaces`, `ListActorTemplates` and `ListTags`, schema additions `workers[].labels` and `actors[].worker_selector` | medium |
 | 2b  | `ate-env manifest reporter` (ServiceAccount, ClusterRole, Deployment, the global `viewer` binding to merge) and the Kind end-to-end step (FS-14)                                                                                                                                        | small  |
+| 2c  | The reporter's `-enable-tracing` and `-metrics-listen-addr`, `ate_env_reporter_poll_duration_seconds{status}` with its section in `docs/metrics.md`, and a `PodMonitoring` for the reporter                                                                                             | small  |
 | 3   | `ate-env manifest collector` (collector Deployment, traces to Cloud Trace and the bucket) and `ate-env manifest --pod-monitoring`                                                                                                                                                       | small  |
 | 4   | `cmd/ate-env-fleet-site`: HTTP server, IAP verification, GCS and BigQuery readers, Fleet and Cluster pages, JSON API                                                                                                                                                                    | large  |
 | 5   | Actor and Live pages, PromQL proxy, Runs page (the Cloud Trace link of a trainer run comes from the trace ids in its `spans.jsonl`; FS-11 lists how a run folder is produced with `RunReport.write`, `build_report.py` and one copy, so no trainer-side code is in scope)               | medium |

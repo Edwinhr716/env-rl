@@ -2,8 +2,8 @@
 
 Status: accepted plan (#223); pull requests 1, 2 and 2b (`internal/inventory`, the reporter and its
 manifest) merged as #226, #348 and #349; pull requests 3 and 4, the telemetry manifests and the site
-with the Fleet and Cluster pages, in review. Last checked 2026-11-16 against
-`ai-on-gke/sandboxenv-rl` at `9fed77fc` and the Substrate `go.mod` requires, `274605f1`; the audit
+with the Fleet and Cluster pages, merged as #415 and #416. Last checked 2026-11-16 against
+`ai-on-gke/sandboxenv-rl` at `a12f48a0` and the Substrate `go.mod` requires, `274605f1`; the audit
 is in [research.md](./research.md), which first read `3b03b03` and `28520c0d` on 2026-10-30. The
 decisions taken so far are in [decisions.md](./decisions.md). Companions: [prd.md](./prd.md),
 [execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
@@ -133,8 +133,9 @@ Run this before each pull request of the plan and when `main` moves; record the 
 section of [research.md](./research.md) and update the last-checked line above (FS-13).
 
 1. RPCs and fields: `grep -E '^\s*rpc ' proto/ateenv/v1alpha/env.proto` and the `Environment`
-   message. The plan assumes no RPC enumerates environments; a list or watch call changes the
-   reporter.
+   message. `ListEnvironments` (#392) reads one page of one atespace per call through `ate-env-api`,
+   and the reporter lists every atespace at once through `ateapi`. A call that lists across
+   atespaces, or a watch call, changes the reporter.
 2. Substrate, at the version `go.mod` requires: `ListActors` with an empty atespace lists across
    atespaces and pages at 1000; `Control` has no `Batch*` or `stream` RPC; the actor event names in
    `internal/actorevent` are `ate.actor.state_changed`, `ate.actor.crashed` and

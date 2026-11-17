@@ -215,3 +215,14 @@ Append-only. Each entry: date, who, what, why.
   time from the bucket, not the reporter's clock, when the store has one. The events route has its
   own limit, 1 request a second per user, burst 5, because each request is a BigQuery job; the
   reader follows the result's page tokens up to 1000 rows.
+- 2026-11-16, orchestrator: pull requests 3 and 4 merged as #415 and #416. Drift check against
+  `main` at `a12f48a0` (research.md, "Audit of main, 2026-11-16, after pull requests 3 and 4
+  merged"). The seven steps hold. Step 1 of the README's drift check no longer says that no RPC
+  enumerates environments, because `ListEnvironments` (#392) does, one atespace page per call; the
+  step now watches for a call that lists across atespaces or a watch call.
+- 2026-11-16, orchestrator: the reporter's tracing and metrics, which the entry of 2026-11-16 on
+  pull request 3 made a pull request of their own, are row 2c of the execution plan's table.
+- 2026-11-16, orchestrator: the environment labels of
+  `docs/plans/ate-env-api/environment-metadata.md` (#391, store in #407) are recorded in
+  `interfaces.md` as a possible source for `actors[].labels`. No pull request of this plan reads the
+  store; the field stays empty.

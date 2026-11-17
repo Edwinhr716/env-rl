@@ -260,6 +260,27 @@ Pull request 3 is rebased onto `9fed77fc`. What moved since `66b0e526`:
 6. `cmd/benchmarking/bench/bundle.go` is unchanged.
 7. `FS-` is used by this plan only.
 
+## Audit of main, 2026-11-16, after pull requests 3 and 4 merged
+
+Checked against `ai-on-gke/sandboxenv-rl` at `a12f48a0`. Pull requests 3 and 4 are on `main` as #415
+(`f548c13b`) and #416 (`b4d69141`). What moved since `9fed77fc`:
+
+1. `env.proto` is unchanged: ten RPCs, and `ListEnvironments` reads one page of one atespace per
+   call. The README's step 1 now states that, in place of "no RPC enumerates environments".
+2. The Substrate `go.mod` requires is unchanged, `274605f1f2a8`. `google.golang.org/api` moved from
+   an indirect to a direct requirement at the same version, because the site imports it (#416).
+3. `internal/inventory` is unchanged; the golden file equals the example of `interfaces.md`, and
+   `go test ./internal/inventory/` passes.
+4. `docs/metrics.md` is unchanged.
+5. `ate-env manifest` has `collector` and `--pod-monitoring` (#415) next to the flags of step 5.
+6. `cmd/benchmarking/bench/bundle.go` is unchanged.
+7. `FS-` is used by this plan only.
+
+The environment-metadata plan (#391) is on `main` with its store (#407). It gives environments
+labels once its create field lands; `interfaces.md` names that as a possible source for
+`actors[].labels`. `deploy/fleet-site/` and `docs/fleet-site.md` do not exist yet; they are pull
+request 6.
+
 ## Sources
 
 - Substrate: `docs/observability.md`, `internal/actorevent/actorevent.go`,
