@@ -593,6 +593,30 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 		// is a mistake.
 		return fmt.Errorf("-golden must be %s, %s or %s, got %q", swebench.GoldenPolicyWait, swebench.GoldenPolicySkip, swebench.GoldenPolicyFail, *golden)
 	}
+	// The warmer reads a zero knob as its default. A flag set to zero or
+	// less is a mistake, and run -preflight refuses it too.
+	for _, knob := range []struct {
+		name  string
+		value int
+	}{{"probes-per-node", *probesPerNode}, {"max-rounds", *maxRounds}, {"image-concurrency", *imageConc}} {
+		if knob.value < 1 {
+			return fmt.Errorf("-%s must be at least 1, got %d", knob.name, knob.value)
+		}
+	}
+	for _, knob := range []struct {
+		name  string
+		value time.Duration
+	}{{"probe-timeout", *probeTimeout}, {"golden-timeout", *goldenTimeout}, {"golden-poll", *goldenPoll}} {
+		if knob.value <= 0 {
+			return fmt.Errorf("-%s must be positive, got %s", knob.name, knob.value)
+		}
+	}
+	// The upper bounds are the warmer's own, as for run -preflight. They are
+	// checked here too, before the plan and the token are read and the API
+	// is dialed.
+	if err := swebench.ValidatePreflightKnobs(*probesPerNode, *maxRounds, *golden); err != nil {
+		return err
+	}
 	placement, err := swebench.ReadImagePlacement(*plan)
 	if err != nil {
 		return err

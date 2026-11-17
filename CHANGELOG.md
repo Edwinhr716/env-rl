@@ -7,6 +7,13 @@ user needs to know across them.
 ## Unreleased
 
 ### Changed
+- `swebench-loader preflight` refuses `-probes-per-node`, `-max-rounds` or
+  `-image-concurrency` below 1, and a `-probe-timeout`, `-golden-timeout` or
+  `-golden-poll` that is not positive. Until now it ran such a pass with the
+  default of that knob and did not say so; `run -preflight` already refuses
+  its `-preflight-*` knobs the same way. A value above the range (more than
+  8 probes per node, more than 10 rounds) is now refused with the other flag
+  checks, before the command reads the plan or the token.
 - `ate-env manifest` and `ate-env manifest template`: validate existing
   template, WorkerPool and namespace flags up front instead of printing objects
   with empty or invalid names. Both commands refuse an explicit empty or

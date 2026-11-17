@@ -2,10 +2,10 @@
 
 Status: describes `main` at `ea1f160d`. `PW-1` to `PW-38` are met on `main`; each names the pull
 request that met it and the tests that check it. `PW-39` to `PW-43` are met by #405, `PW-46` by
-#406, and `PW-48` to `PW-51` by #420. #405, #406 and #427 (the test of `PW-6` for the limit of 256
-probes) were merged into the branch of #404 and reach `main` with it. `PW-44`, `PW-45` and `PW-47`
-are open; their tests do not exist yet, and the pull request that meets a row adds its tests and
-marks it met. The plan is in [README.md](./README.md); issue #205.
+#406, `PW-48` to `PW-51` by #420, and `PW-52` by #436. #405, #406 and #427 (the test of `PW-6` for
+the limit of 256 probes) were merged into the branch of #404 and reach `main` with it. `PW-44`,
+`PW-45` and `PW-47` are open; their tests do not exist yet, and the pull request that meets a row
+adds its tests and marks it met. The plan is in [README.md](./README.md); issue #205.
 
 ## Scope
 
@@ -136,6 +136,7 @@ Tests: `internal/benchmarking/swebench/preflight_test.go`;
 | PW-41 | `preflight -golden <policy>` and `run -preflight-golden <policy>` take `wait`, `skip` or `fail`. `wait` is the default and is the behavior of `PW-19`: an image is probed after its golden settles or the wait gives up, whether or not the golden is ready.                                                                                                                                                                                                                             | met by #405 | `TestPreflightGoldenPolicyWait`                                                                                                                                                                         |
 | PW-42 | With `skip`, the pass does not wait for a golden that is still pending after its template is ensured: it probes the image at once, records the golden as `pending` with the error `golden not waited for`, and the coverage is not complete.                                                                                                                                                                                                                                             | met by #405 | `TestPreflightGoldenPolicySkip`, `TestPreflightCmdGoldenPolicy`                                                                                                                                         |
 | PW-43 | With `fail`, the pass waits as with `wait`, and makes no `WarmImage` call for an image whose golden is not ready after the wait: each of its pairs is short with the error `golden not ready`. `run -preflight` then ends with an error before the first task, after it wrote the coverage file. An image whose golden is ready is warmed.                                                                                                                                               | met by #405 | `TestPreflightGoldenPolicyFail`, `TestRunCmdPreflightGoldenFailEndsTheRun`                                                                                                                              |
+| PW-52 | `swebench-loader preflight` refuses `-probes-per-node`, `-max-rounds` or `-image-concurrency` below 1, and a `-probe-timeout`, `-golden-timeout` or `-golden-poll` that is not positive, as `run -preflight` refuses its knobs (`PW-40`), and a `-probes-per-node` or `-max-rounds` above the limit of `ate-env-api`. Each refusal comes before the command reads the plan or the token, or creates a file.                                                                              | met by #436 | `TestPreflightCmdRefusesAKnobBelowItsRange`                                                                                                                                                             |
 
 ## Open: one warmer for the integrations (plan row 26)
 

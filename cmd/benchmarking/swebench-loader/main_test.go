@@ -1787,6 +1787,51 @@ func TestPreflightCmdRefusesAnUnknownGoldenBeforeAuth(t *testing.T) {
 	}
 }
 
+// PW-52: the preflight subcommand refuses a knob of zero or less, as run
+// -preflight does, before it reads the plan, reads the token or creates a
+// file.
+func TestPreflightCmdRefusesAKnobBelowItsRange(t *testing.T) {
+	dir, _, plan, warmer := preflightRunFixture(t)
+	// The refusals run with no backend, and with a plan and a token file
+	// that do not exist: a check that moved below the read of one of them
+	// fails on the missing file, not on the flag.
+	testPreflightBackend = nil
+	t.Cleanup(func() { testPreflightBackend = nil })
+	noPlan := filepath.Join(dir, "no-such-plan.json")
+	noToken := filepath.Join(dir, "no-such-token")
+	for _, tc := range []struct {
+		flag, value, want string
+	}{
+		{"-probes-per-node", "0", "-probes-per-node must be at least 1, got 0"},
+		{"-probes-per-node", "-1", "-probes-per-node must be at least 1, got -1"},
+		{"-max-rounds", "0", "-max-rounds must be at least 1, got 0"},
+		{"-image-concurrency", "0", "-image-concurrency must be at least 1, got 0"},
+		{"-probe-timeout", "0s", "-probe-timeout must be positive, got 0s"},
+		{"-golden-timeout", "-1s", "-golden-timeout must be positive, got -1s"},
+		{"-golden-poll", "0s", "-golden-poll must be positive, got 0s"},
+		// Above the range: the warmer's limits, read before the plan too.
+		{"-probes-per-node", "9", "preflight: 9 probes per node exceed the 8 ate-env-api takes"},
+		{"-max-rounds", "11", "preflight: 11 rounds exceed the 10 ate-env-api takes"},
+	} {
+		events := filepath.Join(dir, strings.TrimPrefix(tc.flag, "-")+tc.value)
+		var stderr bytes.Buffer
+		err := preflightCmd([]string{"-plan", noPlan, "-auth-token-file", noToken, "-events-dir", events, tc.flag, tc.value}, &stderr)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("preflight %s %s: err = %v, want %q", tc.flag, tc.value, err, tc.want)
+		}
+		if _, err := os.Stat(events); err == nil {
+			t.Errorf("preflight %s %s: the refused pass created %s", tc.flag, tc.value, events)
+		}
+	}
+	// The lowest value of each knob runs, on the fixture's plan and backend.
+	testPreflightBackend = warmer
+	var stderr bytes.Buffer
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", filepath.Join(dir, "ok"), "-probes-per-node", "1", "-max-rounds", "1",
+		"-image-concurrency", "1", "-probe-timeout", "1s", "-golden-timeout", "1s", "-golden-poll", "1ms"}, &stderr); err != nil {
+		t.Errorf("preflight with each knob at its lowest value: %v", err)
+	}
+}
+
 // TestPreflightVerdict covers what run -preflight does with the pass's
 // outcome; the cancel that lands after the pass returned without an error
 // cannot be timed through runCmd.
