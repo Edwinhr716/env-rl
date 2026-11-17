@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -40,6 +41,7 @@ import (
 
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	"github.com/agent-substrate/env/internal/benchmarking/swebench"
+	"pgregory.net/rapid"
 )
 
 func TestResolveAuthToken(t *testing.T) {
@@ -798,6 +800,17 @@ type fakeWarmer struct {
 	failDeletes int
 	// pending leaves every golden baking for the whole pass.
 	pending bool
+	// readyOnPoll settles a pending golden on the first ImageStatus poll.
+	readyOnPoll bool
+	// settleAfterPolls, when > 0, settles a pending golden once ImageStatus has
+	// been called that many times.
+	settleAfterPolls int
+	polls            int
+	// onWarm, when set, runs inside WarmImage while inFlight counts concurrent
+	// calls, so tests can observe -image-concurrency.
+	onWarm      func(inFlight int)
+	inFlight    int
+	maxInFlight int
 	// calls keeps the options of each WarmImage call.
 	calls []swebench.WarmOptions
 }
@@ -860,26 +873,47 @@ func (f *fakeWarmer) EnsureImageTemplate(ctx context.Context, _ string) (swebenc
 }
 
 func (f *fakeWarmer) ImageStatus(ctx context.Context, image string) (swebench.ImageState, error) {
+	f.mu.Lock()
+	f.polls++
+	if f.readyOnPoll || (f.settleAfterPolls > 0 && f.polls >= f.settleAfterPolls) {
+		f.pending = false
+	}
+	f.mu.Unlock()
 	return f.EnsureImageTemplate(ctx, image)
 }
 
 // WarmImage covers the domain's two nodes in one round, as ate-env-api's
 // does, and reports the probes it "deleted".
-func (f *fakeWarmer) WarmImage(_ context.Context, _ string, opts swebench.WarmOptions, onProbe func(swebench.WarmProbe)) (swebench.WarmCoverage, error) {
+func (f *fakeWarmer) WarmImage(_ context.Context, image string, opts swebench.WarmOptions, onProbe func(swebench.WarmProbe)) (swebench.WarmCoverage, error) {
 	domain := opts.WorkerSelector["ate-env/domain"]
+	countKey := domain + "/" + image
 	f.mu.Lock()
 	f.calls = append(f.calls, opts)
+	f.inFlight++
+	cur := f.inFlight
+	if cur > f.maxInFlight {
+		f.maxInFlight = cur
+	}
+	hookWarm := f.onWarm
 	f.mu.Unlock()
+	if hookWarm != nil {
+		hookWarm(cur)
+	}
+	defer func() {
+		f.mu.Lock()
+		f.inFlight--
+		f.mu.Unlock()
+	}()
 	cov := swebench.WarmCoverage{Wanted: opts.Nodes, Rounds: 1}
 	seen := map[string]bool{}
 	for k := 0; k < opts.Nodes*opts.ProbesPerNode; k++ {
 		id := fmt.Sprintf("%s-1-%d", opts.RunID, k)
 		f.mu.Lock()
-		node := fmt.Sprintf("node-%s-%d", domain, f.counter[domain]%2)
+		node := fmt.Sprintf("node-%s-%d", domain, f.counter[countKey]%2)
 		if f.short {
 			node = fmt.Sprintf("node-%s-0", domain)
 		}
-		f.counter[domain]++
+		f.counter[countKey]++
 		f.nodes[id] = node
 		f.mu.Unlock()
 		seen[node] = true
@@ -1805,10 +1839,15 @@ func TestPreflightCmdRefusesAKnobBelowItsRange(t *testing.T) {
 		{"-probes-per-node", "0", "-probes-per-node must be at least 1, got 0"},
 		{"-probes-per-node", "-1", "-probes-per-node must be at least 1, got -1"},
 		{"-max-rounds", "0", "-max-rounds must be at least 1, got 0"},
+		{"-max-rounds", "-1", "-max-rounds must be at least 1, got -1"},
 		{"-image-concurrency", "0", "-image-concurrency must be at least 1, got 0"},
+		{"-image-concurrency", "-1", "-image-concurrency must be at least 1, got -1"},
 		{"-probe-timeout", "0s", "-probe-timeout must be positive, got 0s"},
+		{"-probe-timeout", "-1ns", "-probe-timeout must be positive, got -1ns"},
+		{"-golden-timeout", "0s", "-golden-timeout must be positive, got 0s"},
 		{"-golden-timeout", "-1s", "-golden-timeout must be positive, got -1s"},
 		{"-golden-poll", "0s", "-golden-poll must be positive, got 0s"},
+		{"-golden-poll", "-1ns", "-golden-poll must be positive, got -1ns"},
 		// Above the range: the warmer's limits, read before the plan too.
 		{"-probes-per-node", "9", "preflight: 9 probes per node exceed the 8 ate-env-api takes"},
 		{"-max-rounds", "11", "preflight: 11 rounds exceed the 10 ate-env-api takes"},
@@ -1823,13 +1862,389 @@ func TestPreflightCmdRefusesAKnobBelowItsRange(t *testing.T) {
 			t.Errorf("preflight %s %s: the refused pass created %s", tc.flag, tc.value, events)
 		}
 	}
-	// The lowest value of each knob runs, on the fixture's plan and backend.
+	// The lowest and highest values of the bounded knobs run and reach the
+	// warmer on the fixture's plan and backend.
 	testPreflightBackend = warmer
 	var stderr bytes.Buffer
-	if err := preflightCmd([]string{"-plan", plan, "-events-dir", filepath.Join(dir, "ok"), "-probes-per-node", "1", "-max-rounds", "1",
-		"-image-concurrency", "1", "-probe-timeout", "1s", "-golden-timeout", "1s", "-golden-poll", "1ms"}, &stderr); err != nil {
-		t.Errorf("preflight with each knob at its lowest value: %v", err)
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", filepath.Join(dir, "min"), "-probes-per-node", "1", "-max-rounds", "1",
+		"-image-concurrency", "1", "-probe-timeout", "1ns", "-golden-timeout", "1ns", "-golden-poll", "1ns"}, &stderr); err != nil {
+		t.Fatalf("preflight with each knob at its lowest value: %v", err)
 	}
+	if len(warmer.calls) != 1 || warmer.calls[0].ProbesPerNode != 1 || warmer.calls[0].MaxRounds != 1 || warmer.calls[0].ProbeTimeout != time.Nanosecond {
+		t.Errorf("lowest-knob call = %+v, want 1 probe/node, 1 round, 1ns timeout", warmer.calls)
+	}
+	warmer.calls = nil
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", filepath.Join(dir, "max"), "-probes-per-node", "8", "-max-rounds", "10",
+		"-image-concurrency", "4", "-probe-timeout", "50ms", "-golden-timeout", "50ms", "-golden-poll", "1ms"}, &stderr); err != nil {
+		t.Fatalf("preflight with probes and rounds at their upper bounds: %v", err)
+	}
+	if len(warmer.calls) != 1 || warmer.calls[0].ProbesPerNode != 8 || warmer.calls[0].MaxRounds != 10 || warmer.calls[0].ProbeTimeout != 50*time.Millisecond {
+		t.Errorf("upper-bound call = %+v, want 8 probes/node, 10 rounds, 50ms timeout", warmer.calls)
+	}
+
+	// -golden-timeout, -golden-poll and -image-concurrency reach the warmer.
+	warmer.pending = true
+	warmer.calls = nil
+	timeoutEvents := filepath.Join(dir, "golden-timeout")
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", timeoutEvents, "-golden-timeout", "20ms", "-golden-poll", "1h"}, &stderr); err == nil {
+		t.Errorf("preflight with a stalled golden: got nil error, want incomplete coverage")
+	}
+	if cov, err := swebench.ReadPreflightCoverage(filepath.Join(timeoutEvents, "preflight-coverage.json")); err != nil || len(cov.Goldens) != 1 || !strings.Contains(cov.Goldens[0].Error, "still pending after 20ms") {
+		t.Errorf("coverage = %+v, err = %v; want golden pending after 20ms", cov, err)
+	}
+	warmer.pending = true
+	warmer.readyOnPoll = true
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", filepath.Join(dir, "golden-poll"), "-golden-timeout", "1h", "-golden-poll", "5ms"}, &stderr); err != nil {
+		t.Errorf("preflight -golden-poll 5ms: %v", err)
+	}
+	warmer.readyOnPoll = false
+	warmer.pending = false
+
+	twoImgPlan := filepath.Join(dir, "two-images.json")
+	imgA := "registry.example/swebench/a@sha256:" + strings.Repeat("a", 64)
+	imgB := "registry.example/swebench/b@sha256:" + strings.Repeat("b", 64)
+	if err := os.WriteFile(twoImgPlan, []byte(`{"schema_version":"v1","unpack_factor":1,"replication":1,
+		"domains":[{"name":"d0","selector":{"ate-env/domain":"d0"},"nodes":2,"node_cache_bytes":0,"assigned_bytes":2,"image_count":2}],
+		"images":[{"image":"`+imgA+`","domains":["d0"],"bytes_compressed":1,"bytes_unpacked":1},
+		{"image":"`+imgB+`","domains":["d0"],"bytes_compressed":1,"bytes_unpacked":1}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bothIn := make(chan struct{})
+	var bothOnce sync.Once
+	warmer.inFlight, warmer.maxInFlight = 0, 0
+	warmer.onWarm = func(cur int) {
+		if cur >= 2 {
+			bothOnce.Do(func() { close(bothIn) })
+			return
+		}
+		select {
+		case <-bothIn:
+		case <-time.After(time.Second):
+		}
+	}
+	if err := preflightCmd([]string{"-plan", twoImgPlan, "-events-dir", filepath.Join(dir, "conc-2"), "-image-concurrency", "2"}, &stderr); err != nil {
+		t.Fatalf("preflight -image-concurrency 2: %v", err)
+	}
+	if warmer.maxInFlight != 2 {
+		t.Errorf("maxInFlight with -image-concurrency 2 = %d, want 2", warmer.maxInFlight)
+	}
+	warmer.inFlight, warmer.maxInFlight = 0, 0
+	warmer.onWarm = func(int) {
+		for range 128 {
+			runtime.Gosched()
+		}
+	}
+	if err := preflightCmd([]string{"-plan", twoImgPlan, "-events-dir", filepath.Join(dir, "conc-1"), "-image-concurrency", "1"}, &stderr); err != nil {
+		t.Fatalf("preflight -image-concurrency 1: %v", err)
+	}
+	warmer.onWarm = nil
+	if warmer.maxInFlight != 1 {
+		t.Errorf("maxInFlight with -image-concurrency 1 = %d, want 1", warmer.maxInFlight)
+	}
+}
+
+// PW-52, PW-40, PW-41: property over the full knob space of swebench-loader
+// preflight. A tuple is accepted iff probes-per-node is in [1, 8], max-rounds
+// in [1, 10], image-concurrency >= 1, all three durations > 0, and -golden is
+// wait, skip or fail. Rejected tuples fail with an error naming the rejected
+// flag and value before the plan or auth token file is read and create no
+// files under any output flag mode (including default CWD coverage with -out);
+// accepted tuples forward all knobs to the warmer; and the five shared knobs
+// agree with run -preflight -dry-run.
+func TestPropPreflightCmdKnobs(t *testing.T) {
+	dir, manifest, plan, warmer := preflightRunFixture(t)
+	cwd := filepath.Join(dir, "cwd")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cwd)
+
+	imgA := "registry.example/swebench/a@sha256:" + strings.Repeat("a", 64)
+	imgB := "registry.example/swebench/b@sha256:" + strings.Repeat("b", 64)
+	twoImgDataset := filepath.Join(dir, "two-dataset.jsonl")
+	if err := os.WriteFile(twoImgDataset, []byte(
+		`{"instance_id":"i1","image":"`+imgA+`"}`+"\n"+
+			`{"instance_id":"i2","image":"`+imgB+`"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = manifest
+	twoImgPlan := filepath.Join(dir, "two-images.json")
+	if err := os.WriteFile(twoImgPlan, []byte(`{"schema_version":"v1","unpack_factor":1,"replication":1,
+		"domains":[{"name":"d0","selector":{"ate-env/domain":"d0"},"nodes":2,"node_cache_bytes":0,"assigned_bytes":2,"image_count":2}],
+		"images":[{"image":"`+imgA+`","domains":["d0"],"bytes_compressed":1,"bytes_unpacked":1},
+		{"image":"`+imgB+`","domains":["d0"],"bytes_compressed":1,"bytes_unpacked":1}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	noPlan := filepath.Join(dir, "no-such-plan.json")
+	noToken := filepath.Join(dir, "no-such-token")
+	t.Cleanup(func() {
+		warmer.onWarm = nil
+		warmer.settleAfterPolls = 0
+		warmer.pending = false
+		testPreflightBackend = nil
+	})
+
+	validProbes := rapid.OneOf(rapid.SampledFrom([]int{1, 8}), rapid.IntRange(1, 8))
+	badProbes := rapid.OneOf(rapid.Just(0), rapid.IntRange(-100, -1), rapid.Just(9), rapid.IntRange(9, 100))
+	validRounds := rapid.OneOf(rapid.SampledFrom([]int{1, 10}), rapid.IntRange(1, 10))
+	badRounds := rapid.OneOf(rapid.Just(0), rapid.IntRange(-100, -1), rapid.Just(11), rapid.IntRange(11, 100))
+	validConc := rapid.OneOf(rapid.SampledFrom([]int{1, 2, 16}), rapid.IntRange(1, 16))
+	badConc := rapid.OneOf(rapid.Just(0), rapid.IntRange(-100, -1))
+	validDur := rapid.OneOf(
+		rapid.SampledFrom([]time.Duration{time.Nanosecond, time.Microsecond, time.Millisecond, 2 * time.Millisecond, time.Second}),
+		rapid.Custom(func(rt *rapid.T) time.Duration {
+			return time.Duration(rapid.Int64Range(1, int64(time.Minute)).Draw(rt, "pos_ns"))
+		}),
+	)
+	badDur := rapid.OneOf(
+		rapid.Just(time.Duration(0)),
+		rapid.SampledFrom([]time.Duration{-time.Nanosecond, -time.Millisecond, -time.Second}),
+		rapid.Custom(func(rt *rapid.T) time.Duration {
+			return time.Duration(rapid.Int64Range(-int64(time.Hour), -1).Draw(rt, "neg_ns"))
+		}),
+	)
+	validGolden := rapid.SampledFrom([]string{swebench.GoldenPolicyWait, swebench.GoldenPolicySkip, swebench.GoldenPolicyFail})
+	badGolden := rapid.OneOf(
+		rapid.SampledFrom([]string{"", "never", "WAIT", "SKIP", "FAIL", " wait", "wait "}),
+		rapid.StringMatching(`^[A-Z][a-zA-Z]{0,5}$`),
+	)
+
+	caseSeq := 0
+	rapid.Check(t, func(rt *rapid.T) {
+		caseSeq++
+		shape := rapid.SampledFrom([]string{"valid", "one_bad", "any"}).Draw(rt, "shape")
+
+		var (
+			probes     int
+			rounds     int
+			conc       int
+			probeTO    time.Duration
+			goldenTO   time.Duration
+			poll       time.Duration
+			golden     string
+			wantErrSub string
+		)
+		switch shape {
+		case "valid":
+			probes = validProbes.Draw(rt, "probes")
+			rounds = validRounds.Draw(rt, "rounds")
+			conc = validConc.Draw(rt, "conc")
+			probeTO = validDur.Draw(rt, "probeTimeout")
+			goldenTO = validDur.Draw(rt, "goldenTimeout")
+			poll = validDur.Draw(rt, "goldenPoll")
+			golden = validGolden.Draw(rt, "golden")
+		case "one_bad":
+			probes = validProbes.Draw(rt, "probes")
+			rounds = validRounds.Draw(rt, "rounds")
+			conc = validConc.Draw(rt, "conc")
+			probeTO = validDur.Draw(rt, "probeTimeout")
+			goldenTO = validDur.Draw(rt, "goldenTimeout")
+			poll = validDur.Draw(rt, "goldenPoll")
+			golden = validGolden.Draw(rt, "golden")
+			switch rapid.SampledFrom([]string{"probes", "rounds", "conc", "probeTimeout", "goldenTimeout", "goldenPoll", "golden"}).Draw(rt, "badKnob") {
+			case "probes":
+				probes = badProbes.Draw(rt, "badProbes")
+				if probes < 1 {
+					wantErrSub = fmt.Sprintf("-probes-per-node must be at least 1, got %d", probes)
+				} else {
+					wantErrSub = fmt.Sprintf("preflight: %d probes per node exceed the 8 ate-env-api takes", probes)
+				}
+			case "rounds":
+				rounds = badRounds.Draw(rt, "badRounds")
+				if rounds < 1 {
+					wantErrSub = fmt.Sprintf("-max-rounds must be at least 1, got %d", rounds)
+				} else {
+					wantErrSub = fmt.Sprintf("preflight: %d rounds exceed the 10 ate-env-api takes", rounds)
+				}
+			case "conc":
+				conc = badConc.Draw(rt, "badConc")
+				wantErrSub = fmt.Sprintf("-image-concurrency must be at least 1, got %d", conc)
+			case "probeTimeout":
+				probeTO = badDur.Draw(rt, "badProbeTimeout")
+				wantErrSub = fmt.Sprintf("-probe-timeout must be positive, got %s", probeTO)
+			case "goldenTimeout":
+				goldenTO = badDur.Draw(rt, "badGoldenTimeout")
+				wantErrSub = fmt.Sprintf("-golden-timeout must be positive, got %s", goldenTO)
+			case "goldenPoll":
+				poll = badDur.Draw(rt, "badGoldenPoll")
+				wantErrSub = fmt.Sprintf("-golden-poll must be positive, got %s", poll)
+			case "golden":
+				golden = badGolden.Draw(rt, "badGolden")
+				wantErrSub = fmt.Sprintf("-golden must be wait, skip or fail, got %q", golden)
+			}
+		default:
+			probes = rapid.OneOf(validProbes, badProbes).Draw(rt, "probes")
+			rounds = rapid.OneOf(validRounds, badRounds).Draw(rt, "rounds")
+			conc = rapid.OneOf(validConc, badConc).Draw(rt, "conc")
+			probeTO = rapid.OneOf(validDur, badDur).Draw(rt, "probeTimeout")
+			goldenTO = rapid.OneOf(validDur, badDur).Draw(rt, "goldenTimeout")
+			poll = rapid.OneOf(validDur, badDur).Draw(rt, "goldenPoll")
+			golden = rapid.OneOf(validGolden, badGolden).Draw(rt, "golden")
+		}
+
+		outMode := rapid.SampledFrom([]string{"events-dir", "events-subdir", "out-files", "out-only"}).Draw(rt, "outMode")
+		sub := filepath.Join(dir, fmt.Sprintf("prop-%d", caseSeq))
+		cwdCov := filepath.Join(cwd, "preflight-coverage.json")
+		var outFlags []string
+		var covPath string
+		switch outMode {
+		case "events-dir":
+			evDir := filepath.Join(sub, "run")
+			outFlags = []string{"-events-dir", evDir}
+			covPath = filepath.Join(evDir, "preflight-coverage.json")
+		case "events-subdir":
+			outFlags = []string{"-events-dir", filepath.Join(sub, "events")}
+			covPath = filepath.Join(sub, "preflight-coverage.json")
+		case "out-files":
+			covPath = filepath.Join(sub, "cov.json")
+			outFlags = []string{"-out", filepath.Join(sub, "pf.jsonl"), "-coverage-out", covPath}
+		default:
+			covPath = cwdCov
+			outFlags = []string{"-out", filepath.Join(sub, "pf.jsonl")}
+		}
+
+		knobFlags := []string{
+			"-probes-per-node", fmt.Sprint(probes),
+			"-max-rounds", fmt.Sprint(rounds),
+			"-image-concurrency", fmt.Sprint(conc),
+			"-probe-timeout", probeTO.String(),
+			"-golden-timeout", goldenTO.String(),
+			"-golden-poll", poll.String(),
+			"-golden", golden,
+		}
+
+		policyOK := golden == swebench.GoldenPolicyWait || golden == swebench.GoldenPolicySkip || golden == swebench.GoldenPolicyFail
+		wantValid := policyOK &&
+			probes >= 1 && probes <= 8 &&
+			rounds >= 1 && rounds <= 10 &&
+			conc >= 1 &&
+			probeTO > 0 && goldenTO > 0 && poll > 0
+
+		var stderr bytes.Buffer
+		if !wantValid {
+			testPreflightBackend = nil
+			args := append([]string{"-plan", noPlan, "-auth-token-file", noToken}, append(outFlags, knobFlags...)...)
+			err := preflightCmd(args, &stderr)
+			if err == nil {
+				rt.Fatalf("invalid knobs accepted: %v", args)
+			}
+			if strings.Contains(err.Error(), "no-such-plan") || strings.Contains(err.Error(), "no-such-token") {
+				rt.Fatalf("invalid knobs read plan or token before refusing (%v): %v", args, err)
+			}
+			if wantErrSub != "" && !strings.Contains(err.Error(), wantErrSub) {
+				rt.Fatalf("err = %q, want substring %q (args=%v)", err.Error(), wantErrSub, args)
+			}
+			if _, statErr := os.Stat(sub); !errors.Is(statErr, os.ErrNotExist) {
+				rt.Fatalf("refused pass created %s (stat err = %v)", sub, statErr)
+			}
+			if _, statErr := os.Stat(cwdCov); !errors.Is(statErr, os.ErrNotExist) {
+				rt.Fatalf("refused pass created %s in working directory", cwdCov)
+			}
+		} else {
+			warmer.pending = false
+			warmer.settleAfterPolls = 0
+			warmer.calls = nil
+			warmer.inFlight, warmer.maxInFlight = 0, 0
+			bothIn := make(chan struct{})
+			var bothOnce sync.Once
+			if conc >= 2 {
+				warmer.onWarm = func(cur int) {
+					if cur >= 2 {
+						bothOnce.Do(func() { close(bothIn) })
+						return
+					}
+					select {
+					case <-bothIn:
+					case <-time.After(time.Second):
+					}
+				}
+			} else {
+				warmer.onWarm = func(int) {
+					for range 128 {
+						runtime.Gosched()
+					}
+				}
+			}
+			testPreflightBackend = warmer
+			args := append([]string{"-plan", twoImgPlan}, append(outFlags, knobFlags...)...)
+			err := preflightCmd(args, &stderr)
+			warmer.onWarm = nil
+			if err != nil {
+				rt.Fatalf("valid knobs rejected (%v): %v", args, err)
+			}
+			if len(warmer.calls) != 2 {
+				rt.Fatalf("warm calls = %d, want 2", len(warmer.calls))
+			}
+			for _, got := range warmer.calls {
+				if got.ProbesPerNode != probes || got.MaxRounds != rounds || got.ProbeTimeout != probeTO {
+					rt.Fatalf("warm call = %+v, want probes=%d rounds=%d probeTimeout=%s", got, probes, rounds, probeTO)
+				}
+			}
+			wantInFlight := min(conc, 2)
+			if warmer.maxInFlight != wantInFlight {
+				rt.Fatalf("maxInFlight = %d, want %d (conc=%d)", warmer.maxInFlight, wantInFlight, conc)
+			}
+			if cov, cerr := swebench.ReadPreflightCoverage(covPath); cerr != nil || cov.Validate() != nil || !cov.Complete {
+				rt.Fatalf("coverage at %s: cov=%+v err=%v", covPath, cov, cerr)
+			}
+			if outMode == "out-only" {
+				if err := os.Remove(cwdCov); err != nil {
+					rt.Fatal(err)
+				}
+			}
+
+			// Verify -golden-timeout reaches the warmer on short valid timeouts:
+			// with settleAfterPolls=2 and poll >= 2ms, a <= 1ms timeout gives up
+			// before the second poll settles the golden.
+			if golden != swebench.GoldenPolicySkip && goldenTO <= time.Millisecond && poll >= 2*time.Millisecond && poll <= 10*time.Millisecond {
+				pendDir := filepath.Join(dir, fmt.Sprintf("pend-%d", caseSeq))
+				warmer.pending = true
+				warmer.polls = 0
+				warmer.settleAfterPolls = 2
+				pArgs := append([]string{"-plan", plan, "-events-dir", pendDir}, knobFlags...)
+				pErr := preflightCmd(pArgs, &stderr)
+				warmer.settleAfterPolls = 0
+				warmer.pending = false
+				if pErr == nil {
+					rt.Fatalf("stalled golden with -golden-timeout %s settled ready (args=%v)", goldenTO, pArgs)
+				}
+				pCov, cerr := swebench.ReadPreflightCoverage(filepath.Join(pendDir, "preflight-coverage.json"))
+				if cerr != nil || len(pCov.Goldens) == 0 || !strings.Contains(pCov.Goldens[0].Error, "still pending after "+goldenTO.String()) {
+					rt.Fatalf("pending coverage = %+v err = %v, want golden pending after %s", pCov, cerr, goldenTO)
+				}
+			}
+		}
+
+		// Differential parity with run -preflight on the five shared knobs.
+		if conc >= 1 && poll > 0 {
+			runSub := filepath.Join(dir, fmt.Sprintf("run-%d", caseSeq))
+			runArgs := []string{
+				"-dataset", twoImgDataset, "-mode", "eval", "-width", "1", "-trajectory", "workload-file-read-one", "-run-id", "pf-par",
+				"-events-dir", runSub, "-placement", twoImgPlan, "-dry-run", "-preflight",
+				"-preflight-probes-per-node", fmt.Sprint(probes),
+				"-preflight-max-rounds", fmt.Sprint(rounds),
+				"-preflight-probe-timeout", probeTO.String(),
+				"-preflight-golden-timeout", goldenTO.String(),
+				"-preflight-golden", golden,
+			}
+			if !wantValid {
+				runArgs = append(runArgs, "-auth-token-file", noToken)
+			}
+			runErr := runCmd(runArgs)
+			if (runErr == nil) != wantValid {
+				rt.Fatalf("run -preflight parity mismatch (wantValid=%v): runErr=%v args=%v", wantValid, runErr, runArgs)
+			}
+			if !wantValid {
+				if strings.Contains(runErr.Error(), "no-such-token") {
+					rt.Fatalf("run -preflight read -auth-token-file before refusing (%v): %v", runArgs, runErr)
+				}
+				if _, statErr := os.Stat(runSub); !errors.Is(statErr, os.ErrNotExist) {
+					rt.Fatalf("refused run -preflight created %s (stat err = %v)", runSub, statErr)
+				}
+			}
+		}
+	})
 }
 
 // TestPreflightVerdict covers what run -preflight does with the pass's
