@@ -7,6 +7,14 @@ user needs to know across them.
 ## Unreleased
 
 ### Changed
+- `ate-env manifest` and `ate-env manifest template`: validate existing
+  template, WorkerPool and namespace flags up front instead of printing objects
+  with empty or invalid names. Both commands refuse an explicit empty or
+  whitespace `--template` or `--workerpool` and a `--workerpool` outside
+  DNS-1123 subdomain syntax. `ate-env manifest` also refuses a `--namespace`
+  outside DNS-1123 label syntax and a negative `--replicas`. `--node-selector`
+  splits on commas directly and does not parse CSV-quoted entries (e.g.
+  `--node-selector='"a=1","b=2"'` is refused with an invalid key error).
 - Harbor provider: `ate-env-harbor` accepts Harbor 0.26 next to 0.25
   (`harbor>=0.25,<0.27`). On 0.26, `preflight` passes the job's `--ek` kwargs
   to Harbor's base hook, and refuses an `api_url` or `api_token` kwarg that
@@ -44,6 +52,18 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `ate-env manifest --domains N`, `--node-selector key=value` and
+  `ate-env manifest workerpool` (with `--domain-offset`): render one
+  `WorkerPool` per placement domain (`<workerpool>-d0` .. `<workerpool>-d<N-1>`,
+  `1 <= N <= 10000`) sharing `ate-env/workerpool=<workerpool>` in
+  `metadata.labels` so one base `ActorTemplate` selects every domain and bakes
+  one shared golden snapshot per image, while setting `ate-env/domain=d<i>` in
+  `metadata.labels` and `spec.template.nodeSelector`. `ate-env manifest
+  workerpool` prints `WorkerPool` manifests alone and advances `--domain-offset`
+  (`offset + domains <= 10000`) across heterogeneous node pools.
+  `--node-selector` refuses `ate-env/domain` and empty entries. Per-domain
+  `WorkerPool` objects are a client-side workaround while Substrate's
+  `WorkerPoolSyncer` copies only `WorkerPool` labels onto `Worker.labels`.
 - `swebench-loader run -preflight` takes the pre-flight's knobs:
   `-preflight-probes-per-node`, `-preflight-max-rounds`,
   `-preflight-probe-timeout`, `-preflight-golden-timeout` and

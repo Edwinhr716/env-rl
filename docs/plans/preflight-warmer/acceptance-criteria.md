@@ -1,11 +1,11 @@
 # PreflightWarmer: acceptance criteria
 
 Status: describes `main` at `ea1f160d`. `PW-1` to `PW-38` are met on `main`; each names the pull
-request that met it and the tests that check it. `PW-39` to `PW-43` are met by #405, and `PW-46` by
-#406; the two pull requests, and #427 (the test of `PW-6` for the limit of 256 probes), were merged
-into the branch of #404 and reach `main` with it. `PW-44`, `PW-45` and `PW-47` are open; their tests
-do not exist yet, and the pull request that meets a row adds its tests and marks it met. The plan is
-in [README.md](./README.md); issue #205.
+request that met it and the tests that check it. `PW-39` to `PW-43` are met by #405, `PW-46` by
+#406, and `PW-48` to `PW-51` by #420. #405, #406 and #427 (the test of `PW-6` for the limit of 256
+probes) were merged into the branch of #404 and reach `main` with it. `PW-44`, `PW-45` and `PW-47`
+are open; their tests do not exist yet, and the pull request that meets a row adds its tests and
+marks it met. The plan is in [README.md](./README.md); issue #205.
 
 ## Scope
 
@@ -15,6 +15,8 @@ boot does not pull and unpack the image. This file covers:
 - `ListPlacementDomains` and `WarmImage` of `ate-env-api`
   ([internal/apiservice/placement.go](../../../internal/apiservice/placement.go)) and their
   `ate-env` commands;
+- `ate-env manifest --domains`, `--node-selector` and `ate-env manifest workerpool`
+  ([cmd/ate-env/manifest.go](../../../cmd/ate-env/manifest.go));
 - the planner and the warmer of `swebench-loader`
   ([internal/benchmarking/swebench/preflight_plan.go](../../../internal/benchmarking/swebench/preflight_plan.go),
   [preflight.go](../../../internal/benchmarking/swebench/preflight.go)), the `run` flags
@@ -148,3 +150,14 @@ Tests: `internal/benchmarking/swebench/preflight_test.go`;
 | ID    | Criterion                                                                                                                                                                                                                                                                                                                                              | Status | Tests                                    |
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------ | ---------------------------------------- |
 | PW-47 | A run on the C4 bench cluster, with and without the pre-flight on the same manifest, is recorded under `docs/benchmarks/`: first-boot `ttfi` p50 and p95, `oci_unpack_ms` and `download_ms` of the first boots (target: 0 for at least 99 % of them after a complete pre-flight), the moved-wake share, and the wall time and probe count of the pass. | open   | record only (no test); needs the cluster |
+
+## Domain `WorkerPool` manifests: `ate-env manifest` (plan row 9)
+
+Tests: `cmd/ate-env/manifest_test.go`.
+
+| ID    | Criterion                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Status      | Tests                                                                                                             |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------- |
+| PW-48 | `ate-env manifest --domains N` (`1 <= N <= 10000`) renders `WorkerPool` `<workerpool>-d0` through `<workerpool>-d<N-1>`. Each pool sets `ate-env/workerpool=<workerpool>` and `ate-env/domain=d<i>` in `metadata.labels`, leaves `spec.template.labels` empty so `WorkerPoolSyncer` copies both labels onto `Worker.labels` and one base `ActorTemplate` selects every domain, sets `spec.replicas` to `--replicas`, and sets `ate-env/domain=d<i>` in `spec.template.nodeSelector`. Omitting `--domains` keeps one pool.                                                                                                                         | met by #420 | `TestManifestCommandDomainsAndNodeSelector`, `TestBuildManifestsWithDomainsAndNodeSelector`, `TestBuildManifests` |
+| PW-49 | `--node-selector key=value` on `ate-env manifest` and `ate-env manifest workerpool` sets `spec.template.nodeSelector` on each rendered `WorkerPool`, merged with `ate-env/domain=d<i>` when `--domains` is set.                                                                                                                                                                                                                                                                                                                                                                                                                                   | met by #420 | `TestManifestCommandDomainsAndNodeSelector`, `TestBuildManifestsWithDomainsAndNodeSelector`                       |
+| PW-50 | `ate-env manifest workerpool` prints `WorkerPool` manifests alone, and `--domain-offset` advances the starting domain index (`d<offset>` through `d<offset+N-1>`, `offset + N <= 10000`) so heterogeneous node pools share one `ate-env/workerpool` label with distinct replica counts and node selectors.                                                                                                                                                                                                                                                                                                                                        | met by #420 | `TestManifestWorkerPoolSubcommandAndHeterogeneousOffsets`                                                         |
+| PW-51 | `ate-env manifest` and `ate-env manifest workerpool` refuse `--domains` outside `1` to `10000`, `--domain-offset` without `--domains` or below `0`, `offset + domains` above `10000`, `<workerpool>-d<last>` longer than 63 characters, non-DNS-1123 `--namespace` or `--workerpool`, negative `--replicas`, empty or whitespace `--template` or `--workerpool` (both also refused alongside non-DNS-1123 `--workerpool` on `manifest template`), empty `--node-selector` entries (including repeated or trailing-comma occurrences), invalid or duplicate `--node-selector` entries, and `--node-selector` setting `ate-env/domain` in any mode. | met by #420 | `TestManifestDomainsAndNodeSelectorValidation`                                                                    |

@@ -258,6 +258,10 @@ func newCreateCommand() *cobra.Command {
 // must carry. A key given twice is an error, whatever the values: a
 // selector has one value per key, and a repeat is a typo to surface.
 func parseWorkerSelector(items []string) (map[string]string, error) {
+	return parseLabelSelector("--worker-selector", items)
+}
+
+func parseLabelSelector(flagName string, items []string) (map[string]string, error) {
 	if len(items) == 0 {
 		return nil, nil
 	}
@@ -265,10 +269,10 @@ func parseWorkerSelector(items []string) (map[string]string, error) {
 	for _, item := range items {
 		key, value, ok := strings.Cut(item, "=")
 		if !ok || key == "" {
-			return nil, fmt.Errorf("--worker-selector %q: want key=value", item)
+			return nil, fmt.Errorf("%s %q: want key=value", flagName, item)
 		}
 		if prev, dup := selector[key]; dup {
-			return nil, fmt.Errorf("--worker-selector %s is given twice (%q and %q)", key, prev, value)
+			return nil, fmt.Errorf("%s %s is given twice (%q and %q)", flagName, key, prev, value)
 		}
 		selector[key] = value
 	}

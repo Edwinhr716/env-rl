@@ -694,6 +694,65 @@ To look at the snapshots of a reporter run with `--out-dir` on your machine:
 go run ./cmd/ate-env-fleet-site -dir /tmp/snap -insecure-no-iap -listen 127.0.0.1:8080
 ```
 
+### 6. Optional: placement-domain WorkerPools
+
+Substrate's `WorkerPoolSyncer` copies only `WorkerPool` `metadata.labels` onto `Worker.labels` and
+ignores node identity, so addressing individual nodes or small node groups through
+`CreateEnvironmentRequest.worker_selector` (`ate-env create --worker-selector`,
+`swebench-loader run -placement`, `FleetConfig.placement`) requires one `WorkerPool` per placement
+domain as a client-side workaround:
+
+1. Label each worker node with its domain (one node per domain avoids multi-node probe amplification
+   during `WarmImage`). Set N at or below the number of labeled nodes, because a domain pool whose
+   `ate-env/domain=d<i>` label is on no node leaves its worker pods `Pending`. Re-apply the label if
+   GKE replaces a node, because the replacement VM starts without it:
+
+   ```bash
+   kubectl label node <node> ate-env/domain=d0 --overwrite
+   ```
+
+2. Render N domain `WorkerPool` objects with `ate-env manifest --domains N` (or add pools across
+   heterogeneous node pools with `ate-env manifest workerpool` and `--domain-offset`). Each pool
+   keeps `ate-env/workerpool=<workerpool>` in `metadata.labels` so one base `ActorTemplate` selects
+   every domain and bakes one shared golden snapshot per image, while setting `ate-env/domain=d<i>`
+   in `metadata.labels` and `spec.template.nodeSelector`:
+
+   ```bash
+   ate-env manifest \
+     --api-image    <registry>/ate-env-api@sha256:<digest> \
+     --worker-image <registry>/ateworker-gvisor@sha256:<digest> \
+     --domains 32 \
+     --replicas 16 | kubectl apply -f -
+   ```
+
+   For heterogeneous node pools sharing one base template:
+
+   ```bash
+   ate-env manifest workerpool --workerpool default-template-workerpool \
+     --worker-image <registry>/ateworker-gvisor@sha256:<digest> \
+     --domains 51 --replicas 32 --node-selector cloud.google.com/gke-nodepool=big-workers | kubectl apply -f -
+   ate-env manifest workerpool --workerpool default-template-workerpool \
+     --worker-image <registry>/ateworker-gvisor@sha256:<digest> \
+     --domains 300 --domain-offset 51 --replicas 8 --node-selector cloud.google.com/gke-nodepool=fast-workers | kubectl apply -f -
+   ```
+
+   Give each `ate-env manifest workerpool` tier a disjoint `d<offset>..d<offset+N-1>` range
+   (`offset + N <= 10000`). Overlapping ranges emit the same `<workerpool>-d<i>` names, so a second
+   `kubectl apply` replaces the overlapping pools.
+
+3. If an earlier install created the single shared `WorkerPool` `<workerpool>`, delete it with
+   `kubectl delete workerpool <workerpool> -n <namespace>` (or pass a new `--workerpool` name and
+   register the base template on it). `kubectl apply` of `--domains N` leaves the old `<workerpool>`
+   object in place, and `ListPlacementDomains` then sees `<workerpool>` as an extra multi-node
+   domain whose selector also matches the domain pools' workers.
+
+4. Grant `ate-env-api` the global `viewer` role (`ate-env manifest access-policy --global`, merged
+   into the global policy as shown in section 3 above) so `ListPlacementDomains` and `WarmImage` can
+   read worker node counts, then list the domains with `ate-env placement-domains`. Note that
+   `bench spinup` and `bench spindown` patch one `WorkerPool` by name (`default-template-workerpool`
+   by default), which does not exist when `--domains` names the pools `<workerpool>-d0` through
+   `<workerpool>-d<N-1>`.
+
 ## CLI
 
 File operations and remote command execution take the environment ID first, followed by the operation:
@@ -747,8 +806,9 @@ Use "ate-env [command] --help" for more information about a command.
 $ ate-env manifest --help
 Manifest generates Kubernetes manifests for everything environments need on
 a cluster that already runs the Agent Substrate system: the target
-namespace, a WorkerPool of pre-warmed workers, and the ate-env-api service.
-It prints YAML to stdout without touching the cluster; apply it with kubectl.
+namespace, a WorkerPool of pre-warmed workers (or one WorkerPool per
+placement domain with --domains), and the ate-env-api service. It prints
+YAML to stdout without touching the cluster; apply it with kubectl.
 
 ate-env-api requires a bearer token from its callers, read from the Secret
 --auth-token-secret names (key token). Create that Secret once, in the
@@ -757,7 +817,9 @@ namespace this manifest creates, with
 the Secret exists. --insecure-no-auth deploys without the token.
 
 To generate the Substrate ActorTemplate manifest (for kubectl-ate), use
-the "template" subcommand: ate-env manifest template
+the "template" subcommand: ate-env manifest template. To render WorkerPool
+manifests alone (for example, additional node pools), use:
+ate-env manifest workerpool
 
 Usage:
   ate-env manifest [flags]
@@ -769,6 +831,7 @@ Available Commands:
   collector     Generate the manifests of the fleet telemetry collector
   reporter      Generate the manifests of ate-env-reporter, the fleet inventory reporter
   template      Generate Substrate ActorTemplate manifest
+  workerpool    Generate Substrate WorkerPool manifest(s)
 
 Flags:
       --api-allowed-hosts strings       extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed
@@ -778,18 +841,20 @@ Flags:
       --api-router-tls                  mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve (default true)
       --ateom-image string              alias for --worker-image, kept from before Substrate renamed ateom to ateworker
       --auth-token-secret string        Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret' (default "ate-env-api-token")
+      --domains int                     number of placement-domain WorkerPools to render instead of one shared pool (ate-env/domain=d0..d<n-1>, each with --replicas workers and matching spec.template.nodeSelector)
       --enable-tracing                  run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC
       --environment-metadata            let ate-env-api keep the labels and the deadline of an environment, which Substrate has no field for, in one ConfigMap for each such environment in its namespace (--environment-store=configmaps). This gives ate-env-api what it does not have by default: the Kubernetes API token in its pod, and a Role to list, watch, create and delete the ConfigMaps of the namespace. Limits: docs/security/threat-model.md
   -h, --help                            help for manifest
       --insecure-no-auth                deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports
       --metrics-port int32              port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as "metrics" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check
       --namespace string                Kubernetes namespace to deploy into (default "ate-env")
+      --node-selector strings           node label a worker pod's node must carry (spec.template.nodeSelector), key=value; repeat the flag or separate with commas
       --otlp-endpoint string            OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317
       --otlp-insecure                   set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext
       --pod-monitoring                  add a PodMonitoring (monitoring.googleapis.com/v1) that has Google Cloud Managed Service for Prometheus scrape the metrics port every 5s; needs --metrics-port and Managed Prometheus on the cluster. The pod keeps its prometheus.io annotations, so a cluster that also runs an annotation-based scraper scrapes the port twice
       --port-proxy-atespaces string     comma-separated atespaces whose environments ate-env-api's port proxy forwards to, or * for any (defaults to ate-env)
       --port-proxy-host-suffix string   domain of two labels or more that turns on the hostname form of ate-env-api's port proxy: <port>-<id>.<domain> and <port>-<id>.<atespace>.<domain> reach an environment port; the manifest renders no Ingress, DNS record or certificate for it (off when empty)
-      --replicas int32                  number of pre-warmed worker pods (default 5)
+      --replicas int32                  number of pre-warmed worker pods (per domain pool when --domains is set) (default 5)
       --template string                 ActorTemplate name (default "default-template")
       --worker-image string             digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
       --workerpool string               WorkerPool name (defaults to <template>-workerpool)

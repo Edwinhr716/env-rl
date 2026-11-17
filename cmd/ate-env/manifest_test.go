@@ -811,6 +811,24 @@ func TestManifestTemplateSelectsTheNamedPool(t *testing.T) {
 	}
 }
 
+func TestManifestTemplateTrimsNames(t *testing.T) {
+	cmd := newManifestCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"template", "--template", "  trimmed-template  ", "--workerpool", "  trimmed-pool  ",
+		"--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/p/"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "name: trimmed-template\n") {
+		t.Errorf("template name not trimmed:\n%s", s)
+	}
+	if !strings.Contains(s, "ate-env/workerpool: trimmed-pool\n") {
+		t.Errorf("workerpool name not trimmed in selector:\n%s", s)
+	}
+}
+
 func TestWorkerPoolNameMustFitALabelValue(t *testing.T) {
 	long := strings.Repeat("t", 53) // 53 + len("-workerpool") = 64
 	for _, args := range [][]string{
@@ -1799,5 +1817,422 @@ func TestManifestPodMonitoringNeedsMetricsPort(t *testing.T) {
 	_, err := runManifest(t, "--pod-monitoring")
 	if err == nil || !strings.Contains(err.Error(), "--metrics-port") {
 		t.Errorf("err = %v, want one that asks for --metrics-port", err)
+	}
+}
+
+// PW-48, PW-49 (docs/plans/preflight-warmer/acceptance-criteria.md): running
+// `ate-env manifest` with --domains and --node-selector wires both flags into
+// the rendered WorkerPool objects alongside the Namespace and ate-env-api.
+func TestManifestCommandDomainsAndNodeSelector(t *testing.T) {
+	out, err := runManifest(t, "--domains=3", "--replicas=8", "--node-selector=a=b")
+	if err != nil {
+		t.Fatalf("manifest --domains=3 --node-selector=a=b: %v", err)
+	}
+	docs := strings.Split(strings.TrimSpace(out), "\n---\n")
+	if len(docs) != 7 {
+		t.Fatalf("got %d YAML documents, want 7 (Namespace + 3 WorkerPools + ServiceAccount + Deployment + Service)", len(docs))
+	}
+	for i := range 3 {
+		dom := "d" + string(rune('0'+i))
+		var pool atev1.WorkerPool
+		if err := yaml.Unmarshal([]byte(docs[1+i]), &pool); err != nil {
+			t.Fatalf("unmarshal pool[%d]: %v\n%s", i, err, docs[1+i])
+		}
+		wantName := "default-template-workerpool-" + dom
+		if pool.Kind != "WorkerPool" || pool.Name != wantName {
+			t.Errorf("pool[%d] = %s/%s, want WorkerPool/%s", i, pool.Kind, pool.Name, wantName)
+		}
+		if pool.Spec.Replicas != 8 {
+			t.Errorf("pool[%d] replicas = %d, want 8", i, pool.Spec.Replicas)
+		}
+		if len(pool.Labels) != 2 || pool.Labels[workerPoolLabel] != "default-template-workerpool" || pool.Labels[domainLabel] != dom {
+			t.Errorf("pool[%d] labels = %v, want %s=default-template-workerpool and %s=%s",
+				i, pool.Labels, workerPoolLabel, domainLabel, dom)
+		}
+		if pool.Spec.Template == nil || len(pool.Spec.Template.Labels) != 0 {
+			t.Fatalf("pool[%d] spec.template = %+v, want non-nil with empty labels", i, pool.Spec.Template)
+		}
+		gotSel := pool.Spec.Template.NodeSelector
+		if len(gotSel) != 2 || gotSel["a"] != "b" || gotSel[domainLabel] != dom {
+			t.Errorf("pool[%d] nodeSelector = %v, want a=b and %s=%s", i, gotSel, domainLabel, dom)
+		}
+	}
+}
+
+// PW-48, PW-49 (docs/plans/preflight-warmer/acceptance-criteria.md): --domains
+// renders one WorkerPool per placement domain sharing ate-env/workerpool and
+// carrying ate-env/domain in metadata.labels and spec.template.nodeSelector.
+// --node-selector sets spec.template.nodeSelector.
+func TestBuildManifestsWithDomainsAndNodeSelector(t *testing.T) {
+	// Single pool with --node-selector clones the map and keeps metadata.labels
+	// to ate-env/workerpool alone.
+	single := testManifestConfig()
+	callerSel := map[string]string{"ate-env/role": "sandbox-worker"}
+	single.nodeSelector = callerSel
+	singlePool := buildWorkerPool(single)
+	callerSel["ate-env/role"] = "mutated"
+	if got := singlePool.Spec.Template.NodeSelector; len(got) != 1 || got["ate-env/role"] != "sandbox-worker" {
+		t.Fatalf("single pool nodeSelector = %v, want ate-env/role=sandbox-worker", got)
+	}
+	if _, hasDomain := singlePool.Labels[domainLabel]; hasDomain {
+		t.Errorf("single pool labels = %v, want no %s", singlePool.Labels, domainLabel)
+	}
+
+	cfg := testManifestConfig()
+	cfg.domains = 3
+	cfg.replicas = 8
+	cfg.nodeSelector = map[string]string{"ate-env/role": "sandbox-worker"}
+	objs := buildManifests(cfg)
+	// Namespace + 3 WorkerPools + ServiceAccount + Deployment + Service = 7.
+	if len(objs) != 7 {
+		t.Fatalf("got %d manifests, want 7", len(objs))
+	}
+	baseSel := buildActorTemplate(testTemplateConfig()).GetWorkerSelector().GetMatchLabels()
+	for i := range 3 {
+		dom := "d" + string(rune('0'+i))
+		pool, ok := objs[1+i].(*atev1.WorkerPool)
+		if !ok {
+			t.Fatalf("objs[%d] = %T, want *atev1.WorkerPool", 1+i, objs[1+i])
+		}
+		wantName := "default-template-workerpool-" + dom
+		if pool.Name != wantName {
+			t.Errorf("pool[%d] name = %q, want %q", i, pool.Name, wantName)
+		}
+		if pool.Spec.Replicas != 8 {
+			t.Errorf("pool[%d] replicas = %d, want 8", i, pool.Spec.Replicas)
+		}
+		// WorkerPoolSyncer copies metadata.labels onto Worker.labels and
+		// ignores spec.template.labels. Both workerPoolLabel and domainLabel
+		// belong here.
+		if len(pool.Labels) != 2 || pool.Labels[workerPoolLabel] != "default-template-workerpool" || pool.Labels[domainLabel] != dom {
+			t.Errorf("pool[%d] metadata.labels = %v, want %s=default-template-workerpool and %s=%s",
+				i, pool.Labels, workerPoolLabel, domainLabel, dom)
+		}
+		for k, v := range baseSel {
+			if pool.Labels[k] != v {
+				t.Errorf("base template selector %v does not match pool[%d] labels %v", baseSel, i, pool.Labels)
+			}
+		}
+		if pool.Spec.Template == nil {
+			t.Fatalf("pool[%d] spec.template = nil, want nodeSelector", i)
+		}
+		if len(pool.Spec.Template.Labels) != 0 {
+			t.Errorf("pool[%d] spec.template.labels = %v, want empty", i, pool.Spec.Template.Labels)
+		}
+		wantNodeSel := map[string]string{
+			"ate-env/role": "sandbox-worker",
+			domainLabel:    dom,
+		}
+		if got := pool.Spec.Template.NodeSelector; len(got) != 2 || got["ate-env/role"] != wantNodeSel["ate-env/role"] || got[domainLabel] != dom {
+			t.Errorf("pool[%d] nodeSelector = %v, want %v", i, got, wantNodeSel)
+		}
+	}
+	if _, ok := objs[4].(*corev1.ServiceAccount); !ok {
+		t.Errorf("objs[4] = %T, want *corev1.ServiceAccount after the 3 pools", objs[4])
+	}
+}
+
+// PW-50 (docs/plans/preflight-warmer/acceptance-criteria.md): `ate-env manifest
+// workerpool` prints WorkerPool objects alone and composes across heterogeneous
+// node pools with --domain-offset under one shared ate-env/workerpool label.
+func TestManifestWorkerPoolSubcommandAndHeterogeneousOffsets(t *testing.T) {
+	// Single pool without --domains omits spec.template when --node-selector is unset.
+	cmd := newManifestCommand()
+	var singleOut bytes.Buffer
+	cmd.SetOut(&singleOut)
+	cmd.SetArgs([]string{
+		"workerpool",
+		"--worker-image=example.com/worker@sha256:bbbb",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("manifest workerpool: %v", err)
+	}
+	if strings.Contains(singleOut.String(), "kind: Deployment") || strings.Contains(singleOut.String(), "kind: Namespace") {
+		t.Fatalf("workerpool printed non-WorkerPool objects:\n%s", singleOut.String())
+	}
+	var singlePool atev1.WorkerPool
+	if err := yaml.Unmarshal(singleOut.Bytes(), &singlePool); err != nil {
+		t.Fatalf("unmarshal single workerpool: %v", err)
+	}
+	if singlePool.Kind != "WorkerPool" || singlePool.Name != "default-template-workerpool" || singlePool.Spec.Template != nil {
+		t.Errorf("single workerpool = %+v, want default-template-workerpool with nil spec.template", singlePool)
+	}
+
+	// Heterogeneous two-tier setup sharing fast-base-workerpool:
+	// tier 1 = d0..d1 (32 replicas on big-workers), tier 2 = d2..d4 (8 replicas on fast-workers).
+	runTier := func(extra ...string) []*atev1.WorkerPool {
+		t.Helper()
+		c := newManifestCommand()
+		var buf bytes.Buffer
+		c.SetOut(&buf)
+		args := append([]string{
+			"workerpool",
+			"--workerpool=fast-base-workerpool",
+			"--worker-image=example.com/worker@sha256:bbbb",
+		}, extra...)
+		c.SetArgs(args)
+		if err := c.Execute(); err != nil {
+			t.Fatalf("workerpool %v: %v", extra, err)
+		}
+		docs := strings.Split(strings.TrimSpace(buf.String()), "\n---\n")
+		pools := make([]*atev1.WorkerPool, len(docs))
+		for i, doc := range docs {
+			var p atev1.WorkerPool
+			if err := yaml.Unmarshal([]byte(doc), &p); err != nil {
+				t.Fatalf("unmarshal doc %d: %v\n%s", i, err, doc)
+			}
+			pools[i] = &p
+		}
+		return pools
+	}
+
+	big := runTier("--domains=2", "--replicas=32", "--node-selector=cloud.google.com/gke-nodepool=big-workers")
+	fast := runTier("--domains=3", "--domain-offset=2", "--replicas=8", "--node-selector=cloud.google.com/gke-nodepool=fast-workers")
+	all := append(big, fast...)
+	if len(all) != 5 {
+		t.Fatalf("got %d total pools, want 5", len(all))
+	}
+	wantDomains := []string{"d0", "d1", "d2", "d3", "d4"}
+	wantReplicas := []int32{32, 32, 8, 8, 8}
+	wantNodePool := []string{"big-workers", "big-workers", "fast-workers", "fast-workers", "fast-workers"}
+	for i, p := range all {
+		if p.Name != "fast-base-workerpool-"+wantDomains[i] {
+			t.Errorf("pool[%d] name = %q, want fast-base-workerpool-%s", i, p.Name, wantDomains[i])
+		}
+		if p.Labels[workerPoolLabel] != "fast-base-workerpool" || p.Labels[domainLabel] != wantDomains[i] {
+			t.Errorf("pool[%d] labels = %v, want shared fast-base-workerpool and domain %s", i, p.Labels, wantDomains[i])
+		}
+		if p.Spec.Replicas != wantReplicas[i] {
+			t.Errorf("pool[%d] replicas = %d, want %d", i, p.Spec.Replicas, wantReplicas[i])
+		}
+		gotNS := p.Spec.Template.NodeSelector
+		if gotNS["cloud.google.com/gke-nodepool"] != wantNodePool[i] || gotNS[domainLabel] != wantDomains[i] {
+			t.Errorf("pool[%d] nodeSelector = %v, want gke-nodepool=%s and %s=%s",
+				i, gotNS, wantNodePool[i], domainLabel, wantDomains[i])
+		}
+	}
+}
+
+// PW-51 (docs/plans/preflight-warmer/acceptance-criteria.md): flag and label
+// validation on `ate-env manifest`, `ate-env manifest workerpool` and
+// `ate-env manifest template`.
+func TestManifestDomainsAndNodeSelectorValidation(t *testing.T) {
+	pool60 := strings.Repeat("p", 60) // 60 + len("-d9") = 63 fits; 60 + len("-d10") = 64 overflows ate.dev/worker-pool
+	cmdOK := newManifestCommand()
+	cmdOK.SetOut(&bytes.Buffer{})
+	cmdOK.SetArgs([]string{
+		"workerpool",
+		"--workerpool=" + pool60,
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--domains=10",
+	})
+	if err := cmdOK.Execute(); err != nil {
+		t.Fatalf("63-char domain pool name rejected: %v", err)
+	}
+
+	// Accepted upper bounds: --domains=10000 (d0..d9999) and offset+domains == 10000.
+	cmdMax := newManifestCommand()
+	var maxOut bytes.Buffer
+	cmdMax.SetOut(&maxOut)
+	cmdMax.SetArgs([]string{
+		"workerpool",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--domains=10000",
+	})
+	if err := cmdMax.Execute(); err != nil {
+		t.Fatalf("--domains=10000 rejected: %v", err)
+	}
+	if got := strings.Count(maxOut.String(), "\nkind: WorkerPool\n"); got != 10000 {
+		t.Fatalf("--domains=10000 rendered %d pools, want 10000", got)
+	}
+
+	cmdMaxOffset := newManifestCommand()
+	var offOut bytes.Buffer
+	cmdMaxOffset.SetOut(&offOut)
+	cmdMaxOffset.SetArgs([]string{
+		"workerpool",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--domains=2",
+		"--domain-offset=9998",
+	})
+	if err := cmdMaxOffset.Execute(); err != nil {
+		t.Fatalf("--domains=2 --domain-offset=9998 rejected: %v", err)
+	}
+	if !strings.Contains(offOut.String(), "name: default-template-workerpool-d9999\n") {
+		t.Fatalf("--domains=2 --domain-offset=9998 missing d9999:\n%s", offOut.String())
+	}
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "explicit zero domains on manifest",
+			args: []string{"--api-image=example.com/a@sha256:cccc", "--worker-image=example.com/w@sha256:bbbb", "--domains=0"},
+			want: "--domains 0: want at least 1",
+		},
+		{
+			name: "negative domains",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=-1"},
+			want: "--domains -1: want at least 1",
+		},
+		{
+			name: "domains above cap",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=10001"},
+			want: "exceeds the maximum",
+		},
+		{
+			name: "offset without domains",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domain-offset=1"},
+			want: "--domain-offset requires --domains",
+		},
+		{
+			name: "negative offset",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=2", "--domain-offset=-1"},
+			want: "--domain-offset -1: want 0 or more",
+		},
+		{
+			name: "offset plus domains above cap",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=2", "--domain-offset=9999"},
+			want: "exceeds the maximum domain index",
+		},
+		{
+			name: "maxint offset does not overflow",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=1", "--domain-offset=9223372036854775807"},
+			want: "exceeds the maximum domain index",
+		},
+		{
+			name: "domain suffix pushes WorkerPool name past 63 chars",
+			args: []string{"workerpool", "--workerpool=" + pool60, "--worker-image=example.com/w@sha256:bbbb", "--domains=11"},
+			want: "pass a shorter --workerpool",
+		},
+		{
+			name: "negative replicas",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--replicas=-1"},
+			want: "--replicas -1: want 0 or more",
+		},
+		{
+			name: "missing worker-image on workerpool",
+			args: []string{"workerpool", "--domains=2"},
+			want: "--worker-image is required",
+		},
+		{
+			name: "empty namespace on workerpool",
+			args: []string{"workerpool", "--namespace= ", "--worker-image=example.com/w@sha256:bbbb"},
+			want: "--namespace is empty",
+		},
+		{
+			name: "invalid namespace on workerpool",
+			args: []string{"workerpool", "--namespace=Bad_NS", "--worker-image=example.com/w@sha256:bbbb"},
+			want: "--namespace \"Bad_NS\"",
+		},
+		{
+			name: "explicit empty template",
+			args: []string{"workerpool", "--template=", "--worker-image=example.com/w@sha256:bbbb"},
+			want: "--template must not be empty",
+		},
+		{
+			name: "explicit whitespace workerpool",
+			args: []string{"workerpool", "--workerpool= ", "--worker-image=example.com/w@sha256:bbbb"},
+			want: "--workerpool must not be empty",
+		},
+		{
+			name: "invalid workerpool characters",
+			args: []string{"workerpool", "--workerpool=Bad/Pool-", "--worker-image=example.com/w@sha256:bbbb", "--domains=1"},
+			want: "worker pool name \"Bad/Pool-\"",
+		},
+		{
+			name: "non-DNS-1123 workerpool underscore on manifest",
+			args: []string{"--api-image=example.com/a@sha256:cccc", "--worker-image=example.com/w@sha256:bbbb", "--workerpool=Bad_Pool"},
+			want: "worker pool name \"Bad_Pool\"",
+		},
+		{
+			name: "non-DNS-1123 workerpool underscore on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--workerpool=Bad_Pool"},
+			want: "worker pool name \"Bad_Pool\"",
+		},
+		{
+			name: "explicit empty template on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--template="},
+			want: "--template must not be empty",
+		},
+		{
+			name: "explicit whitespace template on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--template= "},
+			want: "--template must not be empty",
+		},
+		{
+			name: "explicit empty workerpool on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--workerpool="},
+			want: "--workerpool must not be empty",
+		},
+		{
+			name: "explicit whitespace workerpool on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--workerpool= "},
+			want: "--workerpool must not be empty",
+		},
+		{
+			name: "explicit empty node-selector",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector="},
+			want: "--node-selector \"\": want key=value",
+		},
+		{
+			name: "empty node-selector after non-empty node-selector",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=a=1", "--node-selector="},
+			want: "--node-selector \"\": want key=value",
+		},
+		{
+			name: "empty node-selector after non-empty node-selector on manifest",
+			args: []string{"--api-image=example.com/a@sha256:cccc", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=a=1", "--node-selector="},
+			want: "--node-selector \"\": want key=value",
+		},
+		{
+			name: "trailing comma in node-selector",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=a=1,"},
+			want: "--node-selector \"\": want key=value",
+		},
+		{
+			name: "malformed node-selector",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=missingequals"},
+			want: "--node-selector \"missingequals\": want key=value",
+		},
+		{
+			name: "duplicate node-selector key",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=a=1", "--node-selector=a=2"},
+			want: "--node-selector a is given twice",
+		},
+		{
+			name: "invalid node-selector key",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=bad key=v"},
+			want: "--node-selector key",
+		},
+		{
+			name: "invalid node-selector value",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=k=bad/val"},
+			want: "--node-selector k=\"bad/val\"",
+		},
+		{
+			name: "node-selector collides with domain label under domains",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=2", "--node-selector=ate-env/domain=d0"},
+			want: "cannot set ate-env/domain",
+		},
+		{
+			name: "node-selector collides with domain label without domains",
+			args: []string{"--api-image=example.com/a@sha256:cccc", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=ate-env/domain=d5"},
+			want: "cannot set ate-env/domain",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newManifestCommand()
+			c.SetOut(&bytes.Buffer{})
+			c.SetErr(&bytes.Buffer{})
+			c.SetArgs(tc.args)
+			err := c.Execute()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want substring %q", err, tc.want)
+			}
+		})
 	}
 }

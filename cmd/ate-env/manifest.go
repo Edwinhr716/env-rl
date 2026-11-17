@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -42,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 )
 
@@ -75,9 +77,27 @@ const (
 // boots without a snapshot can land on any pool of any class in the cluster.
 const workerPoolLabel = "ate-env/workerpool"
 
+// domainLabel labels a domain WorkerPool and its target nodes with a placement
+// domain name (d0, d1, ...). Substrate's WorkerPoolSyncer copies only
+// WorkerPool metadata.labels onto Worker.labels and ignores node identity, so
+// addressing individual nodes or node groups through Actor.worker_selector
+// takes one WorkerPool per domain. Each domain pool keeps workerPoolLabel so
+// one base ActorTemplate selects all domains and bakes one shared golden
+// snapshot per image.
+const domainLabel = "ate-env/domain"
+
+// maxDomains bounds --domains and offset + domains so domain indices stay in
+// d0..d9999.
+const maxDomains = 10000
+
 // defaultWorkerPool is the pool name `ate-env manifest` gives its WorkerPool,
 // <template>-workerpool, unless --workerpool says otherwise.
 func defaultWorkerPool(template string) string { return template + "-workerpool" }
+
+// domainPoolName names one placement-domain WorkerPool under pool.
+func domainPoolName(pool string, index int) string {
+	return fmt.Sprintf("%s-d%d", pool, index)
+}
 
 // defaultTemplatePool is the pool a template selects unless --workerpool says
 // otherwise: the one `ate-env manifest` creates with its defaults. A cluster
@@ -94,6 +114,12 @@ func checkWorkerPoolName(pool string) error {
 	if len(pool) > maxLabelValueLen {
 		return fmt.Errorf("worker pool name %q has %d characters; it is the value of the %s label, "+
 			"which allows %d: pass a shorter --workerpool", pool, len(pool), workerPoolLabel, maxLabelValueLen)
+	}
+	if errs := k8svalidation.IsDNS1123Subdomain(pool); len(errs) > 0 {
+		return fmt.Errorf("worker pool name %q: %s", pool, strings.Join(errs, ", "))
+	}
+	if errs := k8svalidation.IsValidLabelValue(pool); len(errs) > 0 {
+		return fmt.Errorf("worker pool name %q (label %s): %s", pool, workerPoolLabel, strings.Join(errs, ", "))
 	}
 	return nil
 }
@@ -135,6 +161,9 @@ type manifestConfig struct {
 	workerPool         string
 	workerImage        string
 	replicas           int32
+	domains            int
+	domainOffset       int
+	nodeSelector       map[string]string
 	apiImage           string
 	apiReplicas        int32
 	apiPort            int32
@@ -179,6 +208,124 @@ type manifestConfig struct {
 // resolution the fleet site's metrics need (FS-6).
 const podMonitoringInterval = "5s"
 
+// nodeSelectorFlag collects repeatable or comma-separated key=value pairs
+// while keeping empty segments so a trailing --node-selector="" or comma fails
+// validation instead of disappearing into pflag's CSV parser.
+type nodeSelectorFlag []string
+
+func (f *nodeSelectorFlag) String() string {
+	if len(*f) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(*f, ",") + "]"
+}
+
+func (f *nodeSelectorFlag) Set(val string) error {
+	*f = append(*f, strings.Split(val, ",")...)
+	return nil
+}
+
+func (f *nodeSelectorFlag) Type() string { return "strings" }
+
+// resolveWorkerPools fills default names and validates the WorkerPool fields
+// shared by `ate-env manifest` and `ate-env manifest workerpool`.
+func (c *manifestConfig) resolveWorkerPools(cmd *cobra.Command, nodeSelectorItems []string) error {
+	for _, f := range []string{"template", "workerpool"} {
+		if cmd.Flags().Changed(f) && strings.TrimSpace(cmd.Flags().Lookup(f).Value.String()) == "" {
+			return fmt.Errorf("--%s must not be empty; omit it for the default", f)
+		}
+	}
+	c.namespace = strings.TrimSpace(c.namespace)
+	if c.namespace == "" {
+		return errors.New("--namespace is empty")
+	}
+	if errs := k8svalidation.IsDNS1123Label(c.namespace); len(errs) > 0 {
+		return fmt.Errorf("--namespace %q: %s", c.namespace, strings.Join(errs, ", "))
+	}
+	c.template = strings.TrimSpace(c.template)
+	if c.template == "" {
+		c.template = apiservice.DefaultTemplate
+	}
+	c.workerPool = strings.TrimSpace(c.workerPool)
+	if c.workerPool == "" {
+		c.workerPool = defaultWorkerPool(c.template)
+	}
+	if err := checkWorkerPoolName(c.workerPool); err != nil {
+		return err
+	}
+	if c.replicas < 0 {
+		return fmt.Errorf("--replicas %d: want 0 or more", c.replicas)
+	}
+	domainsChanged := cmd.Flags().Changed("domains")
+	offsetChanged := cmd.Flags().Lookup("domain-offset") != nil && cmd.Flags().Changed("domain-offset")
+	if (domainsChanged && c.domains < 1) || c.domains < 0 {
+		return fmt.Errorf("--domains %d: want at least 1, or omit --domains for one shared pool", c.domains)
+	}
+	if c.domains > maxDomains {
+		return fmt.Errorf("--domains %d exceeds the maximum of %d", c.domains, maxDomains)
+	}
+	if offsetChanged && c.domains == 0 {
+		return errors.New("--domain-offset requires --domains")
+	}
+	if c.domainOffset < 0 {
+		return fmt.Errorf("--domain-offset %d: want 0 or more", c.domainOffset)
+	}
+	if c.domains > 0 {
+		if c.domainOffset > maxDomains-c.domains {
+			return fmt.Errorf("--domain-offset %d with --domains %d exceeds the maximum domain index (%d)",
+				c.domainOffset, c.domains, maxDomains-1)
+		}
+		// atecontroller sets ate.dev/worker-pool=<wp.Name> on each worker pod,
+		// so the longest generated WorkerPool name must also fit a label value.
+		lastName := domainPoolName(c.workerPool, c.domainOffset+c.domains-1)
+		if len(lastName) > maxLabelValueLen {
+			return fmt.Errorf("worker pool name %q has %d characters; Substrate's ate.dev/worker-pool label allows %d: pass a shorter --workerpool",
+				lastName, len(lastName), maxLabelValueLen)
+		}
+	}
+	sel, err := parseNodeSelector(nodeSelectorItems)
+	if err != nil {
+		return err
+	}
+	c.nodeSelector = sel
+	return nil
+}
+
+// parseNodeSelector parses and validates --node-selector key=value pairs as
+// Kubernetes label keys and values.
+func parseNodeSelector(items []string) (map[string]string, error) {
+	sel, err := parseLabelSelector("--node-selector", items)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range slices.Sorted(maps.Keys(sel)) {
+		if errs := k8svalidation.IsQualifiedName(key); len(errs) > 0 {
+			return nil, fmt.Errorf("--node-selector key %q: %s", key, strings.Join(errs, ", "))
+		}
+		if errs := k8svalidation.IsValidLabelValue(sel[key]); len(errs) > 0 {
+			return nil, fmt.Errorf("--node-selector %s=%q: %s", key, sel[key], strings.Join(errs, ", "))
+		}
+	}
+	if _, exists := sel[domainLabel]; exists {
+		return nil, fmt.Errorf("--node-selector cannot set %s; pass --domains to render domain pools", domainLabel)
+	}
+	return sel, nil
+}
+
+// checkWorkerImage ensures --worker-image is set.
+func checkWorkerImage(workerImage string) error {
+	if workerImage == "" {
+		return errors.New(`--worker-image is required: the worker image is
+ateworker-gvisor from the Substrate repo and must match the Substrate version
+deployed on your cluster. From a Substrate checkout at that version run
+"go run ./cmd/ate-setup publish worker-images": it pushes the images and
+prints the digest-pinned refs to use. Pin by digest: a registry's :latest
+is whatever was built last, and a stale worker image registers workers
+with no capacity`)
+	}
+	return nil
+}
+
 // resolveAuth applies --insecure-no-auth and rejects an empty --auth-token-secret.
 func (c *manifestConfig) resolveAuth(secretChanged bool) error {
 	if c.insecureNoAuth {
@@ -200,14 +347,8 @@ func (c *manifestConfig) resolveAuth(secretChanged bool) error {
 const metricsPortName = "metrics"
 
 func (c *manifestConfig) resolveImages() error {
-	if c.workerImage == "" {
-		return errors.New(`--worker-image is required: the worker image is
-ateworker-gvisor from the Substrate repo and must match the Substrate version
-deployed on your cluster. From a Substrate checkout at that version run
-"go run ./cmd/ate-setup publish worker-images": it pushes the images and
-prints the digest-pinned refs to use. Pin by digest: a registry's :latest
-is whatever was built last, and a stale worker image registers workers
-with no capacity`)
+	if err := checkWorkerImage(c.workerImage); err != nil {
+		return err
 	}
 	if c.apiImage == "" {
 		return errors.New(`--api-image is required when ate-env is built from source; release
@@ -495,14 +636,16 @@ binaries default it to the ate-env-guest image published with the release
 
 func newManifestCommand() *cobra.Command {
 	mCfg := manifestConfig{}
+	var nodeSelector nodeSelectorFlag
 
 	cmd := &cobra.Command{
 		Use:   "manifest",
 		Short: "Generate Kubernetes manifests to deploy the system",
 		Long: `Manifest generates Kubernetes manifests for everything environments need on
 a cluster that already runs the Agent Substrate system: the target
-namespace, a WorkerPool of pre-warmed workers, and the ate-env-api service.
-It prints YAML to stdout without touching the cluster; apply it with kubectl.
+namespace, a WorkerPool of pre-warmed workers (or one WorkerPool per
+placement domain with --domains), and the ate-env-api service. It prints
+YAML to stdout without touching the cluster; apply it with kubectl.
 
 ate-env-api requires a bearer token from its callers, read from the Secret
 --auth-token-secret names (key token). Create that Secret once, in the
@@ -511,22 +654,18 @@ namespace this manifest creates, with
 the Secret exists. --insecure-no-auth deploys without the token.
 
 To generate the Substrate ActorTemplate manifest (for kubectl-ate), use
-the "template" subcommand: ate-env manifest template`,
+the "template" subcommand: ate-env manifest template. To render WorkerPool
+manifests alone (for example, additional node pools), use:
+ate-env manifest workerpool`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := mCfg.resolveAuth(cmd.Flags().Changed("auth-token-secret")); err != nil {
 				return err
 			}
-			if mCfg.template == "" {
-				mCfg.template = apiservice.DefaultTemplate
-			}
-			if mCfg.workerPool == "" {
-				mCfg.workerPool = defaultWorkerPool(mCfg.template)
-			}
 			if err := mCfg.validateTelemetry(); err != nil {
 				return err
 			}
-			if err := checkWorkerPoolName(mCfg.workerPool); err != nil {
+			if err := mCfg.resolveWorkerPools(cmd, nodeSelector); err != nil {
 				return err
 			}
 			if err := mCfg.resolveImages(); err != nil {
@@ -570,7 +709,9 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().StringSliceVar(&mCfg.allowedHosts, "api-allowed-hosts", nil, "extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed")
 	cmd.Flags().BoolVar(&mCfg.routerTLS, "api-router-tls", true, "mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
-	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
+	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods (per domain pool when --domains is set)")
+	cmd.Flags().IntVar(&mCfg.domains, "domains", 0, "number of placement-domain WorkerPools to render instead of one shared pool (ate-env/domain=d0..d<n-1>, each with --replicas workers and matching spec.template.nodeSelector)")
+	cmd.Flags().Var(&nodeSelector, "node-selector", "node label a worker pod's node must carry (spec.template.nodeSelector), key=value; repeat the flag or separate with commas")
 	cmd.Flags().BoolVar(&mCfg.enableTracing, "enable-tracing", false, "run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC")
 	cmd.Flags().StringVar(&mCfg.otlpEndpoint, "otlp-endpoint", "", "OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317")
 	cmd.Flags().BoolVar(&mCfg.otlpInsecure, "otlp-insecure", false, "set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext")
@@ -578,11 +719,71 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().BoolVar(&mCfg.podMonitoring, "pod-monitoring", false, "add a PodMonitoring (monitoring.googleapis.com/v1) that has Google Cloud Managed Service for Prometheus scrape the metrics port every "+podMonitoringInterval+"; needs --metrics-port and Managed Prometheus on the cluster. The pod keeps its prometheus.io annotations, so a cluster that also runs an annotation-based scraper scrapes the port twice")
 
 	cmd.AddCommand(newManifestTemplateCommand())
+	cmd.AddCommand(newManifestWorkerPoolCommand())
 	cmd.AddCommand(newManifestAccessPolicyCommand())
 	cmd.AddCommand(newManifestAuthSecretCommand())
 	cmd.AddCommand(newManifestReporterCommand())
 	cmd.AddCommand(newManifestCollectorCommand())
 
+	return cmd
+}
+
+func newManifestWorkerPoolCommand() *cobra.Command {
+	cfg := manifestConfig{}
+	var nodeSelector nodeSelectorFlag
+
+	cmd := &cobra.Command{
+		Use:   "workerpool",
+		Short: "Generate Substrate WorkerPool manifest(s)",
+		Long: `Workerpool prints the Kubernetes WorkerPool manifest(s) without the
+Namespace or ate-env-api objects. Without --domains it prints one WorkerPool
+carrying ate-env/workerpool=<workerpool>.
+
+With --domains N it prints N placement-domain WorkerPools (<workerpool>-d0 ..
+<workerpool>-d<N-1>). Each pool carries both ate-env/workerpool=<workerpool>
+(so one base ActorTemplate selects all domains and bakes one shared golden
+snapshot per image) and ate-env/domain=d<i> in metadata.labels, plus
+spec.template.nodeSelector matching ate-env/domain=d<i>. Label target nodes
+with "kubectl label node <node> ate-env/domain=d<i>".
+
+For heterogeneous node pools that share one base ActorTemplate with different
+replica counts or node selectors, run workerpool once per node pool and advance
+--domain-offset:
+
+  ate-env manifest workerpool --workerpool default-template-workerpool --worker-image <image> \
+    --domains 51 --replicas 32 --node-selector cloud.google.com/gke-nodepool=big-workers | kubectl apply -f -
+  ate-env manifest workerpool --workerpool default-template-workerpool --worker-image <image> \
+    --domains 300 --domain-offset 51 --replicas 8 --node-selector cloud.google.com/gke-nodepool=fast-workers | kubectl apply -f -
+
+Note: per-domain WorkerPools are a client-side workaround while Substrate's
+WorkerPoolSyncer copies only WorkerPool metadata.labels onto Worker.labels and
+ignores node identity.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := cfg.resolveWorkerPools(cmd, nodeSelector); err != nil {
+				return err
+			}
+			if err := checkWorkerImage(cfg.workerImage); err != nil {
+				return err
+			}
+			pools := buildWorkerPools(cfg)
+			objs := make([]any, len(pools))
+			for i, p := range pools {
+				objs[i] = p
+			}
+			return writeManifests(cmd.OutOrStdout(), objs)
+		},
+	}
+
+	cmd.Flags().StringVar(&cfg.namespace, "namespace", apiservice.DefaultNamespace, "Kubernetes namespace of the WorkerPool(s)")
+	cmd.Flags().StringVar(&cfg.template, "template", apiservice.DefaultTemplate, "ActorTemplate name used to default --workerpool to <template>-workerpool")
+	cmd.Flags().StringVar(&cfg.workerPool, "workerpool", "", "shared ate-env/workerpool label value (and pool name or <workerpool>-d<i> prefix; defaults to <template>-workerpool)")
+	cmd.Flags().StringVar(&cfg.workerImage, "worker-image", "", "digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo")
+	cmd.Flags().StringVar(&cfg.workerImage, "ateom-image", "", "alias for --worker-image, kept from before Substrate renamed ateom to ateworker")
+	cmd.Flags().Int32Var(&cfg.replicas, "replicas", 5, "number of pre-warmed worker pods (per domain pool when --domains is set)")
+	cmd.Flags().IntVar(&cfg.domains, "domains", 0, "number of placement-domain WorkerPools to render instead of one shared pool")
+	cmd.Flags().IntVar(&cfg.domainOffset, "domain-offset", 0, "starting domain index for --domains (d<offset>..d<offset+domains-1>; offset + domains <= 10000)")
+	cmd.Flags().Var(&nodeSelector, "node-selector", "node label a worker pod's node must carry (spec.template.nodeSelector), key=value; repeat the flag or separate with commas")
 	return cmd
 }
 
@@ -702,9 +903,16 @@ func newManifestTemplateCommand() *cobra.Command {
 It prints YAML to stdout without touching the cluster.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			for _, f := range []string{"template", "workerpool"} {
+				if cmd.Flags().Changed(f) && strings.TrimSpace(cmd.Flags().Lookup(f).Value.String()) == "" {
+					return fmt.Errorf("--%s must not be empty; omit it for the default", f)
+				}
+			}
+			tCfg.template = strings.TrimSpace(tCfg.template)
 			if tCfg.template == "" {
 				tCfg.template = apiservice.DefaultTemplate
 			}
+			tCfg.workerPool = strings.TrimSpace(tCfg.workerPool)
 			if tCfg.workerPool == "" {
 				tCfg.workerPool = defaultTemplatePool
 			}
@@ -764,11 +972,13 @@ It prints YAML to stdout without touching the cluster.`,
 // buildManifests returns the Kubernetes objects that make up a deployment,
 // in apply order.
 func buildManifests(cfg manifestConfig) []any {
-	objs := []any{
-		buildNamespace(cfg),
-		buildWorkerPool(cfg),
-		buildAPIServiceAccount(cfg),
+	pools := buildWorkerPools(cfg)
+	objs := make([]any, 0, 4+len(pools))
+	objs = append(objs, buildNamespace(cfg))
+	for _, p := range pools {
+		objs = append(objs, p)
 	}
+	objs = append(objs, buildAPIServiceAccount(cfg))
 	if cfg.environmentMetadata {
 		role, binding := buildEnvironmentStoreRole(cfg)
 		objs = append(objs, role, binding)
@@ -1004,20 +1214,71 @@ func buildNamespace(cfg manifestConfig) *corev1.Namespace {
 }
 
 func buildWorkerPool(cfg manifestConfig) *atev1.WorkerPool {
+	return buildWorkerPools(cfg)[0]
+}
+
+// buildWorkerPools returns one shared WorkerPool when cfg.domains is 0, or
+// cfg.domains placement-domain WorkerPools (<workerPool>-d<offset> ..
+// <workerPool>-d<offset+domains-1>) that share workerPoolLabel and carry
+// domainLabel in both metadata.labels and spec.template.nodeSelector.
+func buildWorkerPools(cfg manifestConfig) []*atev1.WorkerPool {
+	if cfg.domains == 0 {
+		var podTmpl *atev1.WorkerPoolPodTemplate
+		if len(cfg.nodeSelector) > 0 {
+			podTmpl = &atev1.WorkerPoolPodTemplate{
+				NodeSelector: maps.Clone(cfg.nodeSelector),
+			}
+		}
+		return []*atev1.WorkerPool{newWorkerPoolObject(
+			cfg.namespace,
+			cfg.workerPool,
+			map[string]string{workerPoolLabel: cfg.workerPool},
+			cfg.replicas,
+			cfg.workerImage,
+			podTmpl,
+		)}
+	}
+
+	pools := make([]*atev1.WorkerPool, cfg.domains)
+	for i := range cfg.domains {
+		idx := cfg.domainOffset + i
+		dom := fmt.Sprintf("d%d", idx)
+		nodeSel := make(map[string]string, len(cfg.nodeSelector)+1)
+		maps.Copy(nodeSel, cfg.nodeSelector)
+		nodeSel[domainLabel] = dom
+		pools[i] = newWorkerPoolObject(
+			cfg.namespace,
+			domainPoolName(cfg.workerPool, idx),
+			map[string]string{
+				workerPoolLabel: cfg.workerPool,
+				domainLabel:     dom,
+			},
+			cfg.replicas,
+			cfg.workerImage,
+			&atev1.WorkerPoolPodTemplate{NodeSelector: nodeSel},
+		)
+	}
+	return pools
+}
+
+func newWorkerPoolObject(namespace, name string, labels map[string]string, replicas int32, workerImage string, podTmpl *atev1.WorkerPoolPodTemplate) *atev1.WorkerPool {
 	return &atev1.WorkerPool{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: atev1.GroupVersion.String(),
 			Kind:       "WorkerPool",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cfg.workerPool,
-			Namespace: cfg.namespace,
-			// Copied to the pool's workers; templates select the pool by it.
-			Labels: map[string]string{workerPoolLabel: cfg.workerPool},
+			Name:      name,
+			Namespace: namespace,
+			// Copied to the pool's workers; templates select the pool by
+			// workerPoolLabel, and CreateEnvironment.worker_selector narrows
+			// to a domain by domainLabel.
+			Labels: labels,
 		},
 		Spec: atev1.WorkerPoolSpec{
-			Replicas:    cfg.replicas,
-			WorkerImage: cfg.workerImage,
+			Replicas:    replicas,
+			WorkerImage: workerImage,
+			Template:    podTmpl,
 			// The CRD requires exactly one sandbox class per pool. Since
 			// substrate#2780 the pool alone decides the sandbox: the
 			// ActorTemplate names none, and an actor restores onto a worker of

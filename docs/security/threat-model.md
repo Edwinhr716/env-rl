@@ -39,9 +39,11 @@ update this document in the same pull request. The pull request template asks fo
   [Server telemetry](#server-telemetry)).
 - **ate-env-guest** runs as PID 1 in each actor. It serves processes and files on port 80, reaps
   orphaned processes, and starts the sidecars that the template names.
-- **`ate-env manifest`** deploys the namespace, the WorkerPool, and the `ate-env-api`
-  ServiceAccount, Deployment and Service. `ate-env manifest access-policy` grants that
-  ServiceAccount the `editor` role on an atespace.
+- **`ate-env manifest`** deploys the namespace, the WorkerPool (or one WorkerPool per placement
+  domain with `--domains`), and the `ate-env-api` ServiceAccount, Deployment and Service.
+  `ate-env manifest workerpool` prints WorkerPool manifests alone, and `ate-env manifest access-policy`
+  grants that ServiceAccount the `editor` role on an atespace (`--global` grants the global `viewer`
+  role that `ListPlacementDomains` needs).
 
 ## Assets
 
