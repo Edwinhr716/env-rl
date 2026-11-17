@@ -43,7 +43,8 @@ storage (`gs://`) to skip a cold boot.
 - **Framework integrations** ([integrations](./integrations/README.md)): Drop-in providers integrate
   with [NeMo Gym](./integrations/nemo-gym/README.md),
   [uni-agent](./integrations/uni-agent/README.md),
-  [OpenHands](./integrations/openhands/README.md), and
+  [OpenHands](./integrations/openhands/README.md),
+  [E2B](./integrations/e2b/README.md), and
   [Harbor](./integrations/harbor/README.md) with no changes to those frameworks.
 - **Benchmarking and placement** ([benchmarking/swebench](./benchmarking/swebench/README.md),
   [bench harness](./cmd/benchmarking/bench/README.md)): `swebench-loader` runs SWE-bench Verified
@@ -111,7 +112,7 @@ Request-path zoom:
 | [`benchmarking/`](./benchmarking/README.md) | The SWE-bench loader scripts, the `bench` scenarios, the telemetry report tool and the benchmarking skills. |
 | [`internal/`](./internal) | The packages the binaries are built from: `apiservice` (the gRPC server), `ate` (the Substrate client), `inventory` (fleet inventory snapshot schema), `reporter` (the snapshot writer), `mcp`, `portproxy`, `routertls`, `hostcheck`, `sidecarenv`, `telemetry`, `tool`, `unknownfields`, `benchmarking/*`, and the test doubles and helpers in `internaltest` (`fakecontrol`, `fakerouter`, `synctestrapid`, `testcerts`). |
 | [`proto/ateenv/v1alpha`](./proto/ateenv/v1alpha) | The `ateenv.v1alpha` API: `env.proto` (`EnvironmentService`) and `guest.proto` (`ProcessService`, `FileSystemService`), with the generated Go stubs. |
-| [`proto/testdata/client-parity`](./proto/testdata/client-parity) | Shared Go and Python client conformance vectors (errors, executable names, image refs, metric families, RPC attributes, RPC coverage, semconv). |
+| [`proto/testdata/client-parity`](./proto/testdata/client-parity) | Shared Go and Python client conformance vectors (errors, executable names, image refs, metric families, RPC attributes, RPC coverage, semconv, spans). |
 | [`docs/`](./docs) | [Architecture](./docs/architecture.md), [glossary](./docs/glossary.md), [observability](./docs/observability.md), the [metrics reference](./docs/metrics.md), [rootfs images and runtime layers](./docs/rootfs-images/README.md), the [threat model](./docs/security/threat-model.md), [support](./docs/support.md), [releases](./docs/release.md), the developer guides in [`docs/dev`](./docs/dev), the maintenance chores in [`docs/chores`](./docs/chores), and the plans in [`docs/plans`](./docs/plans). |
 | [`hack/`](./hack) | Repository scripts, checks and generators: the CI runners in [`hack/ci`](./hack/ci) (the Kind e2e run, the smoke test, pin and Substrate head checks), release automation in [`hack/release`](./hack/release), license boilerplate, [`hack/verify`](./hack/verify) and `metrics-docs` (renders `docs/metrics.md`). |
 | [`nix/`](./nix), [`flake.nix`](./flake.nix), [`uv.lock`](./uv.lock) | The Nix flake: the `devShell`s, the Python environments built from `uv.lock` (`python.nix`), and the CI scripts `ci-go`, `ci-python`, `ci-e2e` and `ci-release` (`ci.nix`). |
@@ -131,6 +132,8 @@ it.
 |---|---|
 | [`examples/grpo`](./examples/grpo/README.md) | A real RL loop: TRL's GRPOTrainer trains Qwen2.5-0.5B on MBPP, and each completion runs in an environment that computes the reward. Covers the park/wake pattern, with the fleet suspended after each step. CPU only. |
 | [`examples/e2b-envd-layer`](./examples/e2b-envd-layer/README.md) | An E2B-compatible sandbox from any image: envd as an added runtime layer, and an E2B SDK program on it. |
+| [`examples/env-lifecycle`](./examples/env-lifecycle/README.md) | Go: the `EnvironmentService` lifecycle (create, get, suspend, delete) with the generated gRPC stubs alone. |
+| [`examples/python-quickstart`](./examples/python-quickstart/README.md) | Python: the `ate_env_rl` client end to end (create, shell, file read/write, process follow and signal, delete). |
 | [`examples/runtime-layers`](./examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
 | [`examples/harbor`](./examples/harbor/README.md) | Terminal-Bench 2.0 on ate-env through the Harbor provider: prebuilt images, resource class templates, `run-tb2.sh` around `harbor run`, and the comparison with Docker. |
 | [`examples/harbor-tools-layer`](./examples/harbor-tools-layer/README.md) | Harbor with tools as a second layer: a static tmux and asciinema layer mounted into every task image, the class templates registered with `--layer`, and `harbor run` with the layer first on `PATH`, thus terminus-2 installs nothing. |
@@ -467,7 +470,7 @@ environment instead of scoring it:
 `--wake-no-capacity-grace` defaults to 0: a full fleet keeps waiting for the whole `--wake-budget`,
 since capacity can come back as nodes scale up or other environments stop. The Python SDK turns
 both into a retryable `SandboxStartError` whose `reason` is the trailer's value. Port-proxy requests
-wait on the router instead (see
+wait on the router unless `X-Env-Wake-Wait` asks the proxy to wait instead (see
 [Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
 
 `ate-env-api` can export traces and serve Prometheus metrics; both are off by default:
@@ -763,6 +766,7 @@ Usage:
 Available Commands:
   access-policy Generate the Substrate access policy that lets ate-env-api manage environments
   auth-secret   Generate the Secret with the bearer token ate-env-api requires from callers
+  collector     Generate the manifests of the fleet telemetry collector
   reporter      Generate the manifests of ate-env-reporter, the fleet inventory reporter
   template      Generate Substrate ActorTemplate manifest
 
@@ -782,6 +786,7 @@ Flags:
       --namespace string                Kubernetes namespace to deploy into (default "ate-env")
       --otlp-endpoint string            OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317
       --otlp-insecure                   set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext
+      --pod-monitoring                  add a PodMonitoring (monitoring.googleapis.com/v1) that has Google Cloud Managed Service for Prometheus scrape the metrics port every 5s; needs --metrics-port and Managed Prometheus on the cluster. The pod keeps its prometheus.io annotations, so a cluster that also runs an annotation-based scraper scrapes the port twice
       --port-proxy-atespaces string     comma-separated atespaces whose environments ate-env-api's port proxy forwards to, or * for any (defaults to ate-env)
       --port-proxy-host-suffix string   domain of two labels or more that turns on the hostname form of ate-env-api's port proxy: <port>-<id>.<domain> and <port>-<id>.<atespace>.<domain> reach an environment port; the manifest renders no Ingress, DNS record or certificate for it (off when empty)
       --replicas int32                  number of pre-warmed worker pods (default 5)
