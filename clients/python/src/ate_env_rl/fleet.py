@@ -31,7 +31,7 @@ from typing import Any
 from .backend.base import BackendDriver
 from .backend.mock import MockBackendDriver
 from .backend.substrate import SubstrateBackendDriver
-from .config import ALLOWED_BACKENDS, FleetConfig, TracerConfig
+from .config import ALLOWED_BACKENDS, FleetConfig, TracerConfig, ValidationError
 from .errors import PreflightError
 from .handle import SandboxHandle
 from .observability import Observer, RunReport, repo_family
@@ -52,6 +52,7 @@ from .types import (
     DataPlaneEndpoint,
     FleetPlan,
     PlanEntry,
+    PoolReadiness,
     PreflightCheck,
     PreflightReport,
     RawSandboxInstance,
@@ -181,6 +182,16 @@ def _skipped_checks(images: Sequence[str], why: str) -> list[PreflightCheck]:
     ]
 
 
+def _wait_args(timeout_s: Any, poll_s: Any) -> tuple[float, float]:
+    """Check the arguments of wait_pools_ready on both fleets."""
+    for name, value in (("timeout_s", timeout_s), ("poll_s", poll_s)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+            raise ValidationError(f"{name} must be a number, got {value!r}")
+    if poll_s <= 0:
+        raise ValidationError(f"poll_s must be > 0, got {poll_s!r}")
+    return float(timeout_s), float(poll_s)
+
+
 def _report(checks: list[PreflightCheck], strict: bool) -> PreflightReport:
     """The report of ``checks``; with ``strict``, PreflightError on a failure (FL-2)."""
     report = PreflightReport(tuple(checks))
@@ -211,6 +222,8 @@ class SandboxFleet:
         # Serializes plan recomputation, so concurrent add_tasks calls leave
         # the plan of the last call, which saw every task added before it.
         self._plan_lock = threading.Lock()
+        # Warm replicas last asked for per image (wait_pools_ready's targets).
+        self._warm_targets: dict[str, int] = {}
 
         # Telemetry. Either FleetConfig.tracing or observability.enable_tracing
         # turns on tracing for the whole fleet under one service name, so
@@ -274,6 +287,15 @@ class SandboxFleet:
         else:
             raise NotImplementedError(f"Backend '{self.config.backend}' is not yet supported or requires extras")
 
+        if self.config.warm_create_budget is not None:
+            if hasattr(self.backend, "warm_create_budget"):
+                self.backend.warm_create_budget = self.config.warm_create_budget
+            else:
+                logger.warning(
+                    "FleetConfig.warm_create_budget=%d is ignored: %s does not cap warm creates",
+                    self.config.warm_create_budget,
+                    type(self.backend).__name__,
+                )
         name = getattr(self.backend, "backend_name", None)
         self.backend_label = name if name in ALLOWED_BACKENDS else self.config.backend
         # A driver belongs to one fleet: its claim and warm events go to the
@@ -551,6 +573,7 @@ class SandboxFleet:
             sized = {img: replicas for img in images}
         else:
             sized = self._size_pools(self.image_counts(), images)
+        self._set_warm_targets(sized)
         work = []
         for img in dict.fromkeys(images):
             template_id, rootfs_image = self._ensure_template_for_image(img)
@@ -561,6 +584,7 @@ class SandboxFleet:
         self, work: list[tuple[str, str, str | None, int]], wait: bool
     ) -> None:
         """Warm (image, template, rootfs_image, replicas) items, warm_parallelism at a time."""
+        self._set_warm_targets({img: rep for img, _, _, rep in work})
         work = [w for w in work if w[3] > 0]
         if not work:
             return
@@ -605,6 +629,7 @@ class SandboxFleet:
         ``warm_pool`` and drains through ``unwarm_pool`` when ``replicas`` is 0.
         """
         replicas = max(0, int(replicas))
+        self._set_warm_targets({image: replicas})
         template_id, rootfs_image = self._ensure_template_for_image(image)
         with self._obs.phase("warm_pool", backend=self.backend_label, family=repo_family(image)):
             try:
@@ -622,10 +647,47 @@ class SandboxFleet:
 
     def unwarm_image(self, image: str) -> None:
         """Drain warm pool for a specific image."""
+        self._set_warm_targets({image: 0})
         entry = self._image_to_template.get(image)
         if entry:
             template_id, rootfs_image = entry
             self.backend.unwarm_pool(template_id, rootfs_image=rootfs_image)
+
+    def _set_warm_targets(self, targets: dict[str, int]) -> None:
+        """Record the warm replicas asked for per image; 0 drops the image."""
+        with self._lock:
+            for img, rep in targets.items():
+                if rep > 0:
+                    self._warm_targets[img] = rep
+                else:
+                    self._warm_targets.pop(img, None)
+
+    def _pool_readiness(self) -> dict[str, PoolReadiness]:
+        """Ready and target counts of every image warmed since the last teardown."""
+        with self._lock:
+            targets = dict(self._warm_targets)
+        return {img: PoolReadiness(ready=self.pool_size(img), target=t) for img, t in targets.items()}
+
+    def wait_pools_ready(self, timeout_s: float, poll_s: float = 0.5) -> dict[str, PoolReadiness]:
+        """Wait until each warmed image's pool holds its target replicas (FL-14).
+
+        The targets are the replicas the last ``setup``, ``warm_images``,
+        ``warm_image`` or ``set_pool_replicas`` asked for per image. Returns
+        once every pool is ready, or at ``timeout_s``, with the ready and
+        target counts per image (FL-15); it raises nothing at the timeout and
+        starts no warm-up. A pool whose backend cannot count it (``ready`` is
+        None) does not hold the wait.
+        An acquire takes its sandbox out of the pool, so call it before
+        acquiring.
+        """
+        timeout_s, poll_s = _wait_args(timeout_s, poll_s)
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            readiness = self._pool_readiness()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or all(r.met or r.ready is None for r in readiness.values()):
+                return readiness
+            time.sleep(min(poll_s, remaining))
 
     def acquired_count(self, image: str) -> int:
         """Sandboxes this fleet has acquired for ``image`` so far, warm or cold.
@@ -835,8 +897,10 @@ class SandboxFleet:
             raise
         finally:
             self._obs.warm_reset()
-            # The next setup() or run() warms again.
+            # The next setup() or run() warms again. Replaced without _lock,
+            # as _active_handles above.
             self._preflight_for = None
+            self._warm_targets = {}
         if verify:
             return self.backend.verify_teardown(self.run_id)
         return None

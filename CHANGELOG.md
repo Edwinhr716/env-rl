@@ -44,6 +44,15 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- Python client: `FleetConfig.warm_create_budget` caps the warm creates in
+  flight across all images that `setup()` and `warm_images()` warm at once, on
+  `SandboxFleet` and `AsyncSandboxFleet`; unset keeps each pool's own limit.
+  A create that waits for a slot (under `warm_create_budget` or a pool's own
+  limit of 16) does not start after a teardown, `unwarm_image`, or a shrinking
+  `set_pool_replicas`. `fleet.wait_pools_ready(timeout_s)` waits until each
+  warmed image's pool holds its target replicas, or the timeout, and returns
+  the ready and target counts per image (`PoolReadiness`) without raising
+  (FL-14 to FL-17).
 - Port proxy: a hostname form, off by default. With
   `ate-env-api --port-proxy-host-suffix <domain>` (on the Deployment:
   `ate-env manifest --port-proxy-host-suffix`), a request whose `Host` is

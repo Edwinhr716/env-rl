@@ -22,8 +22,10 @@ import os
 import threading
 import time
 import uuid
+import weakref
 import zlib
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any
 
 import grpc
@@ -342,6 +344,14 @@ class SubstrateBackendDriver(BackendDriver):
         # provision the full shortfall. A reap drops every reservation with
         # its generation; unwarm_pool and resize_pool start a new one.
         self._warm_inflight: dict[tuple[tuple[str, str | None], int, int], int] = {}
+        # FleetConfig.warm_create_budget: warm creates in flight at once across
+        # all warm_pool calls (FL-16). One semaphore per event loop, because an
+        # asyncio.Semaphore belongs to the loop that first waits on it, kept
+        # with the budget it was made for.
+        self.warm_create_budget: int | None = None
+        self._warm_budgets: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, tuple[int, asyncio.Semaphore]
+        ] = weakref.WeakKeyDictionary()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         # The background deletes a cancelled acquire or warm_pool call started
         # (AC-15.2, AC-15.8), each with the id of the actor it deletes, so a
@@ -1366,15 +1376,93 @@ class SubstrateBackendDriver(BackendDriver):
                 return
             self._warm_inflight[reservation] = inflight + needed
 
-        def _release_reservation() -> None:
+        def _release_reservation(count: int = needed) -> None:
             # Caller holds self._lock. A reap since then already dropped it.
-            left = self._warm_inflight.get(reservation, 0) - needed
+            left = self._warm_inflight.get(reservation, 0) - count
             if left > 0:
                 self._warm_inflight[reservation] = left
             else:
                 self._warm_inflight.pop(reservation, None)
 
+        async def _delete_abandoned(actors: list[str], torn_down: bool) -> None:
+            if not actors:
+                return
+            logger.info(
+                "%s ran while warming %d actors for template %s; deleting them",
+                "Teardown" if torn_down else "unwarm_pool or resize_pool",
+                len(actors),
+                template_id,
+            )
+            why = "after teardown" if torn_down else "after unwarm_pool or resize_pool"
+            try:
+                await asyncio.gather(*(self._delete_unpooled(aid, why) for aid in actors))
+            except BaseException:
+                # A delete that close() cancelled before its first step ran
+                # no handler of its own.
+                for aid in actors:
+                    self._delete_unreaped_in_close(aid)
+                raise
+
+        entered_suspends: set[str] = set()
+
+        async def _suspend_and_pool(actor_id: str) -> None:
+            entered_suspends.add(actor_id)
+            try:
+                await self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
+            except Exception as e:
+                logger.warning("Background suspend for warm actor %s failed: %s", actor_id, e)
+                with self._lock:
+                    _release_reservation(1)
+                    self._owned_actors.setdefault(
+                        actor_id,
+                        self._make_instance(
+                            actor_id,
+                            template_id,
+                            run_id=WARM_POOL_RUN_ID,
+                            rootfs_image=rootfs_image,
+                        ),
+                    )
+                await self._delete_unpooled(actor_id, "after failed warm suspend")
+                return
+            except BaseException:
+                with self._lock:
+                    _release_reservation(1)
+                    reaped_since = not self._may_pool(teardowns)
+                    self._owned_actors.setdefault(
+                        actor_id,
+                        self._make_instance(
+                            actor_id,
+                            template_id,
+                            run_id=WARM_POOL_RUN_ID,
+                            rootfs_image=rootfs_image,
+                        ),
+                    )
+                if reaped_since and _loop_running():
+                    self._spawn_background_delete(actor_id, "after a cancelled warm suspend")
+                raise
+
+            with self._lock:
+                _release_reservation(1)
+                torn_down = not self._may_pool(teardowns)
+                drained = self._pool_gens.get(pool_key, 0) != gen
+                owner = WARM_POOL_RUN_ID if (torn_down or drained) else effective_run_id
+                self._owned_actors[actor_id] = self._make_instance(
+                    actor_id, template_id, run_id=owner, rootfs_image=rootfs_image
+                )
+                if not (torn_down or drained):
+                    self._warm_paused_pool.setdefault(pool_key, []).append(actor_id)
+            if torn_down or drained:
+                why = "after teardown" if torn_down else "after unwarm_pool or resize_pool"
+                try:
+                    await self._delete_unpooled(actor_id, why)
+                except BaseException:
+                    self._delete_unreaped_in_close(actor_id)
+                    raise
+            else:
+                self._observe("warm_add", 1)
+
         sem = asyncio.Semaphore(16)
+        budget = self._warm_budget()
         effective_run_id = run_id or WARM_POOL_RUN_ID
         # Every id a create() was sent for, so a cancelled call can still
         # account for the actors it made (AC-15.8).
@@ -1383,29 +1471,38 @@ class SubstrateBackendDriver(BackendDriver):
         async def _warm_one() -> str | None:
             actor_id = f"warm-{uuid.uuid4().hex[:10]}"
             async with sem:
-                # Woken by a call that close cut off, not cancelled itself:
-                # no create on a channel that close has to open for it.
-                self._stop_if_closing()
-                started.append(actor_id)
-                try:
-                    drv_tok = in_driver_span.set(True)
+                # The budget (FleetConfig.warm_create_budget) covers the
+                # create only; the suspend below runs outside it.
+                async with budget or nullcontext():
+                    # Woken by a call that close cut off, not cancelled itself:
+                    # no create on a channel that close has to open for it.
+                    self._stop_if_closing()
+                    with self._lock:
+                        # A reap, unwarm_pool or shrinking resize_pool ran while
+                        # this create waited for a slot: its pool is gone, so
+                        # it does not start.
+                        if not self._may_pool(teardowns) or self._pool_gens.get(pool_key, 0) != gen:
+                            return None
+                    started.append(actor_id)
                     try:
-                        await self._client_for(actor_id).create(
-                            actor_id,
-                            template_name=template_id,
-                            atespace=self.atespace,
-                            rootfs_image=rootfs_image,
-                            worker_selector=self.worker_selector_for(rootfs_image),
-                        )
-                    finally:
-                        in_driver_span.reset(drv_tok)
-                except (NotFoundError, FailedPreconditionError) as e:
-                    raise SandboxStartError(
-                        f"ActorTemplate '{template_id}' invalid or does not exist on Substrate server: {e}"
-                    ) from e
-                except Exception as e:
-                    logger.warning("Failed to provision warm actor %s: %s", actor_id, e)
-                    return None
+                        drv_tok = in_driver_span.set(True)
+                        try:
+                            await self._client_for(actor_id).create(
+                                actor_id,
+                                template_name=template_id,
+                                atespace=self.atespace,
+                                rootfs_image=rootfs_image,
+                                worker_selector=self.worker_selector_for(rootfs_image),
+                            )
+                        finally:
+                            in_driver_span.reset(drv_tok)
+                    except (NotFoundError, FailedPreconditionError) as e:
+                        raise SandboxStartError(
+                            f"ActorTemplate '{template_id}' invalid or does not exist on Substrate server: {e}"
+                        ) from e
+                    except Exception as e:
+                        logger.warning("Failed to provision warm actor %s: %s", actor_id, e)
+                        return None
                 if wait:
                     # Created during a close: no suspend; the call's handler
                     # below owns the actor and deletes it.
@@ -1429,22 +1526,6 @@ class SubstrateBackendDriver(BackendDriver):
                             )
                         await self._delete_unpooled(actor_id, "after failed warm suspend")
                         return None
-                else:
-                    task = asyncio.create_task(
-                        self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
-                    )
-                    self._background_tasks.add(task)
-
-                    def _done(t: asyncio.Task[Any]) -> None:
-                        self._background_tasks.discard(t)
-                        if not t.cancelled() and t.exception():
-                            logger.warning(
-                                "Background suspend for warm actor %s failed: %s",
-                                actor_id,
-                                t.exception(),
-                            )
-
-                    task.add_done_callback(_done)
                 return actor_id
 
         tasks = [_warm_one() for _ in range(needed)]
@@ -1486,44 +1567,73 @@ class SubstrateBackendDriver(BackendDriver):
             raise
 
         created = [r for r in results if isinstance(r, str)]
-        # The reservation turns into pool entries under one lock, so a
-        # concurrent warm_pool always counts these actors in one of the two.
-        with self._lock:
-            _release_reservation()
-            # After a reap, unwarm_pool or a shrinking resize_pool, the pool
-            # these actors were made for is gone: delete them instead.
-            torn_down = not self._may_pool(teardowns)
-            drained = self._pool_gens.get(pool_key, 0) != gen
-            # Owned either way. Actors to delete are owned under
-            # WARM_POOL_RUN_ID from the start: the run's reap may already
-            # have run, and a cancel can land before any delete below starts
-            # (AC-15.9).
-            owner = WARM_POOL_RUN_ID if (torn_down or drained) else effective_run_id
-            for aid in created:
-                self._owned_actors[aid] = self._make_instance(
-                    aid, template_id, run_id=owner, rootfs_image=rootfs_image
-                )
-                if not (torn_down or drained):
-                    self._warm_paused_pool.setdefault(pool_key, []).append(aid)
-        if torn_down or drained:
-            if created:
-                logger.info(
-                    "%s ran while warming %d actors for template %s; deleting them",
-                    "Teardown" if torn_down else "unwarm_pool or resize_pool",
-                    len(created),
-                    template_id,
-                )
-            why = "after teardown" if torn_down else "after unwarm_pool or resize_pool"
-            try:
-                await asyncio.gather(*(self._delete_unpooled(aid, why) for aid in created))
-            except BaseException:
-                # A delete that close() cancelled before its first step ran
-                # no handler of its own.
+        if not wait:
+            with self._lock:
+                _release_reservation(needed - len(created))
+                torn_down = not self._may_pool(teardowns)
+                drained = self._pool_gens.get(pool_key, 0) != gen
+                if torn_down or drained:
+                    _release_reservation(len(created))
+                    for aid in created:
+                        self._owned_actors[aid] = self._make_instance(
+                            aid, template_id, run_id=WARM_POOL_RUN_ID, rootfs_image=rootfs_image
+                        )
+            if torn_down or drained:
+                await _delete_abandoned(created, torn_down)
+            else:
                 for aid in created:
-                    self._delete_unreaped_in_close(aid)
-                raise
+                    task = asyncio.create_task(_suspend_and_pool(aid))
+                    with self._lock:
+                        self._background_tasks.add(task)
+
+                    def _done(t: asyncio.Task[Any], actor_id: str = aid) -> None:
+                        with self._lock:
+                            self._background_tasks.discard(t)
+                            cancelled_early = t.cancelled() and actor_id not in entered_suspends
+                            if cancelled_early:
+                                _release_reservation(1)
+                                reaped_since = not self._may_pool(teardowns)
+                                self._owned_actors.setdefault(
+                                    actor_id,
+                                    self._make_instance(
+                                        actor_id,
+                                        template_id,
+                                        run_id=WARM_POOL_RUN_ID,
+                                        rootfs_image=rootfs_image,
+                                    ),
+                                )
+                            else:
+                                reaped_since = False
+                        if cancelled_early and reaped_since and _loop_running():
+                            self._spawn_background_delete(
+                                actor_id, "after a cancelled warm suspend"
+                            )
+
+                    task.add_done_callback(_done)
         else:
-            self._observe("warm_add", len(created))
+            # The reservation turns into pool entries under one lock, so a
+            # concurrent warm_pool always counts these actors in one of the two.
+            with self._lock:
+                _release_reservation()
+                # After a reap, unwarm_pool or a shrinking resize_pool, the pool
+                # these actors were made for is gone: delete them instead.
+                torn_down = not self._may_pool(teardowns)
+                drained = self._pool_gens.get(pool_key, 0) != gen
+                # Owned either way. Actors to delete are owned under
+                # WARM_POOL_RUN_ID from the start: the run's reap may already
+                # have run, and a cancel can land before any delete below starts
+                # (AC-15.9).
+                owner = WARM_POOL_RUN_ID if (torn_down or drained) else effective_run_id
+                for aid in created:
+                    self._owned_actors[aid] = self._make_instance(
+                        aid, template_id, run_id=owner, rootfs_image=rootfs_image
+                    )
+                    if not (torn_down or drained):
+                        self._warm_paused_pool.setdefault(pool_key, []).append(aid)
+            if torn_down or drained:
+                await _delete_abandoned(created, torn_down)
+            else:
+                self._observe("warm_add", len(created))
 
         for res in results:
             if isinstance(res, SandboxStartError):
@@ -1794,6 +1904,22 @@ class SubstrateBackendDriver(BackendDriver):
         self._sync(
             self.resize_pool_async(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
         )
+
+    def _warm_budget(self) -> asyncio.Semaphore | None:
+        """The running loop's warm_create_budget semaphore, or None without a budget.
+
+        A changed budget takes effect for the warm_pool calls that start after
+        the change; creates of earlier calls keep the slots they hold.
+        """
+        budget = self.warm_create_budget
+        if budget is None:
+            return None
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            entry = self._warm_budgets.get(loop)
+            if entry is None or entry[0] != budget:
+                entry = self._warm_budgets[loop] = (budget, asyncio.Semaphore(budget))
+            return entry[1]
 
     def pool_size(self, template_id: str, rootfs_image: str | None = None) -> int | None:
         """Paused actors waiting in the warm pool of (template_id, rootfs_image)."""

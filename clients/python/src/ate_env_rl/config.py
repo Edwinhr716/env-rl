@@ -233,6 +233,9 @@ class FleetConfig:
     warm_per_task: bool = False
     # Images warmed at the same time by setup() and warm_images().
     warm_parallelism: int = 16
+    # Warm creates in flight at once across all images (FL-16); None leaves
+    # each warm_pool call's own limit alone.
+    warm_create_budget: int | None = None
     # gRPC connections to ate-env-api. Each HTTP/2 connection carries a
     # bounded number of concurrent calls (the server's MaxConcurrentStreams,
     # 250 on a Go server without an HTTP/2 config), and a Service spreads
@@ -340,6 +343,13 @@ class FleetConfig:
         if (not isinstance(self.warm_parallelism, int) or isinstance(self.warm_parallelism, bool)
                 or self.warm_parallelism < 1):
             raise ValidationError(f"warm_parallelism must be >= 1, got {self.warm_parallelism}")
+
+        if self.warm_create_budget is not None and (
+            not isinstance(self.warm_create_budget, int)
+            or isinstance(self.warm_create_budget, bool)
+            or self.warm_create_budget < 1
+        ):
+            raise ValidationError(f"warm_create_budget must be >= 1, got {self.warm_create_budget}")
 
         if self.connections is not None and (
             not isinstance(self.connections, int) or isinstance(self.connections, bool) or self.connections < 1

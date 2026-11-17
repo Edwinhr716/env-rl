@@ -58,6 +58,7 @@ from ate_env_rl import (
     InvalidArgumentError,
     LookaheadWarmer,
     NotFoundError,
+    PoolReadiness,
     ProcessState,
     SandboxFleet,
     Signal,
@@ -640,6 +641,74 @@ def test_fleet_lookahead_warm_pool_lifecycle():
         finally:
             warmer.close()
         assert fleet.pool_size(warm_img) == 0
+
+
+async def test_fleet_warm_wait_false_and_wait_pools_ready(client):
+    """FL-14/FL-16 E2E: warm_images(wait=False) with warm_create_budget
+    followed by wait_pools_ready() waits until every warm environment's
+    background suspend finishes, so immediate acquire/exec and teardown do not
+    race an in-flight SuspendActor (codes.Aborted)."""
+    atespace = os.environ.get("NAMESPACE", "ate-env")
+    warm_a = "e2e-warm-wait-false-a:latest"
+    warm_b = "e2e-warm-wait-false-b:latest"
+    base_tmpl = TEMPLATE or "default-template"
+    cfg = FleetConfig(
+        backend="substrate",
+        endpoint=TARGET,
+        tenancy=atespace,
+        template=base_tmpl,
+        image_templates={warm_a: base_tmpl, warm_b: base_tmpl},
+        max_warmpool_replicas=4,
+        warm_create_budget=4,
+        auth_token=AUTH_TOKEN,
+    )
+    fleet = SandboxFleet(cfg)
+    try:
+        await asyncio.to_thread(fleet.warm_images, [warm_a, warm_b], 4, False)
+        readiness = await asyncio.to_thread(
+            fleet.wait_pools_ready, READY_TIMEOUT, 0.05
+        )
+        assert readiness == {
+            warm_a: PoolReadiness(ready=4, target=4),
+            warm_b: PoolReadiness(ready=4, target=4),
+        }
+        assert all(r.met for r in readiness.values())
+
+        handle = await asyncio.to_thread(
+            fleet.acquire,
+            Task(id=f"warm-wf-{uuid.uuid4().hex[:6]}", image=warm_a),
+        )
+        assert handle.claim_source == "warm_pool"
+        res = await asyncio.to_thread(handle.exec, "echo wait-pools-ready-ok")
+        assert res.exit_code == 0
+        assert res.stdout == "wait-pools-ready-ok\n"
+        await asyncio.to_thread(fleet.release, handle)
+
+        fleet2 = SandboxFleet(cfg)
+        try:
+            await asyncio.to_thread(fleet2.warm_images, [warm_a], 6, False)
+            r2 = await asyncio.to_thread(
+                fleet2.wait_pools_ready, READY_TIMEOUT, 0.05
+            )
+            assert r2 == {warm_a: PoolReadiness(ready=6, target=6)}
+            report = await asyncio.to_thread(fleet2.teardown, True)
+            assert report is not None and report.clean
+        except EnvError as exc:
+            await asyncio.sleep(0.5)
+            rep = getattr(exc, "teardown_report", None)
+            for aid in getattr(rep, "surviving_ids", ()):
+                try:
+                    await client.delete(aid, atespace=atespace)
+                except NotFoundError:
+                    pass
+            raise
+        finally:
+            await asyncio.to_thread(fleet2.close)
+    finally:
+        try:
+            await asyncio.to_thread(fleet.teardown, True)
+        finally:
+            await asyncio.to_thread(fleet.close)
 
 
 @pytest.mark.skipif(

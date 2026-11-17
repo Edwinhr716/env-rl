@@ -207,6 +207,23 @@ class GoldenSnapshotState(enum.IntEnum):
     FAILED = env_pb2.GOLDEN_SNAPSHOT_STATE_FAILED
 
 
+@dataclass(frozen=True)
+class PoolReadiness:
+    """One image's warm pool in ``wait_pools_ready()`` (FL-15).
+
+    ``ready`` is the idle warm sandboxes the backend reports for the pool
+    (None when the backend cannot tell), ``target`` the replicas that the
+    last ``warm_images``, ``warm_image`` or ``set_pool_replicas`` asked for.
+    """
+
+    ready: int | None
+    target: int
+
+    @property
+    def met(self) -> bool:
+        return self.ready is not None and self.ready >= self.target
+
+
 PreflightStatus = Literal["ok", "failed", "skipped"]
 
 

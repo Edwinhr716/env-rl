@@ -573,6 +573,38 @@ FleetConfig(max_concurrent=64, max_warmpool_replicas=16, warm_per_task=True)
 once. A failed image does not stop the others: the first error is raised once
 every image was tried.
 
+`warm_parallelism` counts images, not creates: 16 images of 20 replicas each can
+send 320 creates at once. `warm_create_budget` caps the warm creates in flight
+across all images, on `SandboxFleet` and `AsyncSandboxFleet`. The Substrate
+driver applies it; with a driver that cannot, such as the mock driver, the fleet
+logs a warning and the budget has no effect. A create that waits for a slot does
+not start once a teardown, `unwarm_image()` or a shrinking `set_pool_replicas()`
+began for its pool. A changed budget applies to the warm calls that start after
+the change; earlier warm calls keep the slots they already hold. It is unset by
+default, which leaves each pool's own limit of 16 creates.
+
+```python
+FleetConfig(warm_parallelism=16, warm_create_budget=64)
+```
+
+`fleet.wait_pools_ready(timeout_s)` waits until each warmed image's pool holds
+the replicas the last `setup()`, `warm_images()`, `warm_image()` or
+`set_pool_replicas()` asked for, and returns the `ready` and `target` counts per
+image as `PoolReadiness`. It returns at the timeout without raising and starts
+no warm-up, so a training loop can start with the pools it got. A pool whose
+backend cannot count it (`ready` is None) does not hold the wait. A pool that
+cannot fill, for example after a failed warm, holds the wait until the timeout.
+`timeout_s` and `poll_s` must be numbers, and `poll_s` must be above zero, or
+the call raises `ValidationError`. An acquire takes its sandbox out of the pool,
+so wait before acquiring.
+
+```python
+fleet.warm_images(images, wait=False)
+for image, pool in fleet.wait_pools_ready(timeout_s=300).items():
+    if not pool.met:
+        print(f"{image}: {pool.ready}/{pool.target} warm")
+```
+
 ### Keep environments on the worker pools that hold their image
 
 `FleetConfig.node_selector` is sent as the per-environment `worker_selector` on

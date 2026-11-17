@@ -1,8 +1,9 @@
 # Plan: client-only fleet gaps (#123)
 
 Status: proposal, 2026-11-14, checked against `main` at `456353fd`. Row 10 (FL-1 to FL-4) is built
-by #397, rows 32 and 31 (FL-5 to FL-9) by #395, and row 35 (FL-18, FL-19) by #396; the rest is open.
-The criteria are in [acceptance-criteria.md](./acceptance-criteria.md), group `FL`.
+by #397, rows 32 and 31 (FL-5 to FL-9) by #395, rows 17 and 15 (FL-14 to FL-17) by #423, and row 35
+(FL-18, FL-19) by #396; the rest is open. The criteria are in
+[acceptance-criteria.md](./acceptance-criteria.md), group `FL`.
 
 ## 1. Scope
 

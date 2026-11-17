@@ -307,6 +307,7 @@ async def test_lookahead_on_a_substrate_fleet(fake_stack):
             handles = [fleet.acquire(Task(id=f"t{i}", image=img)) for i in range(4)]
             assert fleet.pool_size(img) == 0
             warmer.add(1, {img: 2})
+            fleet.wait_pools_ready(timeout_s=5.0, poll_s=0.01)
             assert fleet.pool_size(img) == 2
             fleet.release(handles)
             warmer.finish(0)                  # kept (keep_finished=1); its demand is all claimed

@@ -29,7 +29,7 @@ from typing import Any
 
 from .config import FleetConfig
 from .errors import PreflightError
-from .fleet import SandboxFleet, _report, _skipped_checks
+from .fleet import SandboxFleet, _report, _skipped_checks, _wait_args
 from .handle import SandboxHandle
 from .observability import Observer, RunReport, repo_family
 from .sources import FieldSpec, TaskSource
@@ -41,7 +41,14 @@ from .telemetry.trace_recorder import (
     register_env_meta,
     task_context,
 )
-from .types import FleetPlan, PreflightCheck, PreflightReport, Task, TeardownReport
+from .types import (
+    FleetPlan,
+    PoolReadiness,
+    PreflightCheck,
+    PreflightReport,
+    Task,
+    TeardownReport,
+)
 
 logger = logging.getLogger("sandbox_sdk.async_fleet")
 
@@ -258,6 +265,7 @@ class AsyncSandboxFleet:
             sized = {img: replicas for img in images}
         else:
             sized = self._fleet._size_pools(self.image_counts(), images)
+        self._fleet._set_warm_targets(sized)
         work = []
         for img in dict.fromkeys(images):
             template_id, rootfs_image = await self._ensure_template_for_image_async(img)
@@ -267,6 +275,7 @@ class AsyncSandboxFleet:
     async def _warm_many(
         self, work: list[tuple[str, str, str | None, int]], wait: bool
     ) -> None:
+        self._fleet._set_warm_targets({img: rep for img, _, _, rep in work})
         work = [w for w in work if w[3] > 0]
         if not work:
             return
@@ -301,6 +310,7 @@ class AsyncSandboxFleet:
         """Size one image's warm pool to exactly ``replicas``, up or down; see
         ``SandboxFleet.set_pool_replicas``."""
         replicas = max(0, int(replicas))
+        self._fleet._set_warm_targets({image: replicas})
         template_id, rootfs_image = await self._ensure_template_for_image_async(image)
         family = repo_family(image)
         try:
@@ -331,6 +341,7 @@ class AsyncSandboxFleet:
                 )
 
     async def unwarm_image(self, image: str) -> None:
+        self._fleet._set_warm_targets({image: 0})
         entry = self._fleet._image_to_template.get(image)
         if entry:
             template_id, rootfs_image = entry
@@ -348,6 +359,19 @@ class AsyncSandboxFleet:
     def pool_size(self, image: str) -> int | None:
         """Idle warm replicas for ``image`` (see ``SandboxFleet.pool_size``)."""
         return self._fleet.pool_size(image)
+
+    async def wait_pools_ready(self, timeout_s: float, poll_s: float = 0.5) -> dict[str, PoolReadiness]:
+        """Wait until each warmed image's pool holds its target replicas, or
+        ``timeout_s``; see ``SandboxFleet.wait_pools_ready``."""
+        timeout_s, poll_s = _wait_args(timeout_s, poll_s)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout_s)
+        while True:
+            readiness = self._fleet._pool_readiness()
+            remaining = deadline - loop.time()
+            if remaining <= 0 or all(r.met or r.ready is None for r in readiness.values()):
+                return readiness
+            await asyncio.sleep(min(poll_s, remaining))
 
     async def acquire(self, task: Task | str, timeout_s: float | None = None) -> SandboxHandle:
         """Asynchronously acquire a single sandbox."""
@@ -536,6 +560,7 @@ class AsyncSandboxFleet:
             self.observer.warm_reset()
             # The next setup() or run() warms again.
             self._fleet._preflight_for = None
+            self._fleet._warm_targets = {}
         if verify:
             return await self._verify_teardown()
         return None
