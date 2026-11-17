@@ -88,8 +88,9 @@
 #   The Go build cache is keyed by compiler flags and environment as well as by
 #   source (https://pkg.go.dev/cmd/go#hdr-Build_and_test_caching). The Go job
 #   builds with -race and cgo; the E2E job builds the ate-env and Substrate
-#   images with ko, which uses CGO_ENABLED=0 and -trimpath
-#   (https://ko.build/configuration/). A cache saved by one gives the other no
+#   images with ko (CGO_ENABLED=0 and -trimpath, https://ko.build/configuration/);
+#   the release validation job cross-compiles ate-env across four OS/arch pairs
+#   with CGO_ENABLED=0 and -trimpath. A cache saved by one gives the others no
 #   hits. Substrate's own CI found the same thing and keeps a separate E2E cache:
 #   https://github.com/agent-substrate/substrate/blob/85e475fdd682c03dbb08a0e8a8398e6cb5990245/.github/workflows/pr-workflow.yaml#L217-L220
 name: Cache Go and Substrate builds
@@ -100,7 +101,7 @@ inputs:
     description: "`restore` (before the build) or `save` (after it; only pushes to main and same-repository pull requests save)."
     required: true
   scope:
-    description: Cache namespace for the job, e.g. `go` or `e2e`. Jobs with different build flags must use different scopes.
+    description: Cache namespace for the job, e.g. `go`, `e2e` or `release`. Jobs with different build flags must use different scopes.
     required: true
 
 runs:

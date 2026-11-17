@@ -233,6 +233,15 @@ jobs:
     runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
     timeout-minutes: 15
     steps:
+      # As in the Kind E2E job: the hosted runner's root disk fills while
+      # ci-release cross-compiles ate-env across four OS/arch targets next to
+      # the Nix store and the Go caches.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -241,10 +250,17 @@ jobs:
         uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # A separate scope from the Go job: ci-release cross-compiles with
+      # CGO_ENABLED=0 and -trimpath across linux/darwin x amd64/arm64, so the
+      # Go job's -race build cache gives no hits and only fills the disk.
       - uses: ./.github/actions/cache-go-and-substrate
         with:
           mode: restore
-          scope: go
+          scope: release
       - name: Validate release builds and distributions via Nix
         shell: nix develop -c bash -eo pipefail {0}
         run: ci-release
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: save
+          scope: release
