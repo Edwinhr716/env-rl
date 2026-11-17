@@ -410,7 +410,16 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 			runStart = a.start
 		}
 		if g := s.WakeNoCapacityGrace; g > 0 && a.done.Sub(runStart) >= g {
-			if i != len(attempts)-1 || code != codes.ResourceExhausted {
+			// The caller's ctx may end at the instant this attempt's state
+			// read answers, as in WF-2: the read's answer and ctx.Done are
+			// then both ready, and when the read wins with a transient
+			// error, awaitWake returns the caller's code (WF-7). The
+			// attempt is still the last one. Both times are instants of
+			// the synctest bubble's fake clock, so they are equal exactly;
+			// a check on the ctx error alone would let a wait that runs on
+			// past the grace until the caller's end pass WF-4.
+			callerEndedAtRead := ctxErr != nil && code == wantCtxCode && a.readDone.Equal(start.Add(callerEndAt))
+			if i != len(attempts)-1 || (code != codes.ResourceExhausted && !callerEndedAtRead) {
 				rt.Fatalf("WF-4: no room for %s (grace %s) at attempt %d, but the wait went on to attempt %d and returned %v",
 					a.done.Sub(runStart), g, i+1, len(attempts), err)
 			}
