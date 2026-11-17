@@ -62,6 +62,14 @@ user needs to know across them.
   `localhost`, a name of its Service or a name in `--allowed-hosts`, or when
   the port proxy is off (`--atenet-connect` empty).
   `ate_env_e2b.Sandbox.get_host` does not use the form yet.
+- Python client: `teardown(verify=True)` on both fleets returns a
+  `TeardownReport`: the environments that the reap targeted (the ones the
+  fleet created, warm-pool ones included) and that still exist, with counts
+  per status. It reads them with `ListEnvironments`, or with
+  `GetEnvironment` per id on a server without it. When the reap raises, the
+  error carries the report as `teardown_report`, or the verify's error as
+  `teardown_report_error`. An environment whose delete failed stays in each
+  later report of the run until a verify reads it as gone (FL-18, FL-19).
 - `ListEnvironments` on `EnvironmentService`: the environments of one
   atespace, one page per call. `page_size` defaults to 100, and the server
   lowers a value above 1000 to 1000. `page_token` is Substrate's token. An
