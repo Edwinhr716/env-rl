@@ -1,0 +1,44 @@
+{{/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/}}
+{{define "content"}}
+<p class="crumbs"><a href="/">Fleet</a> / actor</p>
+<h1 class="mono">{{.UID}}</h1>
+<p class="muted"><a href="{{.EventsJSON}}">JSON</a></p>
+{{range .Found}}
+<h2>{{.Actor.Atespace}} / {{.Actor.Name}} <span class="st-text st-{{.Actor.State}}">{{.Actor.State}}</span></h2>
+<table>
+  <tr><th>Cluster</th><td><a href="{{clusterURL .Project .Cluster}}">{{.Project}} / {{.Cluster}}</a></td></tr>
+  <tr><th>Template</th><td>{{.Actor.Template}}{{with .Actor.SourceTag}} <span class="muted">from {{.}}</span>{{end}}</td></tr>
+  <tr><th>Node</th><td>{{.Actor.AssignedNode}}</td></tr>
+  <tr><th>Worker</th><td class="mono">{{.Actor.Worker}}</td></tr>
+  <tr><th>Created</th><td>{{timestamp .Actor.CreateTime}}</td></tr>
+  <tr><th>Updated</th><td>{{timestamp .Actor.UpdateTime}}</td></tr>
+  {{with .Actor.Crash}}<tr><th>Crash</th><td><span class="error">{{.Message}}</span> at {{timestamp .CrashTime}}</td></tr>{{end}}
+</table>
+{{else}}
+<p class="muted">No cluster's latest snapshot lists this actor: it is deleted, or its cluster's reporter has not written it yet.</p>
+{{end}}
+
+<h2>Transitions since {{timestamp .Since}}</h2>
+{{with .EventsUnavailable}}<p class="muted">{{.}}</p>{{else}}
+{{if .Truncated}}<p class="muted">The newest 1000 are shown.</p>{{end}}
+<table>
+  <tr><th>Time</th><th>Cluster</th><th>Operation</th><th>State</th><th>Template</th><th>Trace</th></tr>
+  {{range .Events}}<tr><td>{{.Time}}</td><td>{{if .ClusterURL}}<a href="{{.ClusterURL}}">{{.Project}} / {{.Cluster}}</a>{{else}}{{.Project}} / {{.Cluster}}{{end}}</td><td>{{.Operation}}</td><td><span class="st-text st-{{.State}}">{{.State}}</span></td><td>{{.TemplateName}}</td><td>{{if .TraceURL}}<a href="{{.TraceURL}}" rel="noopener noreferrer" target="_blank">{{.TraceID}}</a>{{else}}<span class="muted">{{.TraceID}}</span>{{end}}</td></tr>
+  {{else}}<tr><td colspan="6" class="muted">none in the window</td></tr>{{end}}
+</table>
+{{end}}
+{{end}}

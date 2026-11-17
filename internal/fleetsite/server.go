@@ -48,6 +48,10 @@ const (
 	// limit of its own on top of the general one.
 	eventsRate  = rate.Limit(1)
 	eventsBurst = 5
+	// Each new metrics request is a Cloud Monitoring query, whose read
+	// quota the project shares.
+	metricsRate  = rate.Limit(2)
+	metricsBurst = 10
 	// limiterIdle is how long an unused per-user limiter is kept.
 	limiterIdle = 10 * time.Minute
 )
@@ -67,6 +71,7 @@ var actorUID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 // EventSource returns one actor's lifecycle events.
 type EventSource interface {
 	ActorEvents(ctx context.Context, uid string, since time.Time) ([]Event, error)
+	RecentEvents(ctx context.Context, since time.Time, limit int) ([]Event, error)
 }
 
 // Authenticate returns the email of the request's user, or an error that
@@ -86,7 +91,10 @@ type Config struct {
 	// Events is nil when no events table is configured; the events API
 	// then answers 503.
 	Events EventSource
-	Auth   Authenticate
+	// Metrics is nil when no metrics project is configured; the metrics
+	// API then answers 503.
+	Metrics MetricsSource
+	Auth    Authenticate
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	// Version is shown in the page footer.
@@ -102,12 +110,13 @@ type Server struct {
 	mu       sync.Mutex
 	limiters map[string]*userLimiter
 	swept    time.Time
+	live     liveCache
 	css      []byte
 }
 
 type userLimiter struct {
-	lim, events *rate.Limiter
-	seen        time.Time
+	lim, events, metrics *rate.Limiter
+	seen                 time.Time
 }
 
 // New returns the site's handler.
@@ -119,7 +128,7 @@ func New(cfg Config) (*Server, error) {
 		cfg.Now = time.Now
 	}
 	s := &Server{cfg: cfg, pages: map[string]*template.Template{}, limiters: map[string]*userLimiter{}}
-	for _, page := range []string{"fleet.html", "cluster.html", "error.html"} {
+	for _, page := range []string{"fleet.html", "cluster.html", "actor.html", "live.html", "error.html"} {
 		t, err := template.New(page).Funcs(templateFuncs).ParseFS(assets, "templates/layout.html", "templates/"+page)
 		if err != nil {
 			return nil, err
@@ -138,6 +147,10 @@ func New(cfg Config) (*Server, error) {
 	app.HandleFunc("GET /api/v1/clusters", s.apiClusters)
 	app.HandleFunc("GET /api/v1/clusters/{project}/{cluster}", s.apiCluster)
 	app.HandleFunc("GET /api/v1/actors/{uid}/events", s.apiActorEvents)
+	app.HandleFunc("GET /actors/{uid}", s.actorPage)
+	app.HandleFunc("GET /live", s.livePage)
+	app.HandleFunc("GET /api/v1/live", s.apiLive)
+	app.HandleFunc("GET /api/v1/metrics/{name}", s.apiMetrics)
 	app.HandleFunc("GET /static/site.css", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		_, _ = w.Write(s.css)
@@ -214,7 +227,7 @@ func (s *Server) allow(email string) bool {
 	}
 	l, ok := s.limiters[email]
 	if !ok {
-		l = &userLimiter{lim: rate.NewLimiter(userRate, userBurst), events: rate.NewLimiter(eventsRate, eventsBurst)}
+		l = &userLimiter{lim: rate.NewLimiter(userRate, userBurst), events: rate.NewLimiter(eventsRate, eventsBurst), metrics: rate.NewLimiter(metricsRate, metricsBurst)}
 		s.limiters[email] = l
 	}
 	l.seen = now
@@ -223,6 +236,11 @@ func (s *Server) allow(email string) bool {
 
 // allowEvents applies the events route's own limit to the user.
 func (s *Server) allowEvents(email string) bool {
+	return s.allowLimited(email, func(l *userLimiter) *rate.Limiter { return l.events })
+}
+
+// allowLimited applies one of the user's route limits.
+func (s *Server) allowLimited(email string, which func(*userLimiter) *rate.Limiter) bool {
 	now := s.cfg.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -230,7 +248,7 @@ func (s *Server) allowEvents(email string) bool {
 	if !ok {
 		return false
 	}
-	return l.events.AllowN(now, 1)
+	return which(l).AllowN(now, 1)
 }
 
 func user(r *http.Request) string {
@@ -336,19 +354,10 @@ func (s *Server) apiActorEvents(w http.ResponseWriter, r *http.Request) {
 		s.apiError(w, r, http.StatusBadRequest, "uid is not an actor uid", nil)
 		return
 	}
-	now := s.cfg.Now()
-	since := now.Add(-defaultEventsWindow)
-	if v := r.URL.Query().Get("since"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			s.apiError(w, r, http.StatusBadRequest, "since is not an RFC 3339 time", nil)
-			return
-		}
-		if t.After(now) || now.Sub(t) > maxEventsWindow {
-			s.apiError(w, r, http.StatusBadRequest, "since must be in the last 30 days", nil)
-			return
-		}
-		since = t
+	since, err := s.parseSince(r)
+	if err != nil {
+		s.apiError(w, r, http.StatusBadRequest, err.Error(), nil)
+		return
 	}
 	if s.cfg.Events == nil {
 		s.apiError(w, r, http.StatusServiceUnavailable, "no events table is configured", nil)

@@ -49,6 +49,7 @@ func main() {
 	flag.StringVar(&cfg.bucket, "bucket", os.Getenv("FLEET_BUCKET"), "Cloud Storage bucket the reporters write v1/inventory/ to (env FLEET_BUCKET); exactly one of -bucket and -dir")
 	flag.StringVar(&cfg.dir, "dir", "", "read the bucket layout under this local directory, as ate-env-reporter -out-dir writes it, instead of a bucket")
 	flag.StringVar(&cfg.eventsTable, "events-table", os.Getenv("FLEET_EVENTS_TABLE"), "BigQuery view of the actor events, <project>.<dataset>.actor_events_v (env FLEET_EVENTS_TABLE); required with IAP")
+	flag.StringVar(&cfg.metricsProject, "metrics-project", os.Getenv("FLEET_METRICS_PROJECT"), "project whose Cloud Monitoring metrics scope holds the clusters' projects, for the metrics API (env FLEET_METRICS_PROJECT); empty turns the metrics API off")
 	flag.StringVar(&cfg.iapAudience, "iap-audience", os.Getenv("FLEET_IAP_AUDIENCE"), "audience of the IAP assertion, for Cloud Run /projects/<number>/locations/<region>/services/<service> (env FLEET_IAP_AUDIENCE)")
 	flag.BoolVar(&cfg.insecureNoIAP, "insecure-no-iap", false, "serve without checking an IAP assertion, for a local run: -listen must then be a loopback address")
 	flag.Parse()
@@ -64,6 +65,7 @@ func main() {
 
 type config struct {
 	listen, bucket, dir, eventsTable, iapAudience string
+	metricsProject                                string
 	insecureNoIAP                                 bool
 }
 
@@ -125,10 +127,20 @@ func run(ctx context.Context, cfg config) error {
 		events = bq
 	}
 
+	var metrics fleetsite.MetricsSource
+	if cfg.metricsProject != "" {
+		m, err := fleetsite.NewPromQLMetrics(ctx, cfg.metricsProject, fleetsite.MonitoringEndpoint)
+		if err != nil {
+			return err
+		}
+		metrics = m
+	}
+
 	version, _ := telemetry.BuildVersion()
 	site, err := fleetsite.New(fleetsite.Config{
 		Snapshots: fleetsite.NewSnapshots(store, nil),
 		Events:    events,
+		Metrics:   metrics,
 		Auth:      auth,
 		Version:   version,
 	})
@@ -152,7 +164,7 @@ func run(ctx context.Context, cfg config) error {
 	if cfg.bucket == "" {
 		source = cfg.dir
 	}
-	log.Printf("ate-env-fleet-site %s: serving %s on %s (events: %q)", version, source, ln.Addr(), cfg.eventsTable)
+	log.Printf("ate-env-fleet-site %s: serving %s on %s (events: %q, metrics: %q)", version, source, ln.Addr(), cfg.eventsTable, cfg.metricsProject)
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()

@@ -33,9 +33,11 @@ const MaxEvents = 1000
 // scan more fails instead of billing it.
 const maxBytesBilled = 10 << 30
 
-// eventsTable matches <project>.<dataset>.<table or view>. BigQuery allows
-// 1024 characters in a dataset or table name; RE2 caps a repeat at 1000.
-var eventsTable = regexp.MustCompile(`^([a-z][a-z0-9-]{4,28}[a-z0-9])\.([A-Za-z0-9_]{1,1000})\.([A-Za-z0-9_]{1,1000})$`)
+// eventsTable matches <project>.<dataset>.<table or view>, where the project
+// may be domain-scoped (example.com:my-project), as gcpProject. BigQuery
+// allows 1024 characters in a dataset or table name; RE2 caps a repeat at
+// 1000.
+var eventsTable = regexp.MustCompile(`^((?:[a-z0-9][a-z0-9.-]*[a-z0-9]:)?[a-z][a-z0-9-]{4,28}[a-z0-9])\.([A-Za-z0-9_]{1,1000})\.([A-Za-z0-9_]{1,1000})$`)
 
 // eventTime is the column format of time and publish_time: RFC 3339 in UTC
 // with the fraction BigQuery holds.
@@ -88,35 +90,59 @@ func NewBigQueryEvents(ctx context.Context, table string, opts ...option.ClientO
 // ActorEvents returns the events of the actor with uid published at or
 // after since, oldest first: the newest MaxEvents when there are more.
 func (b *BigQueryEvents) ActorEvents(ctx context.Context, uid string, since time.Time) ([]Event, error) {
-	// The table name is checked by eventsTable; the values are parameters.
+	out, err := b.query(ctx, "actor_uid = @uid AND publish_time >= @since", MaxEvents,
+		stringParam("uid", uid), timeParam("since", since))
+	if err != nil {
+		return nil, err
+	}
+	slices.Reverse(out)
+	return out, nil
+}
+
+// RecentEvents returns the events of every actor published at or after
+// since, newest first, at most limit.
+func (b *BigQueryEvents) RecentEvents(ctx context.Context, since time.Time, limit int) ([]Event, error) {
+	return b.query(ctx, "publish_time >= @since", limit, timeParam("since", since))
+}
+
+func stringParam(name, value string) *bigquery.QueryParameter {
+	return &bigquery.QueryParameter{Name: name, ParameterType: &bigquery.QueryParameterType{Type: "STRING"}, ParameterValue: &bigquery.QueryParameterValue{Value: value}}
+}
+
+func timeParam(name string, t time.Time) *bigquery.QueryParameter {
+	return &bigquery.QueryParameter{Name: name, ParameterType: &bigquery.QueryParameterType{Type: "TIMESTAMP"}, ParameterValue: &bigquery.QueryParameterValue{Value: t.UTC().Format("2006-01-02 15:04:05.000000+00:00")}}
+}
+
+// query runs SELECT eventColumns FROM the view WHERE where, newest first,
+// at most limit rows, and reads every page of the result. where is a
+// constant of this file; every value is a parameter.
+func (b *BigQueryEvents) query(ctx context.Context, where string, limit int, params ...*bigquery.QueryParameter) ([]Event, error) {
+	// The table name is checked by eventsTable.
 	query := "SELECT " + eventColumns + " FROM `" + b.table + "`" +
-		" WHERE actor_uid = @uid AND publish_time >= @since ORDER BY time DESC, publish_time DESC" +
-		fmt.Sprintf(" LIMIT %d", MaxEvents)
+		" WHERE " + where + " ORDER BY time DESC, publish_time DESC" +
+		fmt.Sprintf(" LIMIT %d", limit)
 	useLegacy := false
 	req := &bigquery.QueryRequest{
 		Query:              query,
 		UseLegacySql:       &useLegacy,
 		ParameterMode:      "NAMED",
 		MaximumBytesBilled: maxBytesBilled,
-		MaxResults:         MaxEvents,
+		MaxResults:         int64(limit),
 		TimeoutMs:          10_000,
-		QueryParameters: []*bigquery.QueryParameter{
-			{Name: "uid", ParameterType: &bigquery.QueryParameterType{Type: "STRING"}, ParameterValue: &bigquery.QueryParameterValue{Value: uid}},
-			{Name: "since", ParameterType: &bigquery.QueryParameterType{Type: "TIMESTAMP"}, ParameterValue: &bigquery.QueryParameterValue{Value: since.UTC().Format("2006-01-02 15:04:05.000000+00:00")}},
-		},
+		QueryParameters:    params,
 	}
 	resp, err := b.svc.Jobs.Query(b.project, req).Context(ctx).Do()
 	if err != nil {
 		return nil, fmt.Errorf("querying %s: %w", b.table, err)
 	}
-	// Wait for the job, then read every page up to MaxEvents rows.
+	// Wait for the job, then read every page up to limit rows.
 	rows, complete, token := resp.Rows, resp.JobComplete, resp.PageToken
-	for !complete || (token != "" && len(rows) < MaxEvents) {
+	for !complete || (token != "" && len(rows) < limit) {
 		if resp.JobReference == nil {
 			return nil, errors.New("the events query did not complete and returned no job")
 		}
 		call := b.svc.Jobs.GetQueryResults(resp.JobReference.ProjectId, resp.JobReference.JobId).
-			Location(resp.JobReference.Location).MaxResults(int64(MaxEvents - len(rows))).TimeoutMs(10_000)
+			Location(resp.JobReference.Location).MaxResults(int64(limit - len(rows))).TimeoutMs(10_000)
 		if complete {
 			call = call.PageToken(token)
 		}
@@ -137,7 +163,6 @@ func (b *BigQueryEvents) ActorEvents(ctx context.Context, uid string, since time
 		}
 		out = append(out, e)
 	}
-	slices.Reverse(out)
 	return out, nil
 }
 

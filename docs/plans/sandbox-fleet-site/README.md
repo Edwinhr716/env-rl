@@ -2,10 +2,11 @@
 
 Status: accepted plan (#223); pull requests 1, 2 and 2b (`internal/inventory`, the reporter and its
 manifest) merged as #226, #348 and #349; pull requests 3 and 4, the telemetry manifests and the site
-with the Fleet and Cluster pages, merged as #415 and #416. Last checked 2026-11-16 against
-`ai-on-gke/sandboxenv-rl` at `a12f48a0` and the Substrate `go.mod` requires, `274605f1`; the audit
-is in [research.md](./research.md), which first read `3b03b03` and `28520c0d` on 2026-10-30. The
-decisions taken so far are in [decisions.md](./decisions.md). Companions: [prd.md](./prd.md),
+with the Fleet and Cluster pages, merged as #415 and #416; pull request 5a, the Actor and Live pages
+and the metrics API, in review. Last checked 2026-11-17 against `ai-on-gke/sandboxenv-rl` at
+`8d110751` and the Substrate `go.mod` requires, `v1.0.0`; the audit is in
+[research.md](./research.md), which first read `3b03b03` and `28520c0d` on 2026-10-30. The decisions
+taken so far are in [decisions.md](./decisions.md). Companions: [prd.md](./prd.md),
 [execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
 [acceptance-criteria.md](./acceptance-criteria.md) and, for the order of operations with `gcloud`,
 [quickstart.md](./quickstart.md).
@@ -144,11 +145,13 @@ section of [research.md](./research.md) and update the last-checked line above (
    `internal/inventory/testdata/snapshot.golden.json`, then `go test ./internal/inventory/`.
 4. Metrics, in two halves. Each `ate_env_*` family in the named PromQL queries exists in
    `docs/metrics.md` or in the `ate_env_fleet_*` and `ate_env_client_*` registrations under
-   `clients/python`. Each other `ate_*` family (today `ate_workerpool_workers` and
-   `ate_actor_crashes_total`) exists in Substrate's `docs/metrics/registry/metrics.yaml` at the
-   version `go.mod` requires, under the OTLP-to-Prometheus naming: dots become underscores and a
-   counter gains `_total`, so the entries to find are `ate.workerpool.workers` and
-   `ate.actor.crashes`.
+   `clients/python`. Each Substrate instrument (today `ate.workerpool.workers` and
+   `ate.actor.crashes`) exists in Substrate's `docs/metrics/registry/metrics.yaml` at the version
+   `go.mod` requires, with the attributes the query matches and groups by. Substrate pushes them
+   over OTLP, and Cloud Monitoring keeps the dotted names and keys, so the queries select
+   `{"ate.workerpool.workers"}`, not a Prometheus-style `ate_workerpool_workers`. The registry's
+   note on `ate.workerpool.workers` still says to average across the `ateapi` replicas before
+   adding.
 5. Manifest: `ate-env manifest` still has `access-policy --global`, `--metrics-port`,
    `--pod-monitoring`, `--enable-tracing`, `--otlp-endpoint`, `--otlp-insecure`, `reporter` and
    `collector`.

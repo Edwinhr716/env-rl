@@ -281,6 +281,29 @@ labels once its create field lands; `interfaces.md` names that as a possible sou
 `actors[].labels`. `deploy/fleet-site/` and `docs/fleet-site.md` do not exist yet; they are pull
 request 6.
 
+## Audit of main, 2026-11-17
+
+Checked against `ai-on-gke/sandboxenv-rl` at `8d110751`, for pull request 5a. Since `a12f48a0`:
+Substrate moved to `v1.0.0` (`78068ee8`), whose runtime packages equal `274605f1`; #417, #423, #424
+and #433 change nothing the plan reads. The seven steps:
+
+1. `env.proto` has the same ten RPCs.
+2. Substrate `v1.0.0`: the three actor event names in `internal/actorevent` are unchanged, and
+   `ateapi.proto` has no `Batch*` or stream RPC; `ListActors` and the roles are those of `274605f1`.
+3. `internal/inventory` is unchanged; the golden file equals the example of `interfaces.md`.
+4. `docs/metrics.md` is unchanged; `ate.workerpool.workers` and `ate.actor.crashes` are in
+   Substrate's `docs/metrics/registry/metrics.yaml` at `v1.0.0`. Corrected in review of #434: the
+   audit of `28520c0d` said that Cloud Monitoring names them `ate_workerpool_workers` and
+   `ate_actor_crashes_total`. It does not: Substrate pushes them over OTLP, and Cloud Monitoring
+   keeps the dotted names, without `_total`, and the dotted attribute keys
+   (`docs/dev/best-practices/metrics.md`; `docs/examples/gmp-alerting-rules.yaml`, which copies the
+   keys with `label_replace` before `by (...)`). The registry also says, since that audit, to
+   average `ate.workerpool.workers` across the `ateapi` replicas before adding, and that a worker of
+   the `unknown` sandbox class is not capacity. The `workers` and `crashes_rate` queries follow.
+5. `ate-env manifest` has every flag and subcommand of step 5.
+6. `cmd/benchmarking/bench/bundle.go` is unchanged.
+7. `FS-` is used by this plan only.
+
 ## Sources
 
 - Substrate: `docs/observability.md`, `internal/actorevent/actorevent.go`,

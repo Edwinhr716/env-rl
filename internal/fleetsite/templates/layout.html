@@ -20,10 +20,11 @@ limitations under the License.
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}} · ate-env fleet</title>
 <link rel="stylesheet" href="/static/site.css">
+{{with .Refresh}}<meta http-equiv="refresh" content="{{.}}">{{end}}
 </head>
 <body>
 <header>
-  <a class="brand" href="/">ate-env fleet</a>
+  <nav><a class="brand" href="/">ate-env fleet</a> <a href="/live">Live</a></nav>
   <span class="user">{{.User}}</span>
 </header>
 <main>

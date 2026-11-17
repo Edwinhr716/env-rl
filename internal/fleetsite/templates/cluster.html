@@ -56,7 +56,7 @@ limitations under the License.
 <p class="muted">{{$.Matched}} match{{if $.Truncated}}; the first {{len $.Actors}} are shown{{end}}.</p>
 <table>
   <tr><th>Atespace</th><th>Name</th><th>UID</th><th>Template</th><th>State</th><th>Node</th><th>Worker</th><th>Updated</th><th>Crash</th></tr>
-  {{range $.Actors}}<tr><td>{{.Atespace}}</td><td>{{.Name}}</td><td class="mono"><a href="{{eventsURL .UID}}">{{.UID}}</a></td><td>{{.Template}}{{with .SourceTag}} <span class="muted">from {{.}}</span>{{end}}</td><td><span class="st-text st-{{.State}}">{{.State}}</span></td><td>{{.AssignedNode}}</td><td class="mono">{{.Worker}}</td><td>{{timestamp .UpdateTime}}</td><td>{{with .Crash}}<span class="error">{{.Message}}</span>{{end}}</td></tr>
+  {{range $.Actors}}<tr><td>{{.Atespace}}</td><td>{{.Name}}</td><td class="mono"><a href="{{actorURL .UID}}">{{.UID}}</a></td><td>{{.Template}}{{with .SourceTag}} <span class="muted">from {{.}}</span>{{end}}</td><td><span class="st-text st-{{.State}}">{{.State}}</span></td><td>{{.AssignedNode}}</td><td class="mono">{{.Worker}}</td><td>{{timestamp .UpdateTime}}</td><td>{{with .Crash}}<span class="error">{{.Message}}</span>{{end}}</td></tr>
   {{else}}<tr><td colspan="9" class="muted">none</td></tr>{{end}}
 </table>
 

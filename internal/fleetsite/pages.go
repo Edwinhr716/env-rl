@@ -53,7 +53,7 @@ var templateFuncs = template.FuncMap{
 	"apiClusterURL": func(project, cluster string) string {
 		return "/api/v1/clusters/" + url.PathEscape(project) + "/" + url.PathEscape(cluster)
 	},
-	"eventsURL": func(uid string) string { return "/api/v1/actors/" + url.PathEscape(uid) + "/events" },
+	"actorURL": func(uid string) string { return "/actors/" + url.PathEscape(uid) },
 }
 
 func formatAge(d time.Duration) string {

@@ -33,15 +33,29 @@ import (
 )
 
 type fakeEvents struct {
-	uid   string
-	since time.Time
-	out   []Event
-	err   error
+	uid    string
+	since  time.Time
+	out    []Event
+	err    error
+	recent []Event
+	calls  int // RecentEvents calls
+	limit  int
+	// onRecent runs inside RecentEvents, as a slow query's time passes.
+	onRecent func()
 }
 
 func (f *fakeEvents) ActorEvents(_ context.Context, uid string, since time.Time) ([]Event, error) {
 	f.uid, f.since = uid, since
 	return f.out, f.err
+}
+
+func (f *fakeEvents) RecentEvents(_ context.Context, since time.Time, limit int) ([]Event, error) {
+	f.calls++
+	f.since, f.limit = since, limit
+	if f.onRecent != nil {
+		f.onRecent()
+	}
+	return f.recent, f.err
 }
 
 // headerAuth admits a request whose X-Test-User header names a user.
@@ -96,7 +110,7 @@ func (ts *testSite) do(t *testing.T, method, path, user string) (*http.Response,
 // FS-7: without an identity every route but /healthz is denied.
 func TestSiteDeniesWithoutIdentity(t *testing.T) {
 	ts := newTestSite(t)
-	for _, p := range []string{"/", "/clusters/p/c", "/api/v1/clusters", "/api/v1/clusters/p/c", "/api/v1/actors/u/events", "/static/site.css", "/nope"} {
+	for _, p := range []string{"/", "/clusters/p/c", "/api/v1/clusters", "/api/v1/clusters/p/c", "/api/v1/actors/u/events", "/actors/u", "/live", "/api/v1/live", "/api/v1/metrics/requests_rate", "/static/site.css", "/nope"} {
 		resp, body := ts.do(t, http.MethodGet, p, "")
 		if resp.StatusCode != http.StatusForbidden {
 			t.Errorf("GET %s without identity: %d %q, want 403", p, resp.StatusCode, body)
@@ -202,7 +216,7 @@ func TestClusterPage(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("%d: %s", resp.StatusCode, body)
 	}
-	for _, want := range []string{"env-001", "env-002", "w-0a1b2c", "golden-default-template-1a2b3c4d5e6f", "8.0", "2.0 / 8.0", "snapshot download timed out", `href="/api/v1/actors/8f2a0001/events"`} {
+	for _, want := range []string{"env-001", "env-002", "w-0a1b2c", "golden-default-template-1a2b3c4d5e6f", "8.0", "2.0 / 8.0", "snapshot download timed out", `href="/actors/8f2a0001"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("Cluster page lacks %q", want)
 		}
@@ -401,7 +415,7 @@ func TestClusterPageNodeFilterAndRowLimit(t *testing.T) {
 	}
 	big.Counts = inventory.ComputeCounts(big.Actors)
 	_, body = ts.getAfterWrite(t, big, "/clusters/proj-a/c-2")
-	if got := strings.Count(body, `href="/api/v1/actors/u-`); got != maxActorRows {
+	if got := strings.Count(body, `href="/actors/u-`); got != maxActorRows {
 		t.Errorf("%d actor rows, want %d", got, maxActorRows)
 	}
 	if !strings.Contains(body, fmt.Sprintf("%d match; the first %d are shown", maxActorRows+5, maxActorRows)) {

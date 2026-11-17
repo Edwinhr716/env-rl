@@ -226,3 +226,37 @@ Append-only. Each entry: date, who, what, why.
   `docs/plans/ate-env-api/environment-metadata.md` (#391, store in #407) are recorded in
   `interfaces.md` as a possible source for `actors[].labels`. No pull request of this plan reads the
   store; the field stays empty.
+- 2026-11-17, orchestrator: pull request 5 is two. 5a is the Actor and Live pages, `/api/v1/live`
+  and the metrics API; 5b is the Runs page, which reads other objects (`v1/runs/`, the benchmark
+  buckets) and renders a waterfall. Each is reviewable alone, and the repo asks for one change per
+  pull request.
+- 2026-11-17, orchestrator, pull request 5a: the Live page reloads itself with
+  `<meta http-equiv="refresh" content="10">`, so the pages still have no script and the CSP keeps
+  `default-src 'none'` with no nonce. The Live query (last hour, 200 rows, newest first) is cached
+  10 s for every viewer of an instance; the Actor page shares the events route's per-user limit.
+- 2026-11-17, orchestrator, pull request 5a: the metrics API runs the six named queries of
+  `interfaces.md` as range queries over 15m, 1h, 6h or 24h, with `cluster` and namespace filters
+  checked as Kubernetes or GKE names before they become label matchers, and a `project` filter;
+  every query groups by `project_id` and `location` next to `cluster`, so same-named clusters in two
+  projects stay apart, and `crashes_rate` filters the namespace on `ate.workerpool.namespace`.
+  `FLEET_METRICS_PROJECT` empty turns the API off (503). The metric names are not yet confirmed in a
+  metrics explorer; FS-6 does that on the first deployment.
+- 2026-11-17, review of #434: the `workers` and `crashes_rate` queries select Substrate's series by
+  their dotted OpenTelemetry names (`{"ate.workerpool.workers"}`, `{"ate.actor.crashes"}`), which
+  Cloud Monitoring keeps for an OTLP push, and copy each dotted key with `label_replace` before they
+  group by it. `workers` averages across the `ateapi` replicas before it adds, and leaves out
+  unschedulable workers and the unknown sandbox class, so it counts capacity once. Every rate range
+  is 5 m, no shorter than the 24h window's step. A cached Live or PromQL entry counts its 10 s from
+  the end of the upstream call, not from its start, so a call that takes 10 s or times out is cached
+  as well. Project filters and `-metrics-project` take domain-scoped project ids, as the collector
+  and the reporter do.
+- 2026-11-17, orchestrator, pull request 5a: a trace link is the Cloud Trace console URL
+  `traces/list?project=<project>&tid=<trace_id>` of the event's cluster project, made only from a
+  well-formed project and a 32-hex trace id. The usage samples of the Actor page stay a follow-up
+  (phase 9).
+- 2026-11-17, orchestrator, from the review of pull request 5a: the Live query runs one at a time
+  apart from the requests, and its error is cached for the TTL like its result, so a failing
+  BigQuery gets one job per 10 s, not one per viewer; the page reloads itself after an error too.
+  The metrics API shares one upstream call among concurrent requests for a query and has its own
+  per-user limit (2 a second, burst 10), because each new request is a Cloud Monitoring query on the
+  project's shared quota. A Google API error keeps its message in the log.

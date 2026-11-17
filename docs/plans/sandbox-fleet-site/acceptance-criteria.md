@@ -1,6 +1,6 @@
 # Acceptance criteria: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-16 against `a12f48a0`. Each criterion has a command
+Status: accepted (#223); last checked 2026-11-17 against `8d110751`. Each criterion has a command
 and an expected result. Evidence goes into `evidence/` in this directory, one file per acceptance
 pass, with the commit of each component.
 
@@ -72,8 +72,11 @@ pass, with the commit of each component.
 
 - Command: PodMonitoring with `interval: 5s`; after five minutes,
   `count_over_time(ate_env_api_requests_total[1m])` through the PromQL API.
-- Expected: at least 10 samples per minute per series; the `environments` named query returns
-  per-cluster, per-atespace counts.
+- Expected: at least 10 samples per minute per series; the `environments` named query
+  (`GET /api/v1/metrics/environments?window=15m` on the site) returns per-cluster, per-atespace
+  counts, which checks the `PodMonitoring` scrape path; and the `workers` named query
+  (`GET /api/v1/metrics/workers?window=15m`) returns per-cluster, per-pool counts that are not
+  empty, which checks the OTLP path through GKE Managed OpenTelemetry and the dotted names.
 - Pass rule: holds for every `ate-env-api` in both clusters.
 
 ## FS-7: IAP

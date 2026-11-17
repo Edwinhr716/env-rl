@@ -179,9 +179,36 @@ func TestBigQueryEventsRejectsABadRow(t *testing.T) {
 }
 
 func TestNewBigQueryEventsChecksTheTable(t *testing.T) {
-	for _, table := range []string{"", "fleet.actor_events_v", "p.fleet.actor_events_v", "central-proj.fleet.actor_events_v`; DROP TABLE x; --", "central-proj.fleet.a-b", "central-proj.fleet.actor_events_v.x"} {
+	for _, table := range []string{"", "fleet.actor_events_v", "p.fleet.actor_events_v", "central-proj.fleet.actor_events_v`; DROP TABLE x; --", "central-proj.fleet.a-b", "central-proj.fleet.actor_events_v.x", ":central-proj.fleet.actor_events_v", "example.com:central-proj.fleet.actor_events_v`"} {
 		if _, err := NewBigQueryEvents(context.Background(), table, option.WithoutAuthentication()); err == nil {
 			t.Errorf("table %q accepted", table)
 		}
+	}
+	// A domain-scoped project runs the jobs in that project.
+	b, err := NewBigQueryEvents(context.Background(), "example.com:central-proj.fleet.actor_events_v", option.WithoutAuthentication())
+	if err != nil || b.project != "example.com:central-proj" {
+		t.Errorf("domain-scoped table: %+v, %v", b, err)
+	}
+}
+
+// The Live query reads every actor's events since a time, newest first.
+func TestBigQueryEventsRecentEvents(t *testing.T) {
+	f := &fakeBigQuery{complete: true, rows: []*bigquery.TableRow{
+		row("2026-11-16T12:00:09Z", "2026-11-16T12:00:10Z", "proj", "c-1", "ate-env", "env-2", "u2", "ate-env", "tmpl", "SuspendActor", "suspended", nil, nil),
+		row("2026-11-16T12:00:01Z", "2026-11-16T12:00:02Z", "proj", "c-1", "ate-env", "env-1", "u1", "ate-env", "tmpl", "ResumeActor", "running", nil, nil),
+	}}
+	events, err := newTestEvents(t, f).RecentEvents(context.Background(), t0.Add(-time.Hour), 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].ActorUID != "u2" {
+		t.Errorf("events = %+v, want newest first", events)
+	}
+	q := f.queries[0]
+	if !strings.Contains(q.Query, "WHERE publish_time >= @since ORDER BY time DESC") || !strings.Contains(q.Query, "LIMIT 200") || strings.Contains(q.Query, "actor_uid = @uid") {
+		t.Errorf("query = %s", q.Query)
+	}
+	if len(q.QueryParameters) != 1 || q.QueryParameters[0].Name != "since" || q.MaxResults != 200 {
+		t.Errorf("parameters %+v, max results %d", q.QueryParameters, q.MaxResults)
 	}
 }

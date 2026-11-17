@@ -1,0 +1,26 @@
+{{/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/}}
+{{define "content"}}
+<h1>Live</h1>
+{{with .Unavailable}}<p class="muted">{{.}}</p>{{else}}
+<p class="muted">The newest {{len .Events}} transitions of the last {{.Window}} across the fleet, queried {{timestamp .QueriedAt}}; the page reloads every {{.Refresh}} s. <a href="/api/v1/live">JSON</a></p>
+<table>
+  <tr><th>Time</th><th>Cluster</th><th>Atespace</th><th>Actor</th><th>Operation</th><th>State</th><th>Trace</th></tr>
+  {{range .Events}}<tr><td>{{.Time}}</td><td>{{if .ClusterURL}}<a href="{{.ClusterURL}}">{{.Project}} / {{.Cluster}}</a>{{else}}{{.Project}} / {{.Cluster}}{{end}}</td><td>{{.Atespace}}</td><td>{{if .ActorURL}}<a href="{{.ActorURL}}">{{.ActorName}}</a>{{else}}{{.ActorName}}{{end}}</td><td>{{.Operation}}</td><td><span class="st-text st-{{.State}}">{{.State}}</span></td><td>{{if .TraceURL}}<a href="{{.TraceURL}}" rel="noopener noreferrer" target="_blank">trace</a>{{end}}</td></tr>
+  {{else}}<tr><td colspan="7" class="muted">no transition in the window</td></tr>{{end}}
+</table>
+{{end}}
+{{end}}

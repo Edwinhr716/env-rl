@@ -226,6 +226,16 @@ user needs to know across them.
   and `cluster` to be one path segment each (no `/` or `\`, not `.` or `..`);
   the reporter refuses such a `-project` or `-cluster` at start, and `-out-dir`
   writes stay under the directory.
+- `ate-env-fleet-site`: the Actor page (`/actors/{uid}`: the actor in the
+  snapshots, its transitions with a Cloud Trace link each, its crash record),
+  the Live page (`/live` and `/api/v1/live`: the newest 200 transitions of the
+  last hour, reloading every 10 s), and `/api/v1/metrics/{name}`, which runs
+  one of six named PromQL queries (`requests_rate`, `create_to_ready_p50`,
+  `wake_wait_p95`, `environments`, `workers`, `crashes_rate`) against Cloud
+  Monitoring in `FLEET_METRICS_PROJECT`, with `project`, `cluster`,
+  `namespace` and `window` (15m, 1h, 6h, 24h) filters; each query groups by
+  project and location as well as cluster. The Cluster page links each actor to
+  its page.
 - `ate-env-fleet-site` (`cmd/ate-env-fleet-site`): the read-only fleet site
   for Cloud Run behind Identity-Aware Proxy. It serves the Fleet page (every
   cluster's `ate-env-api` deployments, WorkerPools, actors by state and
