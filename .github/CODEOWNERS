@@ -3,7 +3,7 @@
 # where a directory pattern above also matches them.
 
 # Default.
-*                               @sunnylovestiramisu @tomergee
+*                               @diamondburned @sunnylovestiramisu @tomergee
 
 # Clients and integrations.
 /cmd/ate-env/                   @tomergee
@@ -18,14 +18,14 @@
 /internal/benchmarking/         @vicentefb @tomergee
 
 # Build, test and documentation files.
-/hack/                          @tomergee
-/internal/internaltest/         @tomergee
-/Makefile                       @tomergee
-/buf.gen.yaml                   @tomergee
-/.ko.yaml                       @tomergee
-/go.mod                         @tomergee
-/go.sum                         @tomergee
-/docs/                          @sunnylovestiramisu @tomergee
+/hack/                          @diamondburned @tomergee
+/internal/internaltest/         @diamondburned @tomergee
+/Makefile                       @diamondburned @tomergee
+/buf.gen.yaml                   @diamondburned @tomergee
+/.ko.yaml                       @diamondburned @tomergee
+/go.mod                         @diamondburned @tomergee
+/go.sum                         @diamondburned @tomergee
+/docs/                          @diamondburned @sunnylovestiramisu @tomergee
 
 # Security-sensitive: the API listener, the port proxy, MCP, the Substrate
 # client, the router TLS client, the wire API, the deployment manifest, the
