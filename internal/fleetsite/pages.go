@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/agent-substrate/env/internal/inventory"
@@ -54,6 +55,12 @@ var templateFuncs = template.FuncMap{
 		return "/api/v1/clusters/" + url.PathEscape(project) + "/" + url.PathEscape(cluster)
 	},
 	"actorURL": func(uid string) string { return "/actors/" + url.PathEscape(uid) },
+	// A RunEntry's Path is escaped already.
+	"runURL":     func(path string) string { return "/runs/" + path },
+	"runAPIURL":  func(path string) string { return "/api/v1/runs/" + path },
+	"runFileURL": func(path, name string) string { return "/runs/" + path + "/files/" + url.PathEscape(name) },
+	"ms":         func(v float64) string { return strconv.FormatFloat(v, 'f', 1, 64) },
+	"sec":        func(v float64) string { return strconv.FormatFloat(v, 'f', 2, 64) },
 }
 
 func formatAge(d time.Duration) string {

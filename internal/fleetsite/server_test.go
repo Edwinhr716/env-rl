@@ -110,7 +110,7 @@ func (ts *testSite) do(t *testing.T, method, path, user string) (*http.Response,
 // FS-7: without an identity every route but /healthz is denied.
 func TestSiteDeniesWithoutIdentity(t *testing.T) {
 	ts := newTestSite(t)
-	for _, p := range []string{"/", "/clusters/p/c", "/api/v1/clusters", "/api/v1/clusters/p/c", "/api/v1/actors/u/events", "/actors/u", "/live", "/api/v1/live", "/api/v1/metrics/requests_rate", "/static/site.css", "/nope"} {
+	for _, p := range []string{"/", "/clusters/p/c", "/api/v1/clusters", "/api/v1/clusters/p/c", "/api/v1/actors/u/events", "/actors/u", "/live", "/api/v1/live", "/api/v1/metrics/requests_rate", "/runs", "/runs/trainer/x", "/runs/bench/b/x", "/runs/trainer/x/files/f", "/runs/bench/b/x/files/f", "/api/v1/runs", "/api/v1/runs/trainer/x", "/api/v1/runs/bench/b/x", "/static/site.css", "/nope"} {
 		resp, body := ts.do(t, http.MethodGet, p, "")
 		if resp.StatusCode != http.StatusForbidden {
 			t.Errorf("GET %s without identity: %d %q, want 403", p, resp.StatusCode, body)

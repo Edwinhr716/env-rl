@@ -304,6 +304,26 @@ and #433 change nothing the plan reads. The seven steps:
 6. `cmd/benchmarking/bench/bundle.go` is unchanged.
 7. `FS-` is used by this plan only.
 
+## Audit of main, 2026-11-17, after pull request 5a merged
+
+Checked against `ai-on-gke/sandboxenv-rl` at `36e07232`, for pull request 5b. Since `8d110751`: #434
+is pull request 5a; #404 changes the SWE-bench loader's pre-flight, and in
+`internal/benchmarking/schema` only `preflight_coverage.go`, next to which pull request 5b adds
+`folder.go`; #420 adds `--domains` and `--node-selector` to `ate-env manifest` and a `workerpool`
+subcommand, which also has `--domain-offset`. The seven steps:
+
+1. `env.proto` is unchanged.
+2. `go.mod` and `go.sum` are unchanged, so Substrate is still `v1.0.0`; `internal/actorevent` is
+   unchanged.
+3. `internal/inventory` is unchanged and its tests pass; the example of `interfaces.md` still parses
+   equal to `snapshot.golden.json`.
+4. `docs/metrics.md` is unchanged, and so is Substrate's `docs/metrics/registry/metrics.yaml`, since
+   the Substrate version is.
+5. `ate-env manifest` keeps every flag and subcommand of step 5; #420 only adds flags.
+6. `cmd/benchmarking/bench/bundle.go` is unchanged on main; pull request 5b moves its folder-name
+   check to `internal/benchmarking/schema` so the site can use it.
+7. `FS-` is used by this plan only.
+
 ## Sources
 
 - Substrate: `docs/observability.md`, `internal/actorevent/actorevent.go`,

@@ -3,11 +3,11 @@
 Status: accepted plan (#223); pull requests 1, 2 and 2b (`internal/inventory`, the reporter and its
 manifest) merged as #226, #348 and #349; pull requests 3 and 4, the telemetry manifests and the site
 with the Fleet and Cluster pages, merged as #415 and #416; pull request 5a, the Actor and Live pages
-and the metrics API, in review. Last checked 2026-11-17 against `ai-on-gke/sandboxenv-rl` at
-`8d110751` and the Substrate `go.mod` requires, `v1.0.0`; the audit is in
-[research.md](./research.md), which first read `3b03b03` and `28520c0d` on 2026-10-30. The decisions
-taken so far are in [decisions.md](./decisions.md). Companions: [prd.md](./prd.md),
-[execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
+and the metrics API, merged as #434; pull request 5b, the Runs page, in review. Last checked
+2026-11-17 against `ai-on-gke/sandboxenv-rl` at `36e07232` and the Substrate `go.mod` requires,
+`v1.0.0`; the audit is in [research.md](./research.md), which first read `3b03b03` and `28520c0d` on
+2026-10-30. The decisions taken so far are in [decisions.md](./decisions.md). Companions:
+[prd.md](./prd.md), [execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
 [acceptance-criteria.md](./acceptance-criteria.md) and, for the order of operations with `gcloud`,
 [quickstart.md](./quickstart.md).
 

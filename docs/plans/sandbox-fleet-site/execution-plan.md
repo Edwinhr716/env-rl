@@ -1,8 +1,8 @@
 # Execution plan: sandbox fleet site
 
-Status: accepted (#223); pull requests 1, 2, 2b, 3 and 4 merged (#226, #348, #349, #415, #416); pull
-request 5a is the Actor and Live pages and the metrics API; 2c, 5b, 6 and 7 are not started. Last
-checked 2026-11-17 against `8d110751`. Design: [README.md](./README.md). Contracts:
+Status: accepted (#223); pull requests 1, 2, 2b, 3, 4 and 5a merged (#226, #348, #349, #415, #416,
+#434); pull request 5b, the Runs page, is in review; 2c, 6 and 7 are not started. Last checked
+2026-11-17 against `36e07232`. Design: [README.md](./README.md). Contracts:
 [interfaces.md](./interfaces.md). Done when every criterion in
 [acceptance-criteria.md](./acceptance-criteria.md) passes on two clusters in two projects and the
 pull requests below are merged.

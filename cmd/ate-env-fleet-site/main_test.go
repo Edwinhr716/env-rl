@@ -39,6 +39,12 @@ func TestConfigValidate(t *testing.T) {
 		{"both auth modes", config{listen: "127.0.0.1:8080", bucket: "b", iapAudience: audience, insecureNoIAP: true}, "cannot be used together"},
 		{"insecure on all interfaces", config{listen: ":8080", dir: "d", insecureNoIAP: true}, "loopback"},
 		{"insecure on 0.0.0.0", config{listen: "0.0.0.0:8080", dir: "d", insecureNoIAP: true}, "loopback"},
+		{"bench buckets", config{listen: "127.0.0.1:8080", dir: "d", insecureNoIAP: true, benchBuckets: "bench-a, bench-b"}, ""},
+		{"bad bench bucket", config{listen: "127.0.0.1:8080", dir: "d", insecureNoIAP: true, benchBuckets: "bench-a,gs://b"}, "not a bucket name"},
+		{"bench bucket path", config{listen: "127.0.0.1:8080", dir: "d", insecureNoIAP: true, benchBuckets: "../x"}, "not a bucket name"},
+		{"bench bucket twice", config{listen: "127.0.0.1:8080", dir: "d", insecureNoIAP: true, benchBuckets: "bench-a,bench-a"}, "twice"},
+		{"bad trace project", config{listen: "127.0.0.1:8080", dir: "d", insecureNoIAP: true, traceProject: "Bad Project"}, "-trace-project"},
+		{"domain-scoped trace project", config{listen: "127.0.0.1:8080", dir: "d", insecureNoIAP: true, traceProject: "example.com:my-project"}, ""},
 		{"insecure on a host name", config{listen: "example.com:8080", dir: "d", insecureNoIAP: true}, "loopback"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

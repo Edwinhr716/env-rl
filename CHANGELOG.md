@@ -253,6 +253,17 @@ user needs to know across them.
   and `cluster` to be one path segment each (no `/` or `\`, not `.` or `..`);
   the reporter refuses such a `-project` or `-cluster` at start, and `-out-dir`
   writes stay under the directory.
+- `ate-env-fleet-site`: the Runs page (`/runs`, `/runs/trainer/{id}`,
+  `/runs/bench/{bucket}/{id}`, and the same under `/api/v1/runs`): trainer
+  runs under `v1/runs/<run_id>/` in the inventory bucket, with their
+  RunReport tables, the Cloud Trace link (the span's `gcp.project_id`, else
+  `FLEET_TRACE_PROJECT`) and a waterfall of the run span's trace from
+  `spans.jsonl`; and the benchmark bundles of the buckets in
+  `FLEET_BENCH_BUCKETS` (`-bench-buckets`), with `run_window.json`,
+  `report.json` and `system_description.json` and a mark on `_traced`
+  folders. Run files, `report.html` too, download from `.../files/{name}`.
+  The bundle folder check is now `schema.CheckFolderName`; `bench`'s
+  `ValidateGCSFolderName` calls it.
 - `ate-env-fleet-site`: the Actor page (`/actors/{uid}`: the actor in the
   snapshots, its transitions with a Cloud Trace link each, its crash record),
   the Live page (`/live` and `/api/v1/live`: the newest 200 transitions of the

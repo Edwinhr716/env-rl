@@ -260,3 +260,29 @@ Append-only. Each entry: date, who, what, why.
   The metrics API shares one upstream call among concurrent requests for a query and has its own
   per-user limit (2 a second, burst 10), because each new request is a Cloud Monitoring query on the
   project's shared quota. A Google API error keeps its message in the log.
+- 2026-11-17, orchestrator, pull request 5b: every run file is a download
+  (`Content-Disposition: attachment`), a trainer's `report.html` too, and a file is served only when
+  the run's listing has it. `build_report.py` writes a page with inline script; under a sandbox
+  policy it still navigated its own tab to an outside address with data in the query (the review's
+  browser probe), so the site does not render a run's HTML at all.
+- 2026-11-17, orchestrator, pull request 5b: the bundle folder check moves from
+  `cmd/benchmarking/bench` to `schema.CheckFolderName` in `internal/benchmarking/schema`, because a
+  package under `internal/` cannot import `cmd/`; `bench`'s `ValidateGCSFolderName` calls it, so the
+  two keep one rule.
+- 2026-11-17, orchestrator, pull request 5b: a trainer run's Cloud Trace link needs a project, which
+  neither the RunReport nor `run.json` records. The page takes the `gcp.project_id` resource
+  attribute of the run span, which the collector of #415 sets, else `cloud.account.id`, else
+  `FLEET_TRACE_PROJECT`; without any it shows the trace id as text. The acceptance fixture sets no
+  project, so FS-11 sets `FLEET_TRACE_PROJECT` to the project the trace was exported to.
+- 2026-11-17, orchestrator, pull request 5b: with `-dir`, a benchmark bucket `b` is the directory
+  `<dir>/b`, so the Runs page can be checked on a workstation. From the review of #437: `b` must be
+  one path element, and every path, the bucket's own directory too, must resolve inside `<dir>`; a
+  bucket directory that is a symbolic link out of `<dir>` lists as empty and serves no file.
+- 2026-11-17, orchestrator, from the review of pull request 5b: a run's URL names its source
+  (`trainer/<id>`, `bench/<bucket>/<id>`) and a run page reads its folder from the store, so a run
+  past the 500 of the index or a name in two sources stays reachable; the index sorts by name and
+  says so, because the SDK's default run id is random. A source that cannot be listed is an error
+  row. What a run page shows is cached per change of its file listing and built at most two at a
+  time, and the span parser keeps only the run trace's spans with memoized depths: a 59 MB span file
+  made 8 views take 2.16 GB before. RunReport candidates are the files named as `RunReport.write`
+  names them, at most 20 of 1 MiB.

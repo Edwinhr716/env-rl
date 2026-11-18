@@ -1,6 +1,6 @@
 # Interface contracts: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-17 against `8d110751`. The snapshot schema in the next
+Status: accepted (#223); last checked 2026-11-17 against `36e07232`. The snapshot schema in the next
 section is code since pull request 1 (#226, `internal/inventory`): its object kinds, field names and
 rules are fixed, and a change to them is a schema change. The names in the other sections (bucket
 layout, reporter flags and identity, event stream and tables, collector pipelines, site routes and
@@ -288,7 +288,7 @@ Go, standard library HTTP, server-rendered HTML (`html/template`) with inline SV
 served by the site, no script and no external assets, the same zero-dependency style as the explorer
 plan and `build_report.py`. The code is `internal/fleetsite`; pull request 4 shipped the Fleet and
 Cluster pages and the first three API routes, pull request 5a the Actor and Live pages, the Live API
-and the metrics API, and pull request 5b ships the Runs page.
+and the metrics API, and pull request 5b the Runs pages and API.
 
 Configuration, each flag with an environment variable for Cloud Run:
 
@@ -300,26 +300,52 @@ Configuration, each flag with an environment variable for Cloud Run:
 | `-iap-audience`    | `FLEET_IAP_AUDIENCE`    | `/projects/<number>/locations/<region>/services/<service>`; required unless `-insecure-no-iap` |
 | `-insecure-no-iap` |                         | serve without an IAP assertion, for a local run; `-listen` must then be a loopback address     |
 | `-listen`          | `PORT`                  | `:$PORT`, else `:8080`                                                                         |
+| `-bench-buckets`   | `FLEET_BENCH_BUCKETS`   | comma-separated benchmark buckets for the Runs page; with `-dir`, directories under it         |
+| `-trace-project`   | `FLEET_TRACE_PROJECT`   | the project of a trainer run's Cloud Trace link when its span file names none                  |
 | `-metrics-project` | `FLEET_METRICS_PROJECT` | the project whose metrics scope holds the clusters' projects; empty turns the metrics API off  |
 
-Runs page sources (pull request 5b): `v1/runs/` in the inventory bucket for trainer run reports, and
-the benchmark buckets in `FLEET_BENCH_BUCKETS` (comma-separated), where a run is a folder whose name
-passes `bench`'s `ValidateGCSFolderName` and whose `run_window.json`, `report.json` and
-`system_description.json` the page reads.
+Runs page sources (pull request 5b): `v1/runs/<run_id>/` in the inventory bucket for trainer runs,
+where a run id is one path segment of `[A-Za-z0-9._-]`, at most 128, and the benchmark buckets in
+`FLEET_BENCH_BUCKETS` (comma-separated), where a run is a top-level folder whose name passes
+`schema.CheckFolderName` (`internal/benchmarking/schema`, the form `bench`'s `ValidateGCSFolderName`
+checks) and is at most 128 characters. A run's URL names its source, `/runs/trainer/<id>` or
+`/runs/bench/<bucket>/<id>`, so a bundle name in two buckets or equal to a trainer run id stays
+reachable; a run page reads its folder from the store, not from the index. The index lists the first
+500 of each source by name, descending (bundle names start with their date, so they list newest
+first; a trainer run id need not), is cached 60 s per instance from the end of its listing, and
+shows a source it cannot list as an error row. The listing runs apart from the request that started
+it, under a 20 s listing timeout, shorter than the 30 s request timeout, so a viewer who closes the
+tab neither fails it nor caches the cancellation; concurrent requests share one listing,
+`?nocache=1` waits for one that starts after it, and a listing whose own timeout expired is shown
+but not cached. A request whose own deadline ends its wait first (a `?nocache=1` behind a listing in
+flight) answers 502. A trainer run page shows each RunReport JSON (the files named as
+`RunReport.write` names them, at most 20, each at most 1 MiB; one that is not JSON, such as Python's
+`NaN`, is a note), a link to `report.html`, the Cloud Trace link of the latest `ate_env_fleet.run`
+span in `spans.jsonl` (the project is that span's `gcp.project_id` resource attribute, else
+`cloud.account.id`, else `FLEET_TRACE_PROJECT`; without one the trace id shows as text) and a
+waterfall of that trace's first 300 spans. A bundle page shows `run_window.json`, `report.json` and
+`system_description.json` as indented JSON (at most 256 KiB each) and marks a `_traced` folder. What
+a run page shows is built once per change of the run's file listing, cached 60 s, shared by
+concurrent views, and at most two are built at a time. A run file is served from
+`/runs/<source>/files/<name>` only when the run's listing has it, always as a download,
+`report.html` too, so no script from a run folder runs on the site's origin. A run file is read up
+to 64 MiB.
 
-| Route                                                             | Returns                                                                                                                                                                                                    | Pull request |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| `GET /`                                                           | Fleet page                                                                                                                                                                                                 | 4            |
-| `GET /clusters/{project}/{cluster}`                               | Cluster page; `?atespace=&template=&state=&node=` filter the actors, the first 1000 shown                                                                                                                  | 4            |
-| `GET /actors/{uid}`                                               | Actor page: the actor in the snapshots, its transitions since `?since=` (default 24 h) with a Cloud Trace link each, its crash record; the events route's limit                                            | 5a           |
-| `GET /runs`, `GET /runs/{id}`                                     | the run index; one run, where `{id}` is a trainer `run_id` or a bundle folder name (FS-11)                                                                                                                 | 5b           |
-| `GET /live`                                                       | Live page: the newest 200 transitions of the last hour, newest first; reloads every 10 s with `<meta http-equiv="refresh">`, no script                                                                     | 5a           |
-| `GET /api/v1/live`                                                | `{"queried_at", "events"}`: the Live page's transitions                                                                                                                                                    | 5a           |
-| `GET /api/v1/clusters`                                            | `{"clusters": [...]}`, one row per `latest.json`: project, cluster, location, `generated_at`, `age_s`, `stale`, reporter, counts, deployments, WorkerPools, `error`                                        | 4            |
-| `GET /api/v1/clusters/{project}/{cluster}`                        | `{"project", "cluster", "generation", "age_s", "stale", "error", "snapshot"}`, where `snapshot` is the object as the reporter wrote it                                                                     | 4            |
-| `GET /api/v1/actors/{uid}/events?since=`                          | `{"uid", "since", "events", "truncated"}`: rows of `actor_events_v`, oldest first, the newest 1000; `since` RFC 3339, default 24 h ago, at most 30 days ago                                                | 4            |
-| `GET /api/v1/metrics/{name}?project=&cluster=&namespace=&window=` | `{"name", "project", "cluster", "namespace", "window", "query", "data"}`: a named query of the allow-list as a range query, `data` as the Prometheus API returns it; `window` 15m, 1h (default), 6h or 24h | 5a           |
-| `GET /healthz`                                                    | 200, without IAP                                                                                                                                                                                           | 4            |
+| Route                                                                                       | Returns                                                                                                                                                                                                    | Pull request |
+| ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| `GET /`                                                                                     | Fleet page                                                                                                                                                                                                 | 4            |
+| `GET /clusters/{project}/{cluster}`                                                         | Cluster page; `?atespace=&template=&state=&node=` filter the actors, the first 1000 shown                                                                                                                  | 4            |
+| `GET /actors/{uid}`                                                                         | Actor page: the actor in the snapshots, its transitions since `?since=` (default 24 h) with a Cloud Trace link each, its crash record; the events route's limit                                            | 5a           |
+| `GET /runs`, `GET /runs/trainer/{id}`, `GET /runs/bench/{bucket}/{id}`                      | the run index; one trainer run or one bundle (FS-11)                                                                                                                                                       | 5b           |
+| `GET /runs/trainer/{id}/files/{name}`, `GET /runs/bench/{bucket}/{id}/files/{name}`         | one listed file of the run, as a download                                                                                                                                                                  | 5b           |
+| `GET /api/v1/runs`, `GET /api/v1/runs/trainer/{id}`, `GET /api/v1/runs/bench/{bucket}/{id}` | the index `{"runs", "truncated", "errors"}`; one run with its files, reports, trace and bundle files                                                                                                       | 5b           |
+| `GET /live`                                                                                 | Live page: the newest 200 transitions of the last hour, newest first; reloads every 10 s with `<meta http-equiv="refresh">`, no script                                                                     | 5a           |
+| `GET /api/v1/live`                                                                          | `{"queried_at", "events"}`: the Live page's transitions                                                                                                                                                    | 5a           |
+| `GET /api/v1/clusters`                                                                      | `{"clusters": [...]}`, one row per `latest.json`: project, cluster, location, `generated_at`, `age_s`, `stale`, reporter, counts, deployments, WorkerPools, `error`                                        | 4            |
+| `GET /api/v1/clusters/{project}/{cluster}`                                                  | `{"project", "cluster", "generation", "age_s", "stale", "error", "snapshot"}`, where `snapshot` is the object as the reporter wrote it                                                                     | 4            |
+| `GET /api/v1/actors/{uid}/events?since=`                                                    | `{"uid", "since", "events", "truncated"}`: rows of `actor_events_v`, oldest first, the newest 1000; `since` RFC 3339, default 24 h ago, at most 30 days ago                                                | 4            |
+| `GET /api/v1/metrics/{name}?project=&cluster=&namespace=&window=`                           | `{"name", "project", "cluster", "namespace", "window", "query", "data"}`: a named query of the allow-list as a range query, `data` as the Prometheus API returns it; `window` 15m, 1h (default), 6h or 24h | 5a           |
+| `GET /healthz`                                                                              | 200, without IAP                                                                                                                                                                                           | 4            |
 
 `?nocache=1` on the cluster routes and the Actor page lists the bucket at once (FS-1). A cluster is
 stale when its write time was older than three of its reporter's `interval_s` at the listing that

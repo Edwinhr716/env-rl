@@ -1,6 +1,6 @@
 # Quickstart: deploy the fleet site
 
-Status: plan-stage runbook, written 2026-11-04; last checked 2026-11-17 against `8d110751`. The
+Status: plan-stage runbook, written 2026-11-04; last checked 2026-11-17 against `36e07232`. The
 Terraform in pull request 6 of the [execution plan](./execution-plan.md) replaces the `gcloud`
 commands below with one `apply` per project; `docs/fleet-site.md` then becomes the user-facing
 guide. Until then this is the order of operations and the exact resources, with the open parameters
@@ -230,11 +230,13 @@ both ends with a two-bucket `BENCH_BUCKET`.
 IAP on Cloud Run authenticates users of the organization with a Google-managed OAuth client; a
 project without an organization needs the console once. `FLEET_EVENTS_TABLE` names the typed view of
 section 1, not the raw table. The site reads `FLEET_METRICS_PROJECT` from PR 5a on, for the metrics
-API; `FLEET_BENCH_BUCKETS` from PR 5b on. `--memory 2Gi` holds the decoded snapshots of the cluster
-list and a refresh: one snapshot of 100,000 actors is about 40 MB as JSON and takes some 600 MB once
-decoded. Memory grows with the sum of the clusters' decoded snapshots, plus a second copy of the
-changed ones during a refresh. `GOMEMLIMIT=1600MiB` makes the Go runtime collect before the instance
-reaches its limit when many large downloads run at once; raise both together for a larger fleet.
+API; `FLEET_BENCH_BUCKETS` from PR 5b on, for the Runs page; add `FLEET_TRACE_PROJECT=<project>`
+when trainers' span files name no `gcp.project_id`, so their runs still get a Cloud Trace link.
+`--memory 2Gi` holds the decoded snapshots of the cluster list and a refresh: one snapshot of
+100,000 actors is about 40 MB as JSON and takes some 600 MB once decoded. Memory grows with the sum
+of the clusters' decoded snapshots, plus a second copy of the changed ones during a refresh.
+`GOMEMLIMIT=1600MiB` makes the Go runtime collect before the instance reaches its limit when many
+large downloads run at once; raise both together for a larger fleet.
 
 For a look before the deployment, run the site on a workstation over a reporter's `-out-dir` output:
 `go run ./cmd/ate-env-fleet-site -dir /tmp/snap -insecure-no-iap -listen 127.0.0.1:8080`.

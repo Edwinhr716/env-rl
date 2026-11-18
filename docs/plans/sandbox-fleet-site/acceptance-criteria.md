@@ -1,6 +1,6 @@
 # Acceptance criteria: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-17 against `8d110751`. Each criterion has a command
+Status: accepted (#223); last checked 2026-11-17 against `36e07232`. Each criterion has a command
 and an expected result. Evidence goes into `evidence/` in this directory, one file per acceptance
 pass, with the commit of each component.
 
@@ -121,13 +121,16 @@ pass, with the commit of each component.
   `python benchmarking/telemetry_report/build_report.py --report /tmp/fs11 --spans /tmp/fs11/spans.jsonl --title "$RUN_ID" --out /tmp/fs11`,
   which adds `run.json` and `report.html`. (3)
   `gcloud storage cp /tmp/fs11/* "gs://$BUCKET/v1/runs/$RUN_ID/"`, where `RUN_ID` is the example's
-  run id. For the benchmark source, `bench upload` one validated bundle into a bucket named in
-  `FLEET_BENCH_BUCKETS`. Open `/runs/$RUN_ID` and `/runs/<bundle folder>`.
-- Expected: the run report table, the HTML report link and the span file resolve; the Cloud Trace
-  link opens the trace id of the `ate_env_fleet.run` span, which the site reads from `spans.jsonl`
-  (neither the RunReport nor the example records a trace id); the waterfall renders from the span
-  file; the bundle page shows `run_window.json`, `report.json` and `system_description.json` and
-  marks a `_traced` folder as traced.
+  run id. The fixture sets no `gcp.project_id` on the spans, so the site runs with
+  `FLEET_TRACE_PROJECT` set to the project the fixture forwards the trace to. For the benchmark
+  source, `bench upload` one validated bundle into a bucket named in `FLEET_BENCH_BUCKETS`. Open
+  `/runs/trainer/$RUN_ID` and `/runs/bench/<bucket>/<bundle folder>`.
+- Expected: the run report table shows, and the HTML report and the span file download; the Cloud
+  Trace link opens the trace id of the `ate_env_fleet.run` span, which the site reads from
+  `spans.jsonl` (neither the RunReport nor the example records a trace id), in the project of the
+  run span's `gcp.project_id` resource attribute or `FLEET_TRACE_PROJECT`; the waterfall renders
+  from the span file; the bundle page shows `run_window.json`, `report.json` and
+  `system_description.json` and marks a `_traced` folder as traced.
 - Pass rule: holds for both sources.
 
 ## FS-12: Documentation

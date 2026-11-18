@@ -94,7 +94,13 @@ type Config struct {
 	// Metrics is nil when no metrics project is configured; the metrics
 	// API then answers 503.
 	Metrics MetricsSource
-	Auth    Authenticate
+	// Runs is nil when no run source is configured; the Runs pages and API
+	// then answer 503.
+	Runs *Runs
+	// TraceProject is the project of a trainer run's Cloud Trace link when
+	// its span file names none.
+	TraceProject string
+	Auth         Authenticate
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	// Version is shown in the page footer.
@@ -107,11 +113,12 @@ type Server struct {
 	pages map[string]*template.Template
 	mux   *http.ServeMux
 
-	mu       sync.Mutex
-	limiters map[string]*userLimiter
-	swept    time.Time
-	live     liveCache
-	css      []byte
+	mu         sync.Mutex
+	limiters   map[string]*userLimiter
+	swept      time.Time
+	live       liveCache
+	runDetails runDetails
+	css        []byte
 }
 
 type userLimiter struct {
@@ -128,7 +135,7 @@ func New(cfg Config) (*Server, error) {
 		cfg.Now = time.Now
 	}
 	s := &Server{cfg: cfg, pages: map[string]*template.Template{}, limiters: map[string]*userLimiter{}}
-	for _, page := range []string{"fleet.html", "cluster.html", "actor.html", "live.html", "error.html"} {
+	for _, page := range []string{"fleet.html", "cluster.html", "actor.html", "live.html", "runs.html", "run.html", "error.html"} {
 		t, err := template.New(page).Funcs(templateFuncs).ParseFS(assets, "templates/layout.html", "templates/"+page)
 		if err != nil {
 			return nil, err
@@ -151,6 +158,14 @@ func New(cfg Config) (*Server, error) {
 	app.HandleFunc("GET /live", s.livePage)
 	app.HandleFunc("GET /api/v1/live", s.apiLive)
 	app.HandleFunc("GET /api/v1/metrics/{name}", s.apiMetrics)
+	app.HandleFunc("GET /runs", s.runsPage)
+	app.HandleFunc("GET /runs/trainer/{id}", s.runPage)
+	app.HandleFunc("GET /runs/bench/{bucket}/{id}", s.runPage)
+	app.HandleFunc("GET /runs/trainer/{id}/files/{name}", s.runFile)
+	app.HandleFunc("GET /runs/bench/{bucket}/{id}/files/{name}", s.runFile)
+	app.HandleFunc("GET /api/v1/runs", s.apiRuns)
+	app.HandleFunc("GET /api/v1/runs/trainer/{id}", s.apiRun)
+	app.HandleFunc("GET /api/v1/runs/bench/{bucket}/{id}", s.apiRun)
 	app.HandleFunc("GET /static/site.css", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		_, _ = w.Write(s.css)

@@ -25,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -36,28 +35,19 @@ import (
 )
 
 // TracedFolderSuffix marks archive folders of runs that captured an SDK trace.
-const TracedFolderSuffix = "_traced"
+const TracedFolderSuffix = schema.TracedFolderSuffix
 
-// <YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>[_traced]; segments
-// exclude "_" so the suffix is unambiguous.
-var gcsFolderNameRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}_[a-zA-Z0-9.-]+_[a-zA-Z0-9.-]+_[a-zA-Z0-9.-]+(_traced)?$`)
-
-// ValidateGCSFolderName checks folder's form and that its _traced suffix
-// agrees with whether the bundle captured a trace: traced latencies include
-// trace overhead and must never be compared with untraced ones unknowingly.
+// ValidateGCSFolderName checks folder's form (schema.CheckFolderName) and that
+// its _traced suffix agrees with whether the bundle captured a trace: traced
+// latencies include trace overhead and must never be compared with untraced
+// ones unknowingly.
 func ValidateGCSFolderName(folder string, traced bool) error {
 	folder = strings.Trim(strings.TrimSpace(folder), "/")
-	if !gcsFolderNameRe.MatchString(folder) {
-		return fmt.Errorf(
-			"invalid benchmark folder name %q: must match <YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>[_traced] (e.g. 2026-10-27_synthetic-w4_math-bb4dcec_suspend-sync, 2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed_traced)",
-			folder,
-		)
+	hasSuffix, err := schema.CheckFolderName(folder)
+	if err != nil {
+		return err
 	}
-	datePrefix := folder[:10]
-	if _, err := time.Parse("2006-01-02", datePrefix); err != nil {
-		return fmt.Errorf("invalid date prefix %q in folder name %q: %w", datePrefix, folder, err)
-	}
-	switch hasSuffix := strings.HasSuffix(folder, TracedFolderSuffix); {
+	switch {
 	case traced && !hasSuffix:
 		return fmt.Errorf("folder name %q must end in %s: the bundle captured an SDK trace", folder, TracedFolderSuffix)
 	case !traced && hasSuffix:

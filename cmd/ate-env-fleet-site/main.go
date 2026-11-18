@@ -29,6 +29,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -50,6 +52,8 @@ func main() {
 	flag.StringVar(&cfg.dir, "dir", "", "read the bucket layout under this local directory, as ate-env-reporter -out-dir writes it, instead of a bucket")
 	flag.StringVar(&cfg.eventsTable, "events-table", os.Getenv("FLEET_EVENTS_TABLE"), "BigQuery view of the actor events, <project>.<dataset>.actor_events_v (env FLEET_EVENTS_TABLE); required with IAP")
 	flag.StringVar(&cfg.metricsProject, "metrics-project", os.Getenv("FLEET_METRICS_PROJECT"), "project whose Cloud Monitoring metrics scope holds the clusters' projects, for the metrics API (env FLEET_METRICS_PROJECT); empty turns the metrics API off")
+	flag.StringVar(&cfg.benchBuckets, "bench-buckets", os.Getenv("FLEET_BENCH_BUCKETS"), "comma-separated Cloud Storage buckets that `bench upload` writes benchmark bundles to, for the Runs page (env FLEET_BENCH_BUCKETS); with -dir, directories under it")
+	flag.StringVar(&cfg.traceProject, "trace-project", os.Getenv("FLEET_TRACE_PROJECT"), "project of a trainer run's Cloud Trace link when its span file names none (env FLEET_TRACE_PROJECT)")
 	flag.StringVar(&cfg.iapAudience, "iap-audience", os.Getenv("FLEET_IAP_AUDIENCE"), "audience of the IAP assertion, for Cloud Run /projects/<number>/locations/<region>/services/<service> (env FLEET_IAP_AUDIENCE)")
 	flag.BoolVar(&cfg.insecureNoIAP, "insecure-no-iap", false, "serve without checking an IAP assertion, for a local run: -listen must then be a loopback address")
 	flag.Parse()
@@ -65,7 +69,7 @@ func main() {
 
 type config struct {
 	listen, bucket, dir, eventsTable, iapAudience string
-	metricsProject                                string
+	metricsProject, benchBuckets, traceProject    string
 	insecureNoIAP                                 bool
 }
 
@@ -80,6 +84,12 @@ func (c config) validate() error {
 	case !c.insecureNoIAP && c.eventsTable == "":
 		return errors.New("-events-table is required with IAP")
 	}
+	if _, err := c.buckets(); err != nil {
+		return err
+	}
+	if c.traceProject != "" && !fleetsite.ValidProject(c.traceProject) {
+		return fmt.Errorf("-trace-project %q is not a Google Cloud project id", c.traceProject)
+	}
 	if c.insecureNoIAP {
 		host, _, err := net.SplitHostPort(c.listen)
 		if err != nil {
@@ -92,11 +102,39 @@ func (c config) validate() error {
 	return nil
 }
 
+// bucketName is a Cloud Storage bucket name, as the site checks it: lower
+// case letters, digits, "-", "_" and ".", a letter or digit at each end.
+var bucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$`)
+
+// buckets returns -bench-buckets as a list, refusing a name that is not a
+// bucket name or that repeats.
+func (c config) buckets() ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, b := range strings.Split(c.benchBuckets, ",") {
+		b = strings.TrimSpace(b)
+		if b == "" {
+			continue
+		}
+		if !bucketName.MatchString(b) || strings.Contains(b, "..") {
+			return nil, fmt.Errorf("-bench-buckets: %q is not a bucket name", b)
+		}
+		if seen[b] {
+			return nil, fmt.Errorf("-bench-buckets: %q is named twice", b)
+		}
+		seen[b] = true
+		out = append(out, b)
+	}
+	return out, nil
+}
+
 func run(ctx context.Context, cfg config) error {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
+	benchBuckets, _ := cfg.buckets()
 	var store fleetsite.Store = fleetsite.DirStore{Dir: cfg.dir}
+	var runStore fleetsite.RunStore = fleetsite.DirRuns{Dir: cfg.dir}
 	if cfg.bucket != "" {
 		gcs, err := storage.NewClient(ctx)
 		if err != nil {
@@ -104,6 +142,7 @@ func run(ctx context.Context, cfg config) error {
 		}
 		defer gcs.Close()
 		store = fleetsite.BucketStore{Bucket: gcs.Bucket(cfg.bucket)}
+		runStore = fleetsite.BucketRuns{Client: gcs, Inventory: cfg.bucket}
 	}
 
 	var auth fleetsite.Authenticate
@@ -138,11 +177,13 @@ func run(ctx context.Context, cfg config) error {
 
 	version, _ := telemetry.BuildVersion()
 	site, err := fleetsite.New(fleetsite.Config{
-		Snapshots: fleetsite.NewSnapshots(store, nil),
-		Events:    events,
-		Metrics:   metrics,
-		Auth:      auth,
-		Version:   version,
+		Snapshots:    fleetsite.NewSnapshots(store, nil),
+		Events:       events,
+		Metrics:      metrics,
+		Runs:         fleetsite.NewRuns(runStore, benchBuckets, nil),
+		TraceProject: cfg.traceProject,
+		Auth:         auth,
+		Version:      version,
 	})
 	if err != nil {
 		return err

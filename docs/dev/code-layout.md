@@ -19,7 +19,7 @@ internal/
   ate/                   # Substrate client adapter: dials ateapi control plane and atenet router
   benchmarking/          # Benchmark packages: job, measure, overlay, schema, sut, swebench, trace
   envstore/              # Environment metadata store: per-environment ConfigMaps (labels/deadlines) and orphan sweep
-  fleetsite/             # Fleet site: IAP assertion check, snapshot cache, BigQuery actor events, pages, JSON API
+  fleetsite/             # Fleet site: IAP assertion check, snapshot cache, BigQuery actor events, PromQL proxy, run folders, pages, JSON API
   hostcheck/             # HTTP middleware: DNS-rebinding defense on Host headers
   internaltest/          # Test doubles and bridges: fakecontrol, fakerouter, synctestrapid, testcerts
   inventory/             # Fleet inventory snapshot: v1 JSON Schema, strict decoder, Substrate state vocabulary
