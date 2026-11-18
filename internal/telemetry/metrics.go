@@ -464,3 +464,69 @@ func (m *GuestMetrics) ObserveProcess(d time.Duration, exitClass string) {
 	}
 	m.processDuration.WithLabelValues(exitClass).Observe(d.Seconds())
 }
+
+// MetricReporterPollDurationSeconds is the one family ate-env-reporter serves.
+const MetricReporterPollDurationSeconds = "ate_env_reporter_poll_duration_seconds"
+
+// Values of the status label of ate_env_reporter_poll_duration_seconds.
+const (
+	PollStatusOK    = "ok"
+	PollStatusError = "error"
+)
+
+// ReporterDefinitions lists the families ate-env-reporter serves with
+// -metrics-listen-addr, in documentation order.
+var ReporterDefinitions = []Definition{
+	{
+		Name: MetricReporterPollDurationSeconds,
+		Type: TypeHistogram,
+		Help: "Seconds one reporter tick took: the control-plane and Kubernetes reads, the encoding and the snapshot writes. " +
+			"status is ok (the tick wrote its snapshot) or error (the tick failed, or ran past its 60 s limit). " +
+			"A tick that shutdown cuts short is not observed.",
+		Labels:  []string{"status"},
+		Buckets: SecondsBuckets,
+	},
+}
+
+// ReporterMetrics holds the ate-env-reporter collectors on a private
+// registry. A nil *ReporterMetrics records nothing.
+type ReporterMetrics struct {
+	registry     *prometheus.Registry
+	pollDuration *prometheus.HistogramVec
+}
+
+// NewReporterMetrics creates the ate-env-reporter family on a new private
+// registry, with both status series so they show before the first tick ends.
+func NewReporterMetrics() *ReporterMetrics {
+	d := ReporterDefinitions[0]
+	m := &ReporterMetrics{
+		registry:     prometheus.NewRegistry(),
+		pollDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: d.Name, Help: d.Help, Buckets: d.Buckets}, d.Labels),
+	}
+	m.registry.MustRegister(m.pollDuration)
+	for _, s := range []string{PollStatusOK, PollStatusError} {
+		m.pollDuration.WithLabelValues(s)
+	}
+	return m
+}
+
+// Registry returns the private registry.
+func (m *ReporterMetrics) Registry() *prometheus.Registry { return m.registry }
+
+// Handler serves the registry in the Prometheus exposition format.
+func (m *ReporterMetrics) Handler() http.Handler {
+	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// ObservePoll records one tick that took d and failed with err, or
+// succeeded when err is nil; it fits reporter.Config.OnTick.
+func (m *ReporterMetrics) ObservePoll(d time.Duration, err error) {
+	if m == nil {
+		return
+	}
+	status := PollStatusOK
+	if err != nil {
+		status = PollStatusError
+	}
+	m.pollDuration.WithLabelValues(status).Observe(d.Seconds())
+}

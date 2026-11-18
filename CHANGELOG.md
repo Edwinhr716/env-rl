@@ -67,6 +67,15 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `ate-env-reporter` takes `-enable-tracing`, which exports a root span
+  `ate-env-reporter.tick` per tick over OTLP/gRPC with the control-plane
+  calls under it, and `-metrics-listen-addr` (default empty: off), which
+  serves `ate_env_reporter_poll_duration_seconds{status}` (`ok` or `error`)
+  at `/metrics` on a listener of its own, without authentication.
+  `ate-env manifest reporter` renders them with `--enable-tracing`,
+  `--otlp-endpoint`, `--otlp-insecure` (both refused without
+  `--enable-tracing`) and `--metrics-port`, and `--pod-monitoring` adds a
+  `PodMonitoring` that scrapes the reporter every 5 s. `docs/metrics.md` has an `ate-env-reporter` section.
 - `ate-env-api` takes `-router-pool-size` (`ATE_ENV_ROUTER_POOL_SIZE`, default
   `0`) to pool persistent `round_robin` gRPC connections to the `atenet` router
   instead of opening one connection per guest call, and `-reactive-wake`

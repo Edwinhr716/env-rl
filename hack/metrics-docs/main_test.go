@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -35,7 +36,7 @@ func TestMetricsDocIsFresh(t *testing.T) {
 	if !bytes.Equal(buf.Bytes(), committed) {
 		t.Error("docs/metrics.md is stale; run: go run ./hack/metrics-docs > docs/metrics.md")
 	}
-	for _, d := range append(telemetry.Definitions, telemetry.GuestDefinitions...) {
+	for _, d := range slices.Concat(telemetry.Definitions, telemetry.GuestDefinitions, telemetry.ReporterDefinitions) {
 		if !strings.Contains(buf.String(), "`"+d.Name+"`") {
 			t.Errorf("rendered doc lacks %s", d.Name)
 		}

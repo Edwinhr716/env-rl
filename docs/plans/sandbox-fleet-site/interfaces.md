@@ -1,6 +1,6 @@
 # Interface contracts: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-17 against `36e07232`. The snapshot schema in the next
+Status: accepted (#223); last checked 2026-11-18 against `7e03d2b9`. The snapshot schema in the next
 section is code since pull request 1 (#226, `internal/inventory`): its object kinds, field names and
 rules are fixed, and a change to them is a schema change. The names in the other sections (bucket
 layout, reporter flags and identity, event stream and tables, collector pipelines, site routes and
@@ -186,10 +186,18 @@ plan reads the store.
 | `-ateapi`, `-ateapi-token-file`     | as `ate-env-api`                        | Substrate control plane                                                                                                                           |
 | `-skip-verify`                      | `true`, as `ate-env-api`                | skip TLS verification of the control plane                                                                                                        |
 | `-health-listen-addr`               | `:9091`                                 | `/healthz`, and `/readyz`, which answers 200 while the last tick wrote its snapshot                                                               |
+| `-enable-tracing`                   | `false`, as `ate-env-api`               | one root span `ate-env-reporter.tick` per tick over OTLP/gRPC (`OTEL_EXPORTER_OTLP_*`), with the `ateapi` calls under it                          |
+| `-metrics-listen-addr`              | empty: off, as `ate-env-api`            | `/metrics` on its own listener, no authentication: `ate_env_reporter_poll_duration_seconds{status}`, `ok` or `error`                              |
 
-Not in pull request 2: `-enable-tracing` and `-metrics-listen-addr` with
-`ate_env_reporter_poll_duration_seconds{status}`. They are pull request 2c, with a `PodMonitoring`
-for the reporter; pull request 3 stayed the manifests. See [decisions.md](./decisions.md).
+Pull request 2c added `-enable-tracing` and `-metrics-listen-addr`. The histogram uses the bucket
+set of every `internal/telemetry` histogram, 50 ms to 10 min, and observes each tick that ends
+before shutdown; a tick that times out at 60 s counts as `error`. `ate-env manifest reporter`
+renders them with `--enable-tracing`, `--otlp-endpoint`, `--otlp-insecure`, `--metrics-port`
+(container port `metrics`; the health port 9091 is refused) and `--pod-monitoring`, which needs
+`--metrics-port`; `--otlp-endpoint` and `--otlp-insecure` need `--enable-tracing`. FS-15 covers the
+flags. The `PodMonitoring` is the one of `ate-env manifest --pod-monitoring` with the reporter's
+name and namespace: selector `app: ate-env-reporter`, port `metrics`, path `/metrics`, interval
+`5s`. See [decisions.md](./decisions.md).
 
 Identity (pull request 2b, `ate-env manifest reporter`): Kubernetes ServiceAccount
 `ate-env-reporter` in namespace `ate-env-reporter` labeled `ate.dev/api-access=true`; projected

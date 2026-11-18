@@ -32,6 +32,10 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/inventory"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	"go.opentelemetry.io/otel"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/grpc/codes"
 )
 
@@ -512,6 +516,154 @@ func TestRunWaitsTheBackoffAfterATickThatTimedOut(t *testing.T) {
 		}
 		if r.Ready() {
 			t.Error("ready while every tick timed out")
+		}
+	})
+}
+
+// tickLog collects what Run reports through Config.Tracer and Config.OnTick.
+type tickLog struct {
+	spans *tracetest.SpanRecorder
+	mu    sync.Mutex
+	durs  []time.Duration
+	errs  []error
+}
+
+func (l *tickLog) onTick(d time.Duration, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.durs = append(l.durs, d)
+	l.errs = append(l.errs, err)
+}
+
+func newTracedReporter(t *testing.T, cluster Cluster, store Store) (*Reporter, *tickLog) {
+	t.Helper()
+	l := &tickLog{spans: tracetest.NewSpanRecorder()}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(l.spans))
+	return newReporterWithTracer(t, tp, ate.NewControlClient(newControl(t).Client()), cluster, store, l), l
+}
+
+func newReporterWithTracer(t *testing.T, tp *sdktrace.TracerProvider, control *ate.Client, cluster Cluster, store Store, l *tickLog) *Reporter {
+	t.Helper()
+	r, err := New(Config{
+		Project: "p", Cluster: "c", Version: "v0.1.0",
+		Interval: 5 * time.Second, SnapshotInterval: time.Hour,
+		Tracer: tp.Tracer("test"),
+		OnTick: l.onTick,
+	}, control, cluster, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// TestTickSpanParentsTheControlPlaneCalls (FS-15): with the global tracer
+// provider set, as telemetry.SetupOTel sets it, and a client from ate.New
+// with EnableTracing, as ate-env-reporter -enable-tracing builds it, the
+// ateapi calls of a tick are children of its span.
+func TestTickSpanParentsTheControlPlaneCalls(t *testing.T) {
+	addr, stop, err := newControl(t).Serve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	l := &tickLog{spans: tracetest.NewSpanRecorder()}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(l.spans))
+	prevTP := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(prevTP) })
+	control, err := ate.New(ate.Options{ControlAddr: addr, SkipVerify: true, EnableTracing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	r := newReporterWithTracer(t, tp, control, staticCluster{}, &memStore{}, l)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Run(ctx)
+	}()
+	var tick sdktrace.ReadOnlySpan
+	for deadline := time.Now().Add(10 * time.Second); tick == nil; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no tick span after 10 s")
+		}
+		for _, s := range l.spans.Ended() {
+			if s.Name() == tickSpanName {
+				tick = s
+			}
+		}
+	}
+	cancel()
+	<-done
+
+	children := map[string]bool{}
+	for _, s := range l.spans.Ended() {
+		if s.Parent().SpanID() == tick.SpanContext().SpanID() {
+			children[s.Name()] = true
+		}
+	}
+	for _, want := range []string{"substrate.ateapi.v1.Control/ListActors", "substrate.ateapi.v1.Control/ListWorkers"} {
+		if !children[want] {
+			t.Errorf("no %s span under the tick span; children: %v", want, children)
+		}
+	}
+}
+
+// TestRunTracesAndReportsEachTick (FS-15): each tick is one span, with an error
+// status when it fails, and OnTick gets its error, which
+// ate_env_reporter_poll_duration_seconds turns into the status label.
+func TestRunTracesAndReportsEachTick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r, l := newTracedReporter(t, staticCluster{}, &memStore{fail: 1})
+		ctx, cancel := context.WithCancel(t.Context())
+		go r.Run(ctx)
+		// Ticks at 0 s (fails), 10 s and 15 s.
+		time.Sleep(16 * time.Second)
+		cancel()
+		synctest.Wait()
+
+		spans := l.spans.Ended()
+		if len(spans) != 3 || len(l.errs) != 3 {
+			t.Fatalf("%d spans and %d OnTick calls, want 3 each", len(spans), len(l.errs))
+		}
+		for i, s := range spans {
+			wantCode := otelcodes.Unset
+			if i == 0 {
+				wantCode = otelcodes.Error
+			}
+			if s.Name() != tickSpanName || s.Status().Code != wantCode || s.Parent().IsValid() {
+				t.Errorf("span %d = %q, status %v, parent %v; want a root %q with status %v", i, s.Name(), s.Status(), s.Parent(), tickSpanName, wantCode)
+			}
+		}
+		if l.errs[0] == nil || !strings.Contains(l.errs[0].Error(), "bucket unavailable") || l.errs[1] != nil || l.errs[2] != nil {
+			t.Errorf("OnTick errors = %v, want the store's error, then nil twice", l.errs)
+		}
+	})
+}
+
+// TestRunReportsATimedOutTickButNotOneCutByShutdown (FS-15): a tick that hangs is
+// reported at the tick timeout with its error; a tick that the end of Run's
+// context cuts short is not reported, so shutdown adds no error sample.
+func TestRunReportsATimedOutTickButNotOneCutByShutdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r, l := newTracedReporter(t, &hangingCluster{}, &memStore{})
+		ctx, cancel := context.WithCancel(t.Context())
+		go r.Run(ctx)
+		// The tick at 0 s times out at 60 s; the next starts at 70 s and is
+		// still hanging at 90 s.
+		time.Sleep(90 * time.Second)
+		cancel()
+		synctest.Wait()
+
+		if want := []time.Duration{tickTimeout}; !reflect.DeepEqual(l.durs, want) {
+			t.Errorf("OnTick durations = %v, want %v", l.durs, want)
+		}
+		if len(l.errs) != 1 || !errors.Is(l.errs[0], context.DeadlineExceeded) {
+			t.Errorf("OnTick errors = %v, want the deadline", l.errs)
+		}
+		if got := len(l.spans.Ended()); got != 2 {
+			t.Errorf("%d spans ended, want 2: the cut tick still ends its span", got)
 		}
 	})
 }

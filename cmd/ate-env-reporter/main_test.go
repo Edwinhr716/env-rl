@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +33,7 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/inventory"
 	"github.com/agent-substrate/env/internal/reporter"
+	"github.com/agent-substrate/env/internal/telemetry"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	atefake "go.ate.dev/substrate/pkg/client/clientset/versioned/fake"
@@ -41,9 +43,10 @@ import (
 	kubefake "k8s.io/client-go/kubernetes/fake"
 )
 
-// TestRunWritesSnapshotsOverGRPC runs the command's wiring: the control plane
-// over gRPC and TLS, the Kubernetes lists, the directory store and the identity from
-// the flags. It stops when the context is done.
+// TestRunWritesSnapshotsOverGRPC (FS-15) runs the command's wiring: the control plane
+// over gRPC and TLS, the Kubernetes lists, the directory store, the identity
+// from the flags and the metrics listener, which counts the tick that wrote
+// the snapshot. It stops when the context is done.
 func TestRunWritesSnapshotsOverGRPC(t *testing.T) {
 	ctrl := fakecontrol.New()
 	if _, err := ctrl.CreateAtespace(context.Background(), &ateapipb.CreateAtespaceRequest{
@@ -77,13 +80,15 @@ func TestRunWritesSnapshotsOverGRPC(t *testing.T) {
 	})
 
 	dir := t.TempDir()
+	healthLn, metricsLn := listen(t), listen(t)
+	metricsAddr := metricsLn.Addr().String()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		done <- run(ctx, kube, substrate, config{
 			outDir: dir, project: "kind", cluster: "kind", location: "local",
 			interval: time.Second, snapshotInterval: time.Second,
-			ateapi: addr, skipVerify: true, healthAddr: "127.0.0.1:0",
+			ateapi: addr, skipVerify: true, healthLn: healthLn, metricsLn: metricsLn,
 		})
 	}()
 
@@ -100,6 +105,17 @@ func TestRunWritesSnapshotsOverGRPC(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("no %s after 30 s", latest)
+		}
+	}
+	// The tick observes its duration after its write.
+	okCount := `ate_env_reporter_poll_duration_seconds_count{status="ok"} `
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		body := get(t, "http://"+metricsAddr+"/metrics")
+		if strings.Contains(body, okCount) && !strings.Contains(body, okCount+"0\n") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/metrics has no ok tick after 10 s:\n%s", body)
 		}
 	}
 	cancel()
@@ -142,13 +158,104 @@ func TestReportAndServeStopsTheReportWhenTheServerFails(t *testing.T) {
 	}
 
 	// The caller's context stays open: only the server's failure ends it.
-	err = reportAndServe(t.Context(), report, &http.Server{Handler: healthHandler(func() bool { return true })}, ln)
+	err = reportAndServe(t.Context(), report, server{name: "health", srv: newHTTPServer(healthHandler(func() bool { return true })), ln: ln})
 	if err == nil || !strings.Contains(err.Error(), "health server") {
 		t.Fatalf("reportAndServe = %v, want the health server's error", err)
 	}
 	if !returned.Load() {
 		t.Error("reportAndServe returned while the report loop still ran")
 	}
+}
+
+// TestReportAndServeShutsDownTheOtherServer: when the metrics server fails,
+// reportAndServe also shuts the health server down, so its listener does
+// not outlive the call.
+func TestReportAndServeShutsDownTheOtherServer(t *testing.T) {
+	healthLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsLn.Close()
+	health := server{name: "health", srv: newHTTPServer(healthHandler(func() bool { return true })), ln: healthLn}
+	metrics := server{name: "metrics", srv: newHTTPServer(http.NotFoundHandler()), ln: metricsLn}
+	err = reportAndServe(t.Context(), func(ctx context.Context) { <-ctx.Done() }, health, metrics)
+	if err == nil || !strings.Contains(err.Error(), "metrics server") {
+		t.Fatalf("reportAndServe = %v, want the metrics server's error", err)
+	}
+	if resp, err := http.Get("http://" + healthLn.Addr().String() + "/healthz"); err == nil {
+		resp.Body.Close()
+		t.Error("the health server still answers after reportAndServe returned")
+	}
+}
+
+// listen returns a loopback listener on a free port; run closes it.
+func listen(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ln
+}
+
+// FS-15 (docs/plans/sandbox-fleet-site/acceptance-criteria.md): with
+// -enable-tracing the control-plane connection is traced and the reporter
+// starts a span per tick; with a metrics listener each tick is observed.
+// Without them, neither is set.
+// run closes the listeners it is given when it fails before serving.
+func TestRunClosesTheListenersOnError(t *testing.T) {
+	health, metrics := listen(t), listen(t)
+	err := run(t.Context(), nil, nil, config{
+		outDir: t.TempDir(), project: "p", cluster: "a/b", location: "l",
+		interval: time.Second, snapshotInterval: time.Hour, ateapi: "127.0.0.1:1",
+		healthLn: health, metricsLn: metrics,
+	})
+	if err == nil {
+		t.Fatal("run with cluster \"a/b\": nil error")
+	}
+	for _, ln := range []net.Listener{health, metrics} {
+		if c, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second); err == nil {
+			c.Close()
+			t.Errorf("%s still accepts connections after run returned", ln.Addr())
+		}
+	}
+}
+
+func TestClientConfigWiresTelemetry(t *testing.T) {
+	cfg := config{ateapi: "ateapi:443", project: "p", cluster: "c", interval: time.Second, snapshotInterval: time.Hour}
+	opts, repCfg := clientConfig(cfg, "v1", "abc", nil)
+	if opts.EnableTracing || repCfg.Tracer != nil || repCfg.OnTick != nil {
+		t.Errorf("telemetry off: EnableTracing %v, Tracer %v, OnTick set %v; want none", opts.EnableTracing, repCfg.Tracer, repCfg.OnTick != nil)
+	}
+	cfg.enableTracing = true
+	opts, repCfg = clientConfig(cfg, "v1", "abc", telemetry.NewReporterMetrics())
+	if !opts.EnableTracing || repCfg.Tracer == nil || repCfg.OnTick == nil {
+		t.Errorf("telemetry on: EnableTracing %v, Tracer %v, OnTick set %v; want all", opts.EnableTracing, repCfg.Tracer, repCfg.OnTick != nil)
+	}
+	if opts.ControlAddr != "ateapi:443" || repCfg.Project != "p" || repCfg.Version != "v1" {
+		t.Errorf("options %+v, config %+v", opts, repCfg)
+	}
+}
+
+func get(t *testing.T, url string) string {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d: %s", url, resp.StatusCode, body)
+	}
+	return string(body)
 }
 
 func TestIdentity(t *testing.T) {

@@ -464,3 +464,34 @@ func TestGuestMetrics(t *testing.T) {
 	var nilM *GuestMetrics
 	nilM.ObserveProcess(time.Second, "zero")
 }
+
+// FS-15: the reporter registry serves its one family with both statuses, and
+// records a tick under ok or error by its error.
+func TestReporterMetrics(t *testing.T) {
+	m := NewReporterMetrics()
+	m.ObservePoll(300*time.Millisecond, nil)
+	m.ObservePoll(2*time.Second, nil)
+	m.ObservePoll(time.Minute, errors.New("ListActors: unavailable"))
+	mfs, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mfs) != 1 || mfs[0].GetName() != MetricReporterPollDurationSeconds {
+		t.Fatalf("reporter families = %v, want only %s", mfs, MetricReporterPollDurationSeconds)
+	}
+	counts := map[string]uint64{}
+	for _, metric := range mfs[0].GetMetric() {
+		if l := metric.GetLabel(); len(l) != 1 || l[0].GetName() != "status" {
+			t.Fatalf("labels = %v, want status alone", l)
+		}
+		counts[metric.GetLabel()[0].GetValue()] = metric.GetHistogram().GetSampleCount()
+		if got := len(metric.GetHistogram().GetBucket()); got != len(SecondsBuckets) {
+			t.Errorf("%d buckets, want the %d of SecondsBuckets", got, len(SecondsBuckets))
+		}
+	}
+	if want := map[string]uint64{PollStatusOK: 2, PollStatusError: 1}; !reflect.DeepEqual(counts, want) {
+		t.Errorf("status counts = %v, want %v", counts, want)
+	}
+	var nilM *ReporterMetrics
+	nilM.ObservePoll(time.Second, nil)
+}

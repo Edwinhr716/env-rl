@@ -26,6 +26,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -127,6 +128,81 @@ func TestManifestReporterForGKE(t *testing.T) {
 	if len(pod.Volumes) != 1 || token.Audience != "api.ate-system.svc" {
 		t.Errorf("volumes = %+v", pod.Volumes)
 	}
+	// Telemetry is off unless asked for.
+	if len(c.Ports) != 1 || len(c.Env) != 0 || len(dep.Spec.Template.Annotations) != 0 {
+		t.Errorf("ports %+v, env %+v, annotations %v: want the health port alone", c.Ports, c.Env, dep.Spec.Template.Annotations)
+	}
+}
+
+// TestManifestReporterTelemetry (FS-15): the telemetry flags render the reporter's
+// -enable-tracing and -metrics-listen-addr, the exporter's environment, the
+// metrics port, and a PodMonitoring that selects the reporter's pods and
+// scrapes that port.
+func TestManifestReporterTelemetry(t *testing.T) {
+	out, err := runManifestReporter(t, "--image", "img", "--bucket", "b", "--namespace", "fleet",
+		"--enable-tracing", "--otlp-endpoint", "http://ate-env-collector.ate-env-collector:4317", "--otlp-insecure",
+		"--metrics-port", "9090", "--pod-monitoring")
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := reporterDocs(t, out)
+	if got := len(docs); got != 6 {
+		t.Fatalf("%d documents, want the five and a PodMonitoring:\n%s", got, out)
+	}
+	var dep appsv1.Deployment
+	if err := yaml.Unmarshal([]byte(docs["Deployment"]), &dep); err != nil {
+		t.Fatal(err)
+	}
+	c := dep.Spec.Template.Spec.Containers[0]
+	for _, arg := range []string{"-enable-tracing", "-metrics-listen-addr=:9090"} {
+		if !slices.Contains(c.Args, arg) {
+			t.Errorf("args %v lack %s", c.Args, arg)
+		}
+	}
+	wantEnv := []corev1.EnvVar{
+		{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: "http://ate-env-collector.ate-env-collector:4317"},
+		{Name: "OTEL_EXPORTER_OTLP_INSECURE", Value: "true"},
+	}
+	if !reflect.DeepEqual(c.Env, wantEnv) {
+		t.Errorf("env = %+v, want %+v", c.Env, wantEnv)
+	}
+	if want := (corev1.ContainerPort{Name: metricsPortName, ContainerPort: 9090}); !slices.Contains(c.Ports, want) {
+		t.Errorf("ports = %+v, want %+v among them", c.Ports, want)
+	}
+	if a := dep.Spec.Template.Annotations; a["prometheus.io/scrape"] != "true" || a["prometheus.io/port"] != "9090" || a["prometheus.io/path"] != "/metrics" {
+		t.Errorf("pod annotations = %v", a)
+	}
+
+	var pm struct {
+		APIVersion string `json:"apiVersion"`
+		Metadata   struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+		Spec struct {
+			Selector  metav1.LabelSelector `json:"selector"`
+			Endpoints []struct {
+				Port     string `json:"port"`
+				Path     string `json:"path"`
+				Interval string `json:"interval"`
+			} `json:"endpoints"`
+		} `json:"spec"`
+	}
+	if err := yaml.Unmarshal([]byte(docs["PodMonitoring"]), &pm); err != nil {
+		t.Fatal(err)
+	}
+	if pm.APIVersion != "monitoring.googleapis.com/v1" || pm.Metadata.Name != reporterName || pm.Metadata.Namespace != "fleet" {
+		t.Errorf("PodMonitoring %s %s/%s, want monitoring.googleapis.com/v1 fleet/%s", pm.APIVersion, pm.Metadata.Namespace, pm.Metadata.Name, reporterName)
+	}
+	if !reflect.DeepEqual(pm.Spec.Selector.MatchLabels, dep.Spec.Template.Labels) {
+		t.Errorf("selector %v, want the reporter pods' labels %v", pm.Spec.Selector.MatchLabels, dep.Spec.Template.Labels)
+	}
+	if len(pm.Spec.Endpoints) != 1 {
+		t.Fatalf("endpoints = %+v, want one", pm.Spec.Endpoints)
+	}
+	if e := pm.Spec.Endpoints[0]; e.Port != metricsPortName || e.Path != "/metrics" || e.Interval != "5s" {
+		t.Errorf("endpoint = %+v, want port %q, /metrics, every 5s", e, metricsPortName)
+	}
 }
 
 func TestManifestReporterOutDir(t *testing.T) {
@@ -164,6 +240,8 @@ func TestManifestReporterOutDir(t *testing.T) {
 	}
 }
 
+// TestManifestReporterRejects: flags the command refuses. The telemetry
+// cases (--pod-monitoring, --metrics-port, --otlp-*) are FS-15.
 func TestManifestReporterRejects(t *testing.T) {
 	for name, tc := range map[string]struct {
 		args []string
@@ -201,6 +279,12 @@ func TestManifestReporterRejects(t *testing.T) {
 		"snapshot interval under default":  {[]string{"--image", "i", "--bucket", "b", "--snapshot-interval", "2s"}, "--snapshot-interval"},
 		"interval over default snapshot":   {[]string{"--image", "i", "--bucket", "b", "--interval", "2h"}, "--snapshot-interval"},
 		"snapshot interval under interval": {[]string{"--image", "i", "--bucket", "b", "--interval", "10s", "--snapshot-interval", "9s"}, "--snapshot-interval"},
+		"negative metrics port":            {[]string{"--image", "i", "--bucket", "b", "--metrics-port", "-1"}, "--metrics-port"},
+		"metrics port over 65535":          {[]string{"--image", "i", "--bucket", "b", "--metrics-port", "65536"}, "--metrics-port"},
+		"metrics port on the health port":  {[]string{"--image", "i", "--bucket", "b", "--metrics-port", "9091"}, "health port"},
+		"pod monitoring without a port":    {[]string{"--image", "i", "--bucket", "b", "--pod-monitoring"}, "--pod-monitoring needs --metrics-port"},
+		"otlp endpoint without tracing":    {[]string{"--image", "i", "--bucket", "b", "--otlp-endpoint", "http://c:4317"}, "need --enable-tracing"},
+		"otlp insecure without tracing":    {[]string{"--image", "i", "--bucket", "b", "--otlp-insecure"}, "need --enable-tracing"},
 	} {
 		if _, err := runManifestReporter(t, tc.args...); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: err = %v, want one containing %q", name, err, tc.want)

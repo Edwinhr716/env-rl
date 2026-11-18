@@ -38,6 +38,7 @@ import (
 	"github.com/agent-substrate/env/internal/reporter"
 	"github.com/agent-substrate/env/internal/telemetry"
 	"go.ate.dev/substrate/pkg/client/clientset/versioned"
+	"go.opentelemetry.io/otel"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -45,8 +46,16 @@ import (
 // startTimeout bounds the reads of the metadata server before the first tick.
 const startTimeout = time.Minute
 
-// shutdownTimeout bounds the wait for open health requests at exit.
+// shutdownTimeout bounds the wait for open health and metrics requests at
+// exit.
 const shutdownTimeout = 5 * time.Second
+
+// readHeaderTimeout bounds the read of a request's headers on both listeners.
+const readHeaderTimeout = 5 * time.Second
+
+// otelServiceName is the OpenTelemetry service.name of the reporter's spans
+// and the instrumentation scope of its tick spans.
+const otelServiceName = "ate-env-reporter"
 
 func main() {
 	var (
@@ -61,6 +70,8 @@ func main() {
 		tokenFile        = flag.String("ateapi-token-file", "", "file with a bearer token for the control plane, e.g. a projected ServiceAccount token with the ateapi audience")
 		skipVerify       = flag.Bool("skip-verify", true, "skip TLS certificate verification on the control plane connection")
 		healthAddr       = flag.String("health-listen-addr", ":9091", "address to serve /healthz and /readyz on; /readyz answers 200 while the last snapshot was written")
+		enableTracing    = flag.Bool("enable-tracing", false, "export OpenTelemetry traces over OTLP/gRPC, configured by OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_INSECURE: one span per tick, with the control-plane calls under it")
+		metricsAddr      = flag.String("metrics-listen-addr", "", "address to serve Prometheus metrics on, at /metrics, on a listener of its own, e.g. :9090; empty (the default) disables metrics. The listener has no authentication and no Host check; it serves tick durations by status")
 	)
 	flag.Parse()
 	if flag.NArg() > 0 {
@@ -68,6 +79,16 @@ func main() {
 	}
 	if (*bucket == "") == (*outDir == "") {
 		log.Fatal("set one of -bucket and -out-dir")
+	}
+	healthLn, err := net.Listen("tcp", *healthAddr)
+	if err != nil {
+		log.Fatalf("health listener %s: %v", *healthAddr, err)
+	}
+	var metricsLn net.Listener
+	if *metricsAddr != "" {
+		if metricsLn, err = net.Listen("tcp", *metricsAddr); err != nil {
+			log.Fatalf("metrics listener %s: %v", *metricsAddr, err)
+		}
 	}
 
 	// The kubeconfig rules of kubectl: KUBECONFIG or ~/.kube/config, and the
@@ -92,7 +113,8 @@ func main() {
 		project: *project, cluster: *cluster, location: *location,
 		interval: *interval, snapshotInterval: *snapshotInterval,
 		ateapi: *ateapi, tokenFile: *tokenFile, skipVerify: *skipVerify,
-		healthAddr: *healthAddr,
+		healthLn: healthLn, metricsLn: metricsLn,
+		enableTracing: *enableTracing,
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -104,11 +126,23 @@ type config struct {
 	interval, snapshotInterval time.Duration
 	ateapi, tokenFile          string
 	skipVerify                 bool
-	healthAddr                 string
+	// healthLn serves /healthz and /readyz; metricsLn, when not nil,
+	// serves /metrics. run closes both.
+	healthLn, metricsLn net.Listener
+	enableTracing       bool
 }
 
 // run reports until ctx is done, which is not an error.
 func run(ctx context.Context, kube kubernetes.Interface, substrate versioned.Interface, cfg config) error {
+	// After reportAndServe the servers have closed them already, and a
+	// second Close only returns an error.
+	defer func() {
+		for _, ln := range []net.Listener{cfg.healthLn, cfg.metricsLn} {
+			if ln != nil {
+				_ = ln.Close()
+			}
+		}
+	}()
 	startCtx, cancel := context.WithTimeout(ctx, startTimeout)
 	defer cancel()
 
@@ -127,41 +161,102 @@ func run(ctx context.Context, kube kubernetes.Interface, substrate versioned.Int
 		store = reporter.BucketStore{Bucket: gcs.Bucket(cfg.bucket)}
 	}
 
-	control, err := ate.New(ate.Options{ControlAddr: cfg.ateapi, SkipVerify: cfg.skipVerify, BearerTokenFile: cfg.tokenFile})
+	if cfg.enableTracing {
+		shutdown, err := telemetry.SetupOTel(ctx, otelServiceName)
+		if err != nil {
+			return fmt.Errorf("-enable-tracing: %w", err)
+		}
+		defer shutdown()
+		endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+		if endpoint == "" {
+			endpoint = "localhost:4317, the default"
+		}
+		log.Printf("tracing enabled (OTLP endpoint %s)", endpoint)
+	}
+	var metrics *telemetry.ReporterMetrics
+	if cfg.metricsLn != nil {
+		metrics = telemetry.NewReporterMetrics()
+	}
+	ateOpts, repCfg := clientConfig(cfg, version, commit, metrics)
+	control, err := ate.New(ateOpts)
 	if err != nil {
 		return err
 	}
 	defer control.Close()
-
-	rep, err := reporter.New(reporter.Config{
-		Project: cfg.project, Cluster: cfg.cluster, Location: cfg.location,
-		Version: version, Commit: commit,
-		Interval: cfg.interval, SnapshotInterval: cfg.snapshotInterval,
-	}, control, reporter.KubeCluster{Kube: kube, Substrate: substrate}, store)
+	rep, err := reporter.New(repCfg, control, reporter.KubeCluster{Kube: kube, Substrate: substrate}, store)
 	if err != nil {
 		return err
 	}
 
-	ln, err := net.Listen("tcp", cfg.healthAddr)
-	if err != nil {
-		return fmt.Errorf("health listener %s: %w", cfg.healthAddr, err)
+	servers := []server{{name: "health", srv: newHTTPServer(healthHandler(rep.Ready)), ln: cfg.healthLn}}
+	if metrics != nil {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", metrics.Handler())
+		servers = append(servers, server{name: "metrics", srv: newHTTPServer(mux), ln: cfg.metricsLn})
 	}
 	dest := "gs://" + cfg.bucket
 	if cfg.bucket == "" {
 		dest = cfg.outDir
 	}
-	log.Printf("ate-env-reporter %s: %s/%s every %s to %s (ateapi %s, health on %s)", version, cfg.project, cfg.cluster, cfg.interval, dest, cfg.ateapi, ln.Addr())
-
-	srv := &http.Server{Handler: healthHandler(rep.Ready), ReadHeaderTimeout: 5 * time.Second}
-	return reportAndServe(ctx, rep.Run, srv, ln)
+	log.Printf("ate-env-reporter %s: %s/%s every %s to %s (ateapi %s, health on %s)", version, cfg.project, cfg.cluster, cfg.interval, dest, cfg.ateapi, cfg.healthLn.Addr())
+	if metrics != nil {
+		log.Printf("metrics listening on %s (no authentication, no Host check)", cfg.metricsLn.Addr())
+	}
+	return reportAndServe(ctx, rep.Run, servers...)
 }
 
-// reportAndServe runs report and serves srv on ln until ctx is done, which
-// is not an error, or until the server fails. It returns after report has
-// returned, so the caller can close the clients that report uses.
-func reportAndServe(ctx context.Context, report func(context.Context), srv *http.Server, ln net.Listener) error {
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(ln) }()
+// clientConfig returns the control-plane options and the reporter config
+// of cfg. With tracing on, the control-plane calls are traced and each tick
+// is a span of the global tracer provider; with metrics, each tick is
+// observed.
+func clientConfig(cfg config, version, commit string, metrics *telemetry.ReporterMetrics) (ate.Options, reporter.Config) {
+	opts := ate.Options{ControlAddr: cfg.ateapi, SkipVerify: cfg.skipVerify, BearerTokenFile: cfg.tokenFile, EnableTracing: cfg.enableTracing}
+	repCfg := reporter.Config{
+		Project: cfg.project, Cluster: cfg.cluster, Location: cfg.location,
+		Version: version, Commit: commit,
+		Interval: cfg.interval, SnapshotInterval: cfg.snapshotInterval,
+	}
+	if cfg.enableTracing {
+		repCfg.Tracer = otel.Tracer(otelServiceName)
+	}
+	if metrics != nil {
+		repCfg.OnTick = metrics.ObservePoll
+	}
+	return opts, repCfg
+}
+
+// server is one HTTP server of the reporter and its listener.
+type server struct {
+	name string
+	srv  *http.Server
+	ln   net.Listener
+}
+
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout}
+}
+
+// reportAndServe runs report and serves each server on its listener until
+// ctx is done, which is not an error, or until a server fails. It returns
+// after report and every server have returned, so the caller can close the
+// clients that report uses and no listener outlives the call.
+func reportAndServe(ctx context.Context, report func(context.Context), servers ...server) error {
+	serveErr := make(chan error, len(servers))
+	for _, s := range servers {
+		go func() { serveErr <- fmt.Errorf("%s server: %w", s.name, s.srv.Serve(s.ln)) }()
+	}
+	// shutdown stops every server and waits for each Serve to return;
+	// failed of them have returned already.
+	shutdown := func(failed int) {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		for _, s := range servers {
+			_ = s.srv.Shutdown(shutdownCtx)
+		}
+		for range len(servers) - failed {
+			<-serveErr
+		}
+	}
 
 	runCtx, stopRun := context.WithCancel(ctx)
 	defer stopRun()
@@ -173,14 +268,13 @@ func reportAndServe(ctx context.Context, report func(context.Context), srv *http
 	select {
 	case <-done:
 		// ctx is done: a signal.
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		shutdown(0)
 		return nil
 	case err := <-serveErr:
 		stopRun()
 		<-done
-		return fmt.Errorf("health server: %w", err)
+		shutdown(1)
+		return err
 	}
 }
 

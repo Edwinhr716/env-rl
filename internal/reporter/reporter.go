@@ -32,6 +32,9 @@ import (
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/inventory"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // catalogEvery is how many ticks one read of the atespaces, templates and
@@ -52,6 +55,9 @@ const maxBackoff = time.Minute
 // maxDroppedLogged bounds the label keys remembered as logged: selector keys
 // come from the callers that create actors.
 const maxDroppedLogged = 100
+
+// tickSpanName names the span of one tick when Config.Tracer is set.
+const tickSpanName = "ate-env-reporter.tick"
 
 // tickTimeout bounds one tick, so a control plane that hangs fails the tick
 // and readiness instead of stopping the loop.
@@ -81,6 +87,14 @@ type Config struct {
 	// SnapshotInterval is how often a tick also keeps its snapshot under
 	// v1/snapshots/.
 	SnapshotInterval time.Duration
+	// Tracer, when set, starts a tickSpanName span for each tick that Run
+	// starts; the control-plane calls of the tick are its children when the
+	// ate.Client traces.
+	Tracer trace.Tracer
+	// OnTick, when set, is called after each tick that Run starts with the
+	// tick's duration and error. A tick that ends because Run's context is
+	// done is not reported.
+	OnTick func(d time.Duration, err error)
 }
 
 // Reporter builds and writes snapshots. Tick and Run are for one goroutine;
@@ -129,6 +143,9 @@ func New(cfg Config, control *ate.Client, cluster Cluster, store Store) (*Report
 	if err := inventory.CheckPathSegment("cluster", cfg.Cluster); err != nil {
 		return nil, fmt.Errorf("reporter: %w", err)
 	}
+	if cfg.Tracer == nil {
+		cfg.Tracer = noop.NewTracerProvider().Tracer("")
+	}
 	return &Reporter{cfg: cfg, control: control, cluster: cluster, store: store, dropped: map[string]bool{}}, nil
 }
 
@@ -152,11 +169,12 @@ func (r *Reporter) Run(ctx context.Context) {
 	failures := 0
 	for {
 		start := time.Now()
-		tickCtx, cancel := context.WithTimeout(ctx, tickTimeout)
-		err := r.Tick(tickCtx)
-		cancel()
+		err := r.tracedTick(ctx)
 		if ctx.Err() != nil {
 			return
+		}
+		if r.cfg.OnTick != nil {
+			r.cfg.OnTick(time.Since(start), err)
 		}
 		r.ready.Store(err == nil)
 		var wait time.Duration
@@ -181,6 +199,20 @@ func (r *Reporter) Run(ctx context.Context) {
 		case <-time.After(wait):
 		}
 	}
+}
+
+// tracedTick runs one tick within tickTimeout, in a span of its own.
+func (r *Reporter) tracedTick(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, tickTimeout)
+	defer cancel()
+	ctx, span := r.cfg.Tracer.Start(ctx, tickSpanName)
+	defer span.End()
+	err := r.Tick(ctx)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return err
 }
 
 // backoff is the wait after failures consecutive failed ticks.

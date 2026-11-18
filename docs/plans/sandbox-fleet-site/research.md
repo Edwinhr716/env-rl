@@ -324,6 +324,28 @@ subcommand, which also has `--domain-offset`. The seven steps:
    check to `internal/benchmarking/schema` so the site can use it.
 7. `FS-` is used by this plan only.
 
+## Audit of main, 2026-11-18, for pull request 2c
+
+Checked against `ai-on-gke/sandboxenv-rl` at `7e03d2b9`, for pull request 2c. Since `36e07232`, the
+last audit: #437 (`7e03d2b9`) is pull request 5b; #436 and #439 change the SWE-bench loader's
+pre-flight knobs; #438 changes the Harbor provider; `220e9586` pools `ate-env-api`'s router
+connections, adds `-reactive-wake` and a `request_id` to the guest's `StartProcessRequest`; #440
+changes one `internal/apiservice` test. The seven steps:
+
+1. `env.proto` is unchanged: ten RPCs. `220e9586` changes `guest.proto` only.
+2. `go.mod` and `go.sum` are unchanged, so Substrate is still `v1.0.0`, with the same actor event
+   names, `ListActors` paging, roles and no `Batch*` or stream RPC.
+3. `internal/inventory` is unchanged and `go test ./internal/inventory/` passes; the example of
+   `interfaces.md` parses equal to `snapshot.golden.json`.
+4. `docs/metrics.md` is unchanged on `main` and holds the four `ate_env_api_*` families the named
+   queries use; pull request 2c adds the `ate-env-reporter` section, which no named query reads.
+   Substrate's registry is the same version.
+5. `ate-env manifest` keeps every flag and subcommand of step 5. Pull request 2c gives `reporter`
+   the five telemetry flags, and step 5 now names them.
+6. `cmd/benchmarking/bench/bundle.go` changed in #437 only, which moved its folder-name check to
+   `schema.CheckFolderName`; the folder form is the same.
+7. `FS-` is used by this plan only. Pull request 2c adds FS-15.
+
 ## Sources
 
 - Substrate: `docs/observability.md`, `internal/actorevent/actorevent.go`,

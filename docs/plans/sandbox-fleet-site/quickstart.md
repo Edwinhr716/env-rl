@@ -1,6 +1,6 @@
 # Quickstart: deploy the fleet site
 
-Status: plan-stage runbook, written 2026-11-04; last checked 2026-11-17 against `36e07232`. The
+Status: plan-stage runbook, written 2026-11-04; last checked 2026-11-18 against `7e03d2b9`. The
 Terraform in pull request 6 of the [execution plan](./execution-plan.md) replaces the `gcloud`
 commands below with one `apply` per project; `docs/fleet-site.md` then becomes the user-facing
 guide. Until then this is the order of operations and the exact resources, with the open parameters
@@ -185,9 +185,12 @@ In the cluster, after the components exist:
   `ate-env-api` sends its spans to the collector.
 - PR 2 (no reporter image is published yet; build one with
   `KO_DOCKER_REPO=... ko build -B ./cmd/ate-env-reporter`):
-  `ate-env manifest reporter --image "$REPORTER_IMAGE" --bucket "$BUCKET" --project "$CLUSTER_PROJECT" --cluster "$CLUSTER" --gcp-service-account "ate-env-reporter@$P" | kubectl apply -f -`,
-  then merge `user:system:serviceaccount:ate-env-reporter:ate-env-reporter` into the global
-  AccessPolicy's `viewer` binding with `kubectl ate get access-policy --global -o yaml` and
+  `ate-env manifest reporter --image "$REPORTER_IMAGE" --bucket "$BUCKET" --project "$CLUSTER_PROJECT" --cluster "$CLUSTER" --gcp-service-account "ate-env-reporter@$P" | kubectl apply -f -`
+  (from PR 2c, add `--metrics-port 9090 --pod-monitoring` for its tick durations and
+  `--enable-tracing --otlp-endpoint http://ate-env-collector.ate-env-collector:4317 --otlp-insecure`
+  for its tick spans), then merge `user:system:serviceaccount:ate-env-reporter:ate-env-reporter`
+  into the global AccessPolicy's `viewer` binding with
+  `kubectl ate get access-policy --global -o yaml` and
   `kubectl ate update access-policy --global -f <file>` (both commands refuse to run without `-a` or
   `--global`), the way the README does it for `ate-env-api`'s `ListPlacementDomains`
   (`ate-env manifest access-policy --global` prints that binding). The global policy is one object;

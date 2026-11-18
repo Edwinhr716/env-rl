@@ -3,11 +3,12 @@
 Status: accepted plan (#223); pull requests 1, 2 and 2b (`internal/inventory`, the reporter and its
 manifest) merged as #226, #348 and #349; pull requests 3 and 4, the telemetry manifests and the site
 with the Fleet and Cluster pages, merged as #415 and #416; pull request 5a, the Actor and Live pages
-and the metrics API, merged as #434; pull request 5b, the Runs page, in review. Last checked
-2026-11-17 against `ai-on-gke/sandboxenv-rl` at `36e07232` and the Substrate `go.mod` requires,
-`v1.0.0`; the audit is in [research.md](./research.md), which first read `3b03b03` and `28520c0d` on
-2026-10-30. The decisions taken so far are in [decisions.md](./decisions.md). Companions:
-[prd.md](./prd.md), [execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
+and the metrics API, merged as #434; pull request 5b, the Runs page, merged as #437; pull request
+2c, the reporter's tracing and metrics, in review. Last checked 2026-11-18 against
+`ai-on-gke/sandboxenv-rl` at `7e03d2b9` and the Substrate `go.mod` requires, `v1.0.0`; the audit is
+in [research.md](./research.md), which first read `3b03b03` and `28520c0d` on 2026-10-30. The
+decisions taken so far are in [decisions.md](./decisions.md). Companions: [prd.md](./prd.md),
+[execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
 [acceptance-criteria.md](./acceptance-criteria.md) and, for the order of operations with `gcloud`,
 [quickstart.md](./quickstart.md).
 
@@ -72,7 +73,8 @@ Per cluster, applied by `ate-env manifest` or the fleet's Config Sync repository
   `ListPlacementDomains` (#235), because the global policy is one object; a ClusterRole with `list`
   on WorkerPools and Deployments, the two kinds the reporter reads.
 - PodMonitoring for `ate-env-api`'s metrics port, rendered by
-  `ate-env manifest --metrics-port <port> --pod-monitoring`.
+  `ate-env manifest --metrics-port <port> --pod-monitoring`, and one for the reporter's, rendered by
+  `ate-env manifest reporter --metrics-port <port> --pod-monitoring`.
 - Substrate configuration: `OTEL_LOGS_EXPORTER=otlp,console` and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`
   on the `ate-api-server` Deployment (phase 2; not in the shared `ate-otel-config`, because the
   managed collector does not export logs to Pub/Sub and atelet refuses per-signal endpoints that
@@ -122,7 +124,7 @@ intervals, which doubles as reporter health.
 - A compromised reporter can overwrite or delete only its own cluster's `latest.json` and hourly
   snapshots. The event archive under `v1/events/` and the BigQuery table are written by Pub/Sub,
   outside every reporter's prefixes, and keep the transition history.
-- The metrics listeners of `ate-env-api` and the guest have no authentication and stay
+- The metrics listeners of `ate-env-api`, the reporter and the guest have no authentication and stay
   cluster-internal; only the in-cluster collectors scrape them.
 - Snapshots and events carry atespace names, template names, image references and run ids, never
   tokens. Cross-tenant visibility is a policy choice: IAP supplies the user identity, so the site
@@ -154,7 +156,7 @@ section of [research.md](./research.md) and update the last-checked line above (
    adding.
 5. Manifest: `ate-env manifest` still has `access-policy --global`, `--metrics-port`,
    `--pod-monitoring`, `--enable-tracing`, `--otlp-endpoint`, `--otlp-insecure`, `reporter` and
-   `collector`.
+   `collector`, and `reporter` has the same five telemetry flags.
 6. Benchmark bundles: `cmd/benchmarking/bench/bundle.go` still names the folder form and the
    required files the Runs page reads.
 7. Conventions: criterion ids stay unique across `docs/plans/` (`FS-` here).

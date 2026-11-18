@@ -342,8 +342,8 @@ func (c *manifestConfig) resolveAuth(secretChanged bool) error {
 	return nil
 }
 
-// metricsPortName names the ate-env-api metrics port on the container and
-// the Service.
+// metricsPortName names the metrics port on the ate-env-api container and
+// Service, and on the ate-env-reporter container.
 const metricsPortName = "metrics"
 
 func (c *manifestConfig) resolveImages() error {
@@ -988,7 +988,7 @@ func buildManifests(cfg manifestConfig) []any {
 		buildAPIService(cfg),
 	)
 	if cfg.podMonitoring {
-		objs = append(objs, buildPodMonitoring(cfg))
+		objs = append(objs, buildPodMonitoring(apiName, cfg.namespace))
 	}
 	return objs
 }
@@ -1029,21 +1029,22 @@ func buildEnvironmentStoreRole(cfg manifestConfig) (*rbacv1.Role, *rbacv1.RoleBi
 	return role, binding
 }
 
-// buildPodMonitoring returns the PodMonitoring that scrapes ate-env-api's
-// metrics port. Managed Service for Prometheus adds the project, location,
-// cluster and namespace labels to each series. This repository links no Go
-// type for the kind, so the object is a map.
-func buildPodMonitoring(cfg manifestConfig) map[string]any {
+// buildPodMonitoring returns the PodMonitoring named app in namespace that
+// scrapes the metrics port of the pods labeled app=<app>: ate-env-api's or
+// ate-env-reporter's. Managed Service for Prometheus adds the project,
+// location, cluster and namespace labels to each series. This repository
+// links no Go type for the kind, so the object is a map.
+func buildPodMonitoring(app, namespace string) map[string]any {
 	return map[string]any{
 		"apiVersion": "monitoring.googleapis.com/v1",
 		"kind":       "PodMonitoring",
 		"metadata": map[string]any{
-			"name":      apiName,
-			"namespace": cfg.namespace,
-			"labels":    map[string]any{"app": apiName},
+			"name":      app,
+			"namespace": namespace,
+			"labels":    map[string]any{"app": app},
 		},
 		"spec": map[string]any{
-			"selector": map[string]any{"matchLabels": map[string]any{"app": apiName}},
+			"selector": map[string]any{"matchLabels": map[string]any{"app": app}},
 			"endpoints": []any{map[string]any{
 				"port":     metricsPortName,
 				"path":     "/metrics",

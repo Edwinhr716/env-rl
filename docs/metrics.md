@@ -43,3 +43,16 @@ router.
 | Name | Type | Labels | Description |
 |---|---|---|---|
 | `ate_env_guest_process_duration_seconds` | histogram | `exit_class` | Seconds from a process starting in the environment to its exit, by exit_class: zero, nonzero, signal (killed by a signal) or timeout (killed by the process timeout). The command is never a label. |
+
+## ate-env-reporter
+
+With `-metrics-listen-addr`, ate-env-reporter serves this family at `/metrics` on a
+listener of its own, on a private registry. The listener is off by default (the flag
+is empty); `ate-env manifest reporter --metrics-port` turns it on, and
+`--pod-monitoring` adds a `PodMonitoring` that scrapes it every 5 s. It has no
+authentication and no Host check, like ate-env-api's; the family holds tick
+durations by status and no cluster data.
+
+| Name | Type | Labels | Description |
+|---|---|---|---|
+| `ate_env_reporter_poll_duration_seconds` | histogram | `status` | Seconds one reporter tick took: the control-plane and Kubernetes reads, the encoding and the snapshot writes. status is ok (the tick wrote its snapshot) or error (the tick failed, or ran past its 60 s limit). A tick that shutdown cuts short is not observed. |

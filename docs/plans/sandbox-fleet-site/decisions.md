@@ -286,3 +286,32 @@ Append-only. Each entry: date, who, what, why.
   time, and the span parser keeps only the run trace's spans with memoized depths: a 59 MB span file
   made 8 views take 2.16 GB before. RunReport candidates are the files named as `RunReport.write`
   names them, at most 20 of 1 MiB.
+- 2026-11-17, orchestrator, pull request 2c: the reporter's tick is the unit of both signals. With
+  `-enable-tracing` each tick is a root span `ate-env-reporter.tick` (scope and `service.name`
+  `ate-env-reporter`) with an error status when the tick fails, and the `ateapi` calls of the tick
+  are its children through `internal/ate`'s otelgrpc client handler; the Kubernetes lists and the
+  bucket writes have no spans of their own. `ate_env_reporter_poll_duration_seconds{status}` uses
+  `telemetry.SecondsBuckets`, the bucket set of every `internal/telemetry` histogram, 50 ms to 10
+  min, which spans a 5 s interval and the 60 s tick timeout. `status` is `ok` or `error`, the values
+  `create_to_ready` uses for success and failure; a tick that shutdown cuts short is not observed,
+  so a rollout adds no error sample. `internal/reporter` takes a `Tracer` and an `OnTick` callback
+  in its `Config`, the way the guest takes `OnProcessExit`, and links no Prometheus code. The family
+  is defined in `telemetry.ReporterDefinitions`, which `hack/metrics-docs` renders into
+  `docs/metrics.md`. Unlike the environments gauge's reads, which `telemetry.Untraced` keeps out of
+  traces, each tick is a sampled root trace: about 17,000 a day per cluster at 5 s, and `ateapi`
+  records its server spans under them when it traces. Tracing is opt-in, and the SDK honors
+  `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` (for example `traceidratio` with `0.1`) on the
+  reporter's container to thin them.
+- 2026-11-17, orchestrator, pull request 2c: `ate-env manifest reporter` takes the five telemetry
+  flags of `ate-env manifest` with the same names and meaning. `--metrics-port` refuses the health
+  port, 9091, because both are listeners of one pod. The `PodMonitoring` reuses `buildPodMonitoring`
+  with the reporter's name and namespace, and the pod keeps the `prometheus.io` annotations, as the
+  `ate-env-api` pod does. Drift check against `main` at `7e03d2b9` (research.md, "Audit of main,
+  2026-11-18, for pull request 2c"); the seven steps hold, and step 5 also names the reporter's
+  telemetry flags.
+- 2026-11-17, review of pull request 2c: FS-15, "Reporter tick telemetry", is added, because no
+  criterion covered the reporter's own traces and metrics; its tests name it.
+  `ate-env manifest reporter` refuses `--otlp-endpoint` and `--otlp-insecure` without
+  `--enable-tracing`, because without it they render environment variables nothing reads. Its flags
+  are new, so the check costs no compatibility. `ate-env manifest` still accepts the combination;
+  refusing it there too is a follow-up, a behavior change of its own.

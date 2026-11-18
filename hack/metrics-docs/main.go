@@ -13,8 +13,9 @@
 // limitations under the License.
 
 // Command metrics-docs renders docs/metrics.md, the reference of the
-// Prometheus families ate-env-api serves, from telemetry.Definitions, the
-// same definitions the server registers. Regenerate after changing a metric:
+// Prometheus families ate-env-api, ate-env-guest and ate-env-reporter serve,
+// from the definitions in internal/telemetry that the binaries register.
+// Regenerate after changing a metric:
 //
 //	go run ./hack/metrics-docs > docs/metrics.md
 package main
@@ -88,6 +89,18 @@ router.
 
 `, telemetry.RequestedAtHeader, telemetry.MetricCreateToReadySeconds)
 	table(w, telemetry.GuestDefinitions)
+	fmt.Fprint(w, `
+## ate-env-reporter
+
+With `+"`-metrics-listen-addr`"+`, ate-env-reporter serves this family at `+"`/metrics`"+` on a
+listener of its own, on a private registry. The listener is off by default (the flag
+is empty); `+"`ate-env manifest reporter --metrics-port`"+` turns it on, and
+`+"`--pod-monitoring`"+` adds a `+"`PodMonitoring`"+` that scrapes it every 5 s. It has no
+authentication and no Host check, like ate-env-api's; the family holds tick
+durations by status and no cluster data.
+
+`)
+	table(w, telemetry.ReporterDefinitions)
 }
 
 func table(w io.Writer, defs []telemetry.Definition) {

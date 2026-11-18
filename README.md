@@ -660,7 +660,9 @@ The Google service account needs `roles/storage.objectUser` on the bucket, becau
 replaces `latest.json`, and the Workload Identity binding for the Kubernetes ServiceAccount
 `ate-env-reporter/ate-env-reporter`. On GKE the project, the cluster and the location come from the
 metadata server; elsewhere pass `--project` and `--cluster`. `--out-dir <path>` writes under an
-emptyDir instead of a bucket.
+emptyDir instead of a bucket. `--metrics-port <port>` serves the tick durations
+(`ate_env_reporter_poll_duration_seconds`) and `--pod-monitoring` scrapes them with Managed
+Prometheus; `--enable-tracing` with `--otlp-endpoint` exports a span per tick.
 
 The reporter lists the actors and workers of all atespaces, which takes the global `viewer` role.
 `ate-env manifest reporter --access-policy` prints that binding. The global policy is one object for
@@ -677,8 +679,9 @@ The Deployment turns ready when the first snapshot is written.
 ### 4. Optional: the fleet telemetry collector
 
 `ate-env manifest collector` prints one OpenTelemetry collector per cluster, which sends the traces
-of `ate-env-api` and the trainers to Cloud Trace and as files under `v1/traces/` in a bucket.
-`--pod-monitoring` adds a Managed Prometheus `PodMonitoring` that scrapes `ate-env-api` every 5 s.
+of `ate-env-api`, the trainers and the reporter to Cloud Trace and as files under `v1/traces/` in a
+bucket. `--pod-monitoring` adds a Managed Prometheus `PodMonitoring` that scrapes `ate-env-api`
+every 5 s; `ate-env manifest reporter --pod-monitoring` does the same for the reporter.
 See [docs/observability.md](docs/observability.md#the-fleet-collector) for the roles the Google
 service account needs and the APIs to enable.
 

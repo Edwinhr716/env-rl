@@ -1,6 +1,6 @@
 # Acceptance criteria: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-17 against `36e07232`. Each criterion has a command
+Status: accepted (#223); last checked 2026-11-18 against `7e03d2b9`. Each criterion has a command
 and an expected result. Evidence goes into `evidence/` in this directory, one file per acceptance
 pass, with the commit of each component.
 
@@ -20,6 +20,7 @@ pass, with the commit of each component.
 | FS-12 | Documentation                            | 8     |
 | FS-13 | Plan drift check against main            | each  |
 | FS-14 | Reporter against the Kind Substrate      | 3     |
+| FS-15 | Reporter tick telemetry                  | 3, 4  |
 
 ## FS-1: Inventory freshness
 
@@ -169,3 +170,25 @@ pass, with the commit of each component.
   so the ServiceAccount's token, the `viewer` binding and the ClusterRole hold. The run on the host
   uses a token of the same ServiceAccount and `TestE2ESnapshotDir` checks its files.
 - Pass rule: holds in the `E2E Kind and Smoke Test` job.
+
+## FS-15: Reporter tick telemetry
+
+Added by pull request 2c.
+
+- Command:
+  `go test -race ./internal/reporter ./internal/telemetry ./cmd/ate-env-reporter ./cmd/ate-env` with
+  `TestRunTracesAndReportsEachTick`, `TestRunReportsATimedOutTickButNotOneCutByShutdown`,
+  `TestTickSpanParentsTheControlPlaneCalls`, `TestReporterMetrics`,
+  `TestRunWritesSnapshotsOverGRPC`, `TestClientConfigWiresTelemetry`,
+  `TestManifestReporterTelemetry` and `TestManifestReporterRejects`.
+- Expected: with `-metrics-listen-addr`, `/metrics` serves `ate_env_reporter_poll_duration_seconds`
+  with `status` `ok` or `error` and counts a tick that wrote its snapshot as `ok`; a tick that times
+  out counts as `error`, and one that shutdown cuts short is not counted. With `-enable-tracing`,
+  each tick is one root span `ate-env-reporter.tick`, with an error status when it fails, and the
+  `ateapi` calls of the tick, over the client `ate.New` builds with `EnableTracing`, are its
+  children. `ate-env manifest reporter --metrics-port <port> --pod-monitoring` renders
+  `-metrics-listen-addr=:<port>`, a `metrics` container port and a `PodMonitoring` whose selector
+  equals the reporter pods' labels and whose one endpoint scrapes `metrics` at `/metrics` every 5 s;
+  `--pod-monitoring` without `--metrics-port`, `--metrics-port` on the health port, and
+  `--otlp-endpoint` or `--otlp-insecure` without `--enable-tracing` are refused.
+- Pass rule: the named tests pass in the Go CI job.

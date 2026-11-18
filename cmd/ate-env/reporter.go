@@ -69,6 +69,17 @@ type reporterConfig struct {
 	snapshotInterval    time.Duration
 	snapshotIntervalSet bool
 	gcpServiceAccount   string
+
+	// Telemetry, as for ate-env-api in manifestConfig: enableTracing renders
+	// -enable-tracing, otlpEndpoint and otlpInsecure set the exporter's
+	// environment, metricsPort renders -metrics-listen-addr=:<port> and
+	// exposes the port as "metrics" (zero leaves metrics off), and
+	// podMonitoring adds a PodMonitoring that scrapes it.
+	enableTracing bool
+	otlpEndpoint  string
+	otlpInsecure  bool
+	metricsPort   int32
+	podMonitoring bool
 }
 
 // reporterReservedDirs are the directories --out-dir must stay out of: an
@@ -78,7 +89,7 @@ type reporterConfig struct {
 var reporterReservedDirs = []string{"/ko-app", "/var/run/secrets", "/run/secrets"}
 
 func (c *reporterConfig) validate() error {
-	for _, v := range []*string{&c.namespace, &c.image, &c.bucket, &c.outDir, &c.project, &c.cluster, &c.location, &c.gcpServiceAccount} {
+	for _, v := range []*string{&c.namespace, &c.image, &c.bucket, &c.outDir, &c.project, &c.cluster, &c.location, &c.gcpServiceAccount, &c.otlpEndpoint} {
 		*v = strings.TrimSpace(*v)
 	}
 	switch {
@@ -137,6 +148,16 @@ func (c *reporterConfig) validate() error {
 	case snapshotInterval < interval:
 		return fmt.Errorf("--snapshot-interval %s is under the interval %s", snapshotInterval, interval)
 	}
+	switch {
+	case c.metricsPort < 0 || c.metricsPort > 65535:
+		return fmt.Errorf("--metrics-port %d is not a port number", c.metricsPort)
+	case c.metricsPort == reporterHealthPort:
+		return fmt.Errorf("--metrics-port %d is the health port; metrics are served on a listener of their own", c.metricsPort)
+	case c.podMonitoring && c.metricsPort == 0:
+		return errors.New("--pod-monitoring needs --metrics-port: there is no metrics port to scrape")
+	case (c.otlpEndpoint != "" || c.otlpInsecure) && !c.enableTracing:
+		return errors.New("--otlp-endpoint and --otlp-insecure configure the trace exporter and need --enable-tracing")
+	}
 	return nil
 }
 
@@ -159,6 +180,10 @@ On GKE the project, cluster and location come from the metadata server, and
 --gcp-service-account binds the ServiceAccount through Workload Identity to the
 Google service account that may write the bucket. --out-dir writes under a
 directory of an emptyDir volume instead, for a cluster without a bucket.
+
+--enable-tracing exports a span per tick to --otlp-endpoint. --metrics-port
+serves ate_env_reporter_poll_duration_seconds on a listener of its own, and
+--pod-monitoring has Managed Service for Prometheus scrape it every 5s.
 
 The reporter lists the actors and workers of every atespace, which takes the
 global viewer role. With --access-policy the command prints that binding
@@ -197,6 +222,11 @@ create it once with
 	cmd.Flags().DurationVar(&cfg.interval, "interval", 0, "time from one snapshot to the next, at least 1s (ate-env-reporter -interval, default 5s)")
 	cmd.Flags().DurationVar(&cfg.snapshotInterval, "snapshot-interval", 0, "how often a snapshot is also kept under v1/snapshots/, at least the interval (ate-env-reporter -snapshot-interval, default 1h)")
 	cmd.Flags().StringVar(&cfg.gcpServiceAccount, "gcp-service-account", "", "Google service account the ServiceAccount acts as through Workload Identity, set as its "+workloadIdentityAnnotation+" annotation")
+	cmd.Flags().BoolVar(&cfg.enableTracing, "enable-tracing", false, "run ate-env-reporter with -enable-tracing, exporting a span per tick over OTLP/gRPC")
+	cmd.Flags().StringVar(&cfg.otlpEndpoint, "otlp-endpoint", "", "OTLP/gRPC collector endpoint for ate-env-reporter's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://ate-env-collector.ate-env-collector:4317; needs --enable-tracing")
+	cmd.Flags().BoolVar(&cfg.otlpInsecure, "otlp-insecure", false, "set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext; needs --enable-tracing")
+	cmd.Flags().Int32Var(&cfg.metricsPort, "metrics-port", 0, "port ate-env-reporter serves Prometheus metrics on (-metrics-listen-addr), exposed on the container as \"metrics\" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check")
+	cmd.Flags().BoolVar(&cfg.podMonitoring, "pod-monitoring", false, "add a PodMonitoring (monitoring.googleapis.com/v1) that has Google Cloud Managed Service for Prometheus scrape the metrics port every "+podMonitoringInterval+"; needs --metrics-port and Managed Prometheus on the cluster. The pod keeps its prometheus.io annotations, so a cluster that also runs an annotation-based scraper scrapes the port twice")
 	cmd.Flags().BoolVar(&accessPolicy, "access-policy", false, "print the global access policy binding (viewer) the reporter needs, instead of the Kubernetes manifests")
 	return cmd
 }
@@ -276,6 +306,27 @@ func buildReporterManifests(cfg reporterConfig) []any {
 	if cfg.snapshotIntervalSet {
 		args = append(args, "-snapshot-interval="+cfg.snapshotInterval.String())
 	}
+	ports := []corev1.ContainerPort{{Name: "health", ContainerPort: reporterHealthPort}}
+	var podAnnotations map[string]string
+	if cfg.enableTracing {
+		args = append(args, "-enable-tracing")
+	}
+	if cfg.metricsPort != 0 {
+		args = append(args, fmt.Sprintf("-metrics-listen-addr=:%d", cfg.metricsPort))
+		ports = append(ports, corev1.ContainerPort{Name: metricsPortName, ContainerPort: cfg.metricsPort})
+		podAnnotations = map[string]string{
+			"prometheus.io/scrape": "true",
+			"prometheus.io/port":   fmt.Sprint(cfg.metricsPort),
+			"prometheus.io/path":   "/metrics",
+		}
+	}
+	var env []corev1.EnvVar
+	if cfg.otlpEndpoint != "" {
+		env = append(env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: cfg.otlpEndpoint})
+	}
+	if cfg.otlpInsecure {
+		env = append(env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_INSECURE", Value: "true"})
+	}
 
 	replicas := int32(1)
 	probe := func(path string) *corev1.Probe {
@@ -293,7 +344,7 @@ func buildReporterManifests(cfg reporterConfig) []any {
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: podAnnotations},
 				Spec: corev1.PodSpec{
 					// The ServiceAccount is the principal of the ClusterRole
 					// binding, of the control plane's viewer binding
@@ -303,7 +354,8 @@ func buildReporterManifests(cfg reporterConfig) []any {
 						Name:           reporterName,
 						Image:          cfg.image,
 						Args:           args,
-						Ports:          []corev1.ContainerPort{{Name: "health", ContainerPort: reporterHealthPort}},
+						Ports:          ports,
+						Env:            env,
 						VolumeMounts:   mounts,
 						LivenessProbe:  probe("/healthz"),
 						ReadinessProbe: probe("/readyz"),
@@ -314,7 +366,7 @@ func buildReporterManifests(cfg reporterConfig) []any {
 		},
 	}
 
-	return []any{
+	objs := []any{
 		// The label admits the namespace's pods to ateapi (apiAccessLabel).
 		&corev1.Namespace{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"},
@@ -322,4 +374,8 @@ func buildReporterManifests(cfg reporterConfig) []any {
 		},
 		sa, role, binding, deployment,
 	}
+	if cfg.podMonitoring {
+		objs = append(objs, buildPodMonitoring(reporterName, cfg.namespace))
+	}
+	return objs
 }

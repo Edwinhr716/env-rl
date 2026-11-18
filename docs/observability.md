@@ -21,6 +21,8 @@ imported, no exporter is created and no collector is registered.
 | Python client and fleet | `FleetConfig(observability=ObservabilityConfig(enable_tracing=True))`, or `FleetConfig(tracing=TracerConfig(enable_tracing=True))`, or `Client(..., tracer_config=TracerConfig(enable_tracing=True))`; needs the `tracing` extra | `ObservabilityConfig(enable_metrics=None)` (the default: on when the `metrics` extra is installed, else one INFO message; `True` warns when the extra is missing) and `ate_env_rl.observability.serve_metrics(port, addr=...)` |
 | ate-env-api | `--enable-tracing` | `--metrics-listen-addr`, for example `:9090` (default empty: metrics off) |
 | `ate-env manifest` | `--enable-tracing`, `--otlp-endpoint`, `--otlp-insecure` | `--metrics-port` (adds a `metrics` container and Service port and `prometheus.io` scrape annotations); with it, `--pod-monitoring` (a Managed Prometheus `PodMonitoring` that scrapes every 5 s) |
+| ate-env-reporter | `-enable-tracing` (a root span `ate-env-reporter.tick` per tick, with the `ateapi` calls under it) | `-metrics-listen-addr`, for example `:9090` (default empty: metrics off) |
+| `ate-env manifest reporter` | `--enable-tracing`, `--otlp-endpoint`, `--otlp-insecure` | `--metrics-port` (adds a `metrics` container port and `prometheus.io` scrape annotations); with it, `--pod-monitoring` (a `PodMonitoring` that scrapes every 5 s) |
 | ate-env-guest | `--enable-tracing` in the ActorTemplate's guest arguments | `--enable-metrics` (serves `/metrics` on the guest listener, without authentication; reachable only inside the environment and through the atenet router, see [metrics.md](metrics.md)) |
 | Go client ([`clients/go`](../clients/go/README.md)) | `ClientOptions.TracerProvider` (any `trace.TracerProvider`; `env.NewTracerProvider(ctx, name)` is the OTLP default) and `ClientOptions.TraceServiceName` (default `ate-env-go-client`) | `ClientOptions.MetricsRegisterer` (any `prometheus.Registerer`, such as `prometheus.DefaultRegisterer` or `prometheus.NewRegistry()`; nil registers nothing) |
 | swebench-loader | `swebench-loader run -enable-tracing` | none (the JSONL events are its record) |
@@ -41,7 +43,7 @@ Every exporter is configured by the standard OpenTelemetry variables:
 
 The `service.name` of each process is fixed: `ate-env-fleet` (or the
 `trace_service_name` you set), `ate-env-client` for a client traced on its own,
-`ate-env-api`, `ate-env-guest`, `ate-env-go-client` and `swebench-loader`. A
+`ate-env-api`, `ate-env-guest`, `ate-env-reporter`, `ate-env-go-client` and `swebench-loader`. A
 Python process that already installed an SDK `TracerProvider` keeps it; the
 client adopts it instead of creating an OTLP exporter.
 
@@ -127,7 +129,7 @@ spans carry its own `run`, `env` and `instance`.
 
 ## Metrics
 
-- ate-env-api and ate-env-guest families: [metrics.md](metrics.md), generated
+- ate-env-api, ate-env-guest and ate-env-reporter families: [metrics.md](metrics.md), generated
   from `internal/telemetry` by `go run ./hack/metrics-docs`. CI fails when it is
   stale.
 - Trainer families (`ate_env_fleet_phase_latency_seconds`,
