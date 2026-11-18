@@ -1,6 +1,6 @@
 # Acceptance criteria: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-18 against `7e03d2b9`. Each criterion has a command
+Status: accepted (#223); last checked 2026-11-18 against `a0c6024f`. Each criterion has a command
 and an expected result. Evidence goes into `evidence/` in this directory, one file per acceptance
 pass, with the commit of each component.
 
@@ -21,6 +21,7 @@ pass, with the commit of each component.
 | FS-13 | Plan drift check against main            | each  |
 | FS-14 | Reporter against the Kind Substrate      | 3     |
 | FS-15 | Reporter tick telemetry                  | 3, 4  |
+| FS-16 | Target identity on ate-env-api spans     | 9     |
 
 ## FS-1: Inventory freshness
 
@@ -192,3 +193,24 @@ Added by pull request 2c.
   `--pod-monitoring` without `--metrics-port`, `--metrics-port` on the health port, and
   `--otlp-endpoint` or `--otlp-insecure` without `--enable-tracing` are refused.
 - Pass rule: the named tests pass in the Go CI job.
+
+## FS-16: Target identity on ate-env-api spans
+
+Added by pull request 7.
+
+- Command:
+  `go test -race -run 'TestServerSpansCarry|TestSetSpanActorAttributesKeepsKnownValues' ./internal/apiservice`,
+  which runs `TestServerSpansCarryEnvironmentIdentity`, `TestServerSpansCarryGuestCallIdentity`,
+  `TestServerSpansCarryTemplateIdentity`, `TestServerSpansCarryNoToken` and
+  `TestSetSpanActorAttributesKeepsKnownValues`.
+- Expected: with tracing on, each `ate-env-api` server span carries the identity its call targets,
+  under the `ateattr` keys `ateapi` stamps on its actor RPCs. `ate.atespace` and `ate.actor.name`
+  (the environment id) go on the environment and the eight guest calls, also failed ones. Once
+  `CreateEnvironment` or `GetEnvironment` has the actor, `ate.actor.uid`, `ate.actor.version` (an
+  int64), `ate.template.name` and `ate.template.atespace` join them. `ListEnvironments` carries
+  `ate.atespace`. The template calls carry `ate.atespace`, `ate.template.name` and
+  `ate.template.atespace`, with the derived template once its name is known. `GetServerInfo` and a
+  `ListPlacementDomains` that names no template carry no `ate.*` attribute. A name Substrate would
+  refuse is not stamped. No span attribute, status or event carries the caller's bearer token.
+- Pass rule: the named tests pass in the Go CI job, and in a Cloud Trace query on `ate.actor.name`
+  an environment's `ate-env-api` and `ateapi` spans come up together.

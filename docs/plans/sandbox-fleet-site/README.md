@@ -4,10 +4,11 @@ Status: accepted plan (#223); pull requests 1, 2 and 2b (`internal/inventory`, t
 manifest) merged as #226, #348 and #349; pull requests 3 and 4, the telemetry manifests and the site
 with the Fleet and Cluster pages, merged as #415 and #416; pull request 5a, the Actor and Live pages
 and the metrics API, merged as #434; pull request 5b, the Runs page, merged as #437; pull request
-2c, the reporter's tracing and metrics, in review. Last checked 2026-11-18 against
-`ai-on-gke/sandboxenv-rl` at `7e03d2b9` and the Substrate `go.mod` requires, `v1.0.0`; the audit is
-in [research.md](./research.md), which first read `3b03b03` and `28520c0d` on 2026-10-30. The
-decisions taken so far are in [decisions.md](./decisions.md). Companions: [prd.md](./prd.md),
+2c, the reporter's tracing and metrics, merged as #442; pull request 7, identity attributes on
+`ate-env-api` server spans, in review. Last checked 2026-11-18 against `ai-on-gke/sandboxenv-rl` at
+`a0c6024f` and the Substrate `go.mod` requires, `v1.0.0`; the audit is in
+[research.md](./research.md), which first read `3b03b03` and `28520c0d` on 2026-10-30. The decisions
+taken so far are in [decisions.md](./decisions.md). Companions: [prd.md](./prd.md),
 [execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
 [acceptance-criteria.md](./acceptance-criteria.md) and, for the order of operations with `gcloud`,
 [quickstart.md](./quickstart.md).
@@ -157,8 +158,8 @@ section of [research.md](./research.md) and update the last-checked line above (
 5. Manifest: `ate-env manifest` still has `access-policy --global`, `--metrics-port`,
    `--pod-monitoring`, `--enable-tracing`, `--otlp-endpoint`, `--otlp-insecure`, `reporter` and
    `collector`, and `reporter` has the same five telemetry flags.
-6. Benchmark bundles: `cmd/benchmarking/bench/bundle.go` still names the folder form and the
-   required files the Runs page reads.
+6. Benchmark bundles: `cmd/benchmarking/bench/bundle.go` still names the required files, and
+   `internal/benchmarking/schema.CheckFolderName` the folder form, that the Runs page reads.
 7. Conventions: criterion ids stay unique across `docs/plans/` (`FS-` here).
 
 ## Open parameters

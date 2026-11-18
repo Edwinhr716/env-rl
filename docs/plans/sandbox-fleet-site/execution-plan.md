@@ -1,9 +1,9 @@
 # Execution plan: sandbox fleet site
 
-Status: accepted (#223); pull requests 1, 2, 2b, 3, 4, 5a and 5b merged (#226, #348, #349, #415,
-#416, #434, #437); pull request 2c, the reporter's tracing and metrics, is in review; 6 and 7 are
-not started. Last checked 2026-11-18 against `7e03d2b9`. Design: [README.md](./README.md).
-Contracts: [interfaces.md](./interfaces.md). Done when every criterion in
+Status: accepted (#223); pull requests 1, 2, 2b, 3, 4, 5a, 5b and 2c merged (#226, #348, #349, #415,
+#416, #434, #437, #442); pull request 7, identity attributes on `ate-env-api` server spans, is in
+review; 6 is not started. Last checked 2026-11-18 against `a0c6024f`. Design:
+[README.md](./README.md). Contracts: [interfaces.md](./interfaces.md). Done when every criterion in
 [acceptance-criteria.md](./acceptance-criteria.md) passes on two clusters in two projects and the
 pull requests below are merged.
 
@@ -50,7 +50,7 @@ Phases 2, 3 and 4 run in parallel after phase 1.
 | 5a  | Actor and Live pages, `/api/v1/live`, the PromQL proxy (`/api/v1/metrics/{name}`) with the allow-list of named queries                                                                                                                                                                  | medium |
 | 5b  | Runs page (the Cloud Trace link of a trainer run comes from the trace ids in its `spans.jsonl`; FS-11 lists how a run folder is produced with `RunReport.write`, `build_report.py` and one copy, so no trainer-side code is in scope)                                                   | medium |
 | 6   | `deploy/fleet-site/` Terraform and `docs/fleet-site.md`; a shell check that a two-bucket `BENCH_BUCKET` yields one `roles/storage.objectViewer` grant per bucket and one comma-separated `FLEET_BENCH_BUCKETS`                                                                          | medium |
-| 7   | identity attributes on `ate-env-api` server spans                                                                                                                                                                                                                                       | small  |
+| 7   | identity attributes on `ate-env-api` server spans (FS-16)                                                                                                                                                                                                                               | small  |
 
 Each pull request follows the repo rules in `AGENTS.md`: one change per pull request, no AI
 attribution trailers, Apache headers, tests in the same pull request.

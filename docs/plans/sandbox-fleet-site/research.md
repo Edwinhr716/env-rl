@@ -346,6 +346,28 @@ changes one `internal/apiservice` test. The seven steps:
    `schema.CheckFolderName`; the folder form is the same.
 7. `FS-` is used by this plan only. Pull request 2c adds FS-15.
 
+## Audit of main, 2026-11-18, for pull request 7
+
+Checked against `ai-on-gke/sandboxenv-rl` at `a0c6024f`, for pull request 7. Since `7e03d2b9`, the
+last audit: #442 (`ba056deb`) is pull request 2c; #441 changes `.github/CODEOWNERS` only. The seven
+steps:
+
+1. `env.proto` is unchanged: ten RPCs.
+2. `go.mod` and `go.sum` are unchanged, so Substrate is still `v1.0.0`. Its
+   `cmd/ateapi/internal/controlapi/span_identity.go` and `internal/ateattr` give the keys pull
+   request 7 copies.
+3. `internal/inventory` is unchanged and `go test ./internal/inventory/` passes; the example of
+   `interfaces.md` parses equal to `snapshot.golden.json`.
+4. `docs/metrics.md` gained the `ate-env-reporter` section (#442); the four `ate_env_api_*` families
+   the named queries use are unchanged. Substrate's registry is the same version.
+5. `ate-env manifest` keeps every flag and subcommand of step 5, and `reporter` has the five
+   telemetry flags (#442).
+6. `cmd/benchmarking/bench/bundle.go` and `internal/benchmarking/schema` are unchanged. Step 6 now
+   names `schema.CheckFolderName`, where #437 moved the folder form.
+7. `FS-` is used by this plan only. #442 added FS-15; pull request 7 adds FS-16.
+
+The edge "`ate-env-api` spans lack identity attributes" above is closed by pull request 7.
+
 ## Sources
 
 - Substrate: `docs/observability.md`, `internal/actorevent/actorevent.go`,

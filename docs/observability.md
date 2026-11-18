@@ -121,10 +121,23 @@ byte the same with tracing on or off.
 Span attributes carry ids and sizes, never a command line or file content.
 Substrate identities use Substrate's own `ateattr` keys (`ate.actor.name` for
 the environment id, `ate.atespace`, `ate.template.name`), so spans join
-Substrate's logs and traces without a mapping. Client-only fields use
-`ate_env.*` (`ate_env.rootfs_image`, `ate_env.command.executable`,
-`ate_env.first_command`, `ate_env.exit_code`, `ate_env.timed_out`,
-`ate_env.file.path`, `ate_env.file.size`). The loader's
+Substrate's logs and traces without a mapping. ate-env-api's server spans
+carry the same keys for the environment or template each call targets, as
+ateapi's spans of its actor RPCs do: `ate.atespace` and `ate.actor.name` on the
+environment and guest calls, with `ate.actor.uid`, `ate.actor.version`,
+`ate.template.name` and `ate.template.atespace` once `CreateEnvironment` or
+`GetEnvironment` has the actor; `ate.atespace` on `ListEnvironments`; and
+`ate.atespace`, `ate.template.name` and `ate.template.atespace` on the image
+and warm calls, naming the derived template once it is known, and on a
+`ListPlacementDomains` that names a template or an atespace. A name Substrate
+would refuse (over 63 characters, or not a lowercase DNS label) goes in no
+`ate.*` attribute. They carry no caller identity: callers share one token. The
+span status of a call that fails with `Unknown`, `DeadlineExceeded`,
+`Unimplemented`, `Internal`, `Unavailable` or `DataLoss` carries the gRPC
+message (otelgrpc), which can hold caller-supplied text such as an
+`x-env-id`. Client-only fields use `ate_env.*` (`ate_env.rootfs_image`,
+`ate_env.command.executable`, `ate_env.first_command`, `ate_env.exit_code`,
+`ate_env.timed_out`, `ate_env.file.path`, `ate_env.file.size`). The loader's
 spans carry its own `run`, `env` and `instance`.
 
 ## Metrics

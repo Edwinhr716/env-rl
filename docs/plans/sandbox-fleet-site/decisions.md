@@ -315,3 +315,31 @@ Append-only. Each entry: date, who, what, why.
   `--enable-tracing`, because without it they render environment variables nothing reads. Its flags
   are new, so the check costs no compatibility. `ate-env manifest` still accepts the combination;
   refusing it there too is a follow-up, a behavior change of its own.
+- 2026-11-18, orchestrator, pull request 7: `ate-env-api` stamps the target of each call on its
+  otelgrpc server span with the keys of Substrate's `internal/ateattr` that `ateapi` stamps
+  (`controlapi/span_identity.go`): `ate.atespace` and `ate.actor.name` before the actor is read, so
+  a failed call carries them; the full set of `ateattr.ActorAttributes` (adding `ate.actor.uid`,
+  `ate.actor.version`, `ate.template.name`, `ate.template.atespace`) once `CreateEnvironment` or
+  `GetEnvironment` has the actor, leaving out an empty value so a missing template reference does
+  not blank the one the request named. Guest calls are stamped where their `x-env-id` and
+  `x-env-atespace` metadata is read (`envFromContext`); template calls carry the base template and
+  then the derived one. The keys are copied, because `internal/ateattr` is internal to Substrate.
+  `ateapi` validates a request before it stamps it, and `ate-env-api` stamps before its call to
+  `ateapi`, so a name is stamped only when it is one Substrate accepts (a lowercase DNS label of at
+  most 63 characters, `shortName`). A caller's id of megabytes thus never reaches an `ate.*`
+  attribute, where it could push an OTLP batch over its size limit and drop other callers' spans.
+- 2026-11-18, orchestrator, pull request 7: no caller identity goes on a span. `ate-env-api` has no
+  principal to stamp: callers share one bearer token (`BearerAuth`, known gap 1 of the threat
+  model), and `ateapi` stamps no caller principal on its spans either. No token goes on a span, and
+  of the metadata only `x-env-id` and `x-env-atespace` do, as the environment's id and atespace. No
+  attribute carries a command or a file path. The span status is another matter: otelgrpc v0.72.0
+  puts the gRPC message of an `Unknown`, `DeadlineExceeded`, `Unimplemented`, `Internal`,
+  `Unavailable` or `DataLoss` error in it (`serverStatus`), and that message can carry
+  caller-supplied text, such as the `x-env-id` that the router's "no actor" answer echoes, or a file
+  path the guest could not read. A `StartProcess` with a 10,000-character `x-env-id` left a
+  1,171-character status message. When callers get identities of their own, whether a span carries
+  one is that change's decision. The threat model's Server telemetry section gains a "Data in server
+  spans" row. FS-16 covers the attributes.
+- 2026-11-18, orchestrator, pull request 7: drift check against `main` at `a0c6024f` (research.md,
+  "Audit of main, 2026-11-18, for pull request 7"). The seven steps hold. Step 6 now names
+  `internal/benchmarking/schema.CheckFolderName`, where #437 moved the folder form.

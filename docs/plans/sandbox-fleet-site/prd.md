@@ -1,6 +1,6 @@
 # PRD: sandbox fleet site
 
-Status: accepted (#223); last checked 2026-11-18 against `7e03d2b9`. Design:
+Status: accepted (#223); last checked 2026-11-18 against `a0c6024f`. Design:
 [README.md](./README.md). Evidence: [research.md](./research.md).
 
 ## Problem

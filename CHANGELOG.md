@@ -67,6 +67,16 @@ user needs to know across them.
   pre-flight's job (`swebench-loader preflight`), not the prewarm's.
 
 ### Added
+- `ate-env-api` with `--enable-tracing` stamps the environment or template
+  each call targets on its server span, under the `ateattr` keys `ateapi`
+  stamps on its actor RPCs: `ate.atespace` and `ate.actor.name` (the
+  environment id), plus `ate.actor.uid`, `ate.actor.version`,
+  `ate.template.name` and `ate.template.atespace` when the call has them. A
+  name Substrate would refuse (over 63 characters, or not a lowercase DNS
+  label) goes in no `ate.*` attribute. One trace query on `ate.actor.name`
+  now finds an environment's `ate-env-api` spans and `ateapi`'s spans of its
+  actor. No caller identity and no token go on a span; of the metadata, only
+  `x-env-id` and `x-env-atespace` do, as the environment's id and atespace.
 - `ate-env-reporter` takes `-enable-tracing`, which exports a root span
   `ate-env-reporter.tick` per tick over OTLP/gRPC with the control-plane
   calls under it, and `-metrics-listen-addr` (default empty: off), which

@@ -219,6 +219,8 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 		start = requestedAt(ctx, time.Now())
 	}
 	templateName, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
+	setSpanEnvAttributes(ctx, atespace, req.GetId())
+	setSpanTemplateAttributes(ctx, atespace, templateName)
 	if s.Metrics != nil {
 		defer func() {
 			if retErr != nil {
@@ -248,6 +250,7 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
+	setSpanActorAttributes(ctx, actor)
 	if s.ReactiveWake && s.awakeEnvs != nil {
 		s.awakeEnvs.Remove(atespace + "/" + req.GetId())
 	}
@@ -289,10 +292,12 @@ func templateDefaults(tmpl *ateenvv1alpha.Template, atespace string) (name, spac
 // state of its golden snapshot, without creating anything.
 func (s *Server) GetImageStatus(ctx context.Context, req *ateenvv1alpha.GetImageStatusRequest) (*ateenvv1alpha.ImageStatus, error) {
 	base, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
+	setSpanTemplateAttributes(ctx, atespace, base)
 	name, err := ImageTemplateName(base, req.GetRootfsImage())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	setSpanTemplateAttributes(ctx, atespace, name)
 	tmpl, err := s.client.GetActorTemplate(ctx, atespace, name)
 	if err != nil && !errors.Is(err, ate.ErrNotFound) {
 		return nil, toGRPCError(err)
@@ -312,6 +317,7 @@ func (s *Server) GetImageStatus(ctx context.Context, req *ateenvv1alpha.GetImage
 // recreated under the same rules, but no actor is created.
 func (s *Server) EnsureImageTemplate(ctx context.Context, req *ateenvv1alpha.EnsureImageTemplateRequest) (*ateenvv1alpha.ImageStatus, error) {
 	base, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
+	setSpanTemplateAttributes(ctx, atespace, base)
 	name, tmpl, release, err := s.ensureImageTemplate(ctx, atespace, base, req.GetRootfsImage())
 	if err != nil {
 		return nil, err
@@ -362,6 +368,11 @@ func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image 
 	if err != nil {
 		return "", nil, nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	// The derived template is the RPC's template from here on, also when a
+	// step below fails on it (FS-16): CreateEnvironment, EnsureImageTemplate
+	// and WarmImage stamp the base before the call, and GetImageStatus stamps
+	// the derived name at the same point.
+	setSpanTemplateAttributes(ctx, atespace, name)
 	lock := s.imageTemplates.get(atespace, name)
 	if err := lock.rlock(ctx); err != nil {
 		return "", nil, nil, err
@@ -473,10 +484,13 @@ func (s *Server) GetEnvironment(ctx context.Context, req *ateenvv1alpha.GetEnvir
 		atespace = DefaultAtespace
 	}
 
+	setSpanEnvAttributes(ctx, atespace, req.GetId())
+
 	actor, err := s.client.Get(ctx, atespace, req.GetId())
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
+	setSpanActorAttributes(ctx, actor)
 
 	return &ateenvv1alpha.GetEnvironmentResponse{
 		Environment: ActorToEnvironment(actor),
@@ -525,6 +539,7 @@ func (s *Server) ListEnvironments(ctx context.Context, req *ateenvv1alpha.ListEn
 		atespace = DefaultAtespace
 	}
 
+	setSpanAtespaceAttribute(ctx, atespace)
 	actors, next, err := s.client.ListPage(ctx, atespace, size, req.GetPageToken())
 	if err != nil {
 		return nil, toGRPCError(err)
@@ -549,6 +564,8 @@ func (s *Server) SuspendEnvironment(ctx context.Context, req *ateenvv1alpha.Susp
 	if atespace == "" {
 		atespace = DefaultAtespace
 	}
+
+	setSpanEnvAttributes(ctx, atespace, req.GetId())
 
 	var err error
 	switch req.GetMode() {
@@ -578,6 +595,8 @@ func (s *Server) DeleteEnvironment(ctx context.Context, req *ateenvv1alpha.Delet
 	if atespace == "" {
 		atespace = DefaultAtespace
 	}
+
+	setSpanEnvAttributes(ctx, atespace, req.GetId())
 
 	// The object of the environment, as the store's informer has it before
 	// the delete. An environment with no label and no deadline has none, and
@@ -815,6 +834,14 @@ func (s *Server) StreamProcessOutput(req *ateenvv1alpha.StreamProcessOutputReque
 
 // WriteProcessInput forwards stdin chunks to a process inside the environment.
 func (s *Server) WriteProcessInput(stream grpc.ClientStreamingServer[ateenvv1alpha.WriteProcessInputRequest, ateenvv1alpha.WriteProcessInputResponse]) error {
+	// The environment's identity goes on the server span first, so a stream
+	// whose first message fails still carries it (FS-16), as WriteFile does.
+	ctx := stream.Context()
+	envID, atespace, err := envFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	targetActor := atespace + "/" + envID
 	// Receive the first message before waking the guest, so a request the API
 	// rejects (one with unknown fields) does not resume a suspended environment.
 	// A client that opens a stream and sends nothing therefore holds no guest
@@ -823,12 +850,6 @@ func (s *Server) WriteProcessInput(stream grpc.ClientStreamingServer[ateenvv1alp
 	if err != nil {
 		return err
 	}
-	ctx := stream.Context()
-	envID, atespace, err := envFromContext(ctx)
-	if err != nil {
-		return err
-	}
-	targetActor := atespace + "/" + envID
 	conn, outCtx, closeFn, _, err := s.guestSession(ctx, atespace, envID, true)
 	if err != nil {
 		return err
@@ -980,6 +1001,9 @@ func (s *Server) WriteFile(stream grpc.ClientStreamingServer[ateenvv1alpha.Write
 // --- HELPERS ---
 // ============================================================================
 
+// envFromContext returns the environment id and atespace of a guest call,
+// from its x-env-id and x-env-atespace metadata, and stamps them on the
+// call's server span.
 func envFromContext(ctx context.Context) (string, string, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
@@ -994,6 +1018,7 @@ func envFromContext(ctx context.Context) (string, string, error) {
 	if len(atespaces) > 0 && atespaces[0] != "" {
 		atespace = atespaces[0]
 	}
+	setSpanEnvAttributes(ctx, atespace, ids[0])
 	return ids[0], atespace, nil
 }
 

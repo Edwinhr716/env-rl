@@ -128,6 +128,7 @@ func (s *Server) ListPlacementDomains(ctx context.Context, req *ateenvv1alpha.Li
 	var selector map[string]string
 	if filter {
 		name, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
+		setSpanTemplateAttributes(ctx, atespace, name)
 		tmpl, err := s.client.GetActorTemplate(ctx, atespace, name)
 		if err != nil {
 			return nil, toGRPCError(err)
@@ -330,12 +331,13 @@ func parseWarmOptions(req *ateenvv1alpha.WarmImageRequest, maxPerNode int) (warm
 // still deleted).
 func (s *Server) WarmImage(req *ateenvv1alpha.WarmImageRequest, stream grpc.ServerStreamingServer[ateenvv1alpha.WarmImageEvent]) error {
 	ctx := stream.Context()
+	baseName, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
+	setSpanTemplateAttributes(ctx, atespace, baseName)
 	maxPerNode := s.warmMaxProbesPerNode()
 	opts, err := parseWarmOptions(req, maxPerNode)
 	if err != nil {
 		return err
 	}
-	baseName, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
 	templateName, tmpl, release, err := s.ensureImageTemplate(ctx, atespace, baseName, req.GetRootfsImage())
 	if err != nil {
 		return err
