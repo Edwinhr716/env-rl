@@ -1,0 +1,283 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Release workflow for Agent Substrate Environments (sandboxenv-rl).
+#
+# Deliverables:
+#  1. Container images: ate-env-api and ate-env-guest pushed to GitHub Container Registry
+#     (GHCR), pinned by digest and signed with Cosign keyless signatures.
+#  2. Go CLI: ate-env static binaries cross-compiled for Linux and macOS (amd64 / arm64), built
+#     into dist/ with baked-in image defaults, single SHA256SUMS_${TAG}.txt, and Cosign signatures,
+#     attached to the GitHub Release.
+#  3. Python client SDK: ate-env-rl (clients/python) published to PyPI via OIDC
+#     Trusted Publishing when the release is published and vars.PYPI_PUBLISH_ENABLED == 'true'
+#     (optional; cleanly skipped when PyPI credentials/Trusted Publishing are not yet configured).
+#  4. gRPC protos: Wire-compatible protocol buffers contracts tagged at vX.Y.Z.
+#
+# Triggers:
+#  - push tags (v*): Builds images, signs them, builds CLI, creates/updates draft GitHub Release.
+#  - release (published): Builds ate-env-rl and publishes to PyPI when vars.PYPI_PUBLISH_ENABLED == 'true'.
+#  - workflow_dispatch: Manual dispatch from a specific tag (republishes images/CLI by default, or
+#    backfills PyPI for an already-published release when publish_pypi=true and
+#    vars.PYPI_PUBLISH_ENABLED == 'true').
+#
+# Pull request validation of CLI cross-compilation and the Python client distribution
+# lives in ci.yaml.
+#
+# Security invariants (zizmor):
+#  - Actions pinned by commit SHA with trailing version comment.
+#  - Workflow expressions pass into shell only through env vars.
+#  - Release builds run with persist-credentials: false and clean caches.
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish images and assets for (e.g. v0.1.0)"
+        required: true
+        type: string
+      publish_pypi:
+        description: "Publish Python client to PyPI only (requires an already-published GitHub Release for the tag)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+  KO_DEFAULTPLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  publish:
+    name: Publish images, CLI and draft release assets
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.publish_pypi)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write # release assets and notes
+      packages: write # ghcr.io
+      id-token: write # cosign keyless signing
+    steps:
+      # A manual run must start from the tag ("Use workflow from: <tag>"). The
+      # signature identity names the ref the workflow runs from, and the verify
+      # command in docs/release.md accepts only refs/tags/.
+      - name: Resolve the tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|a|beta|b|rc|c|dev)\.?[0-9]+)?$ ]]; then
+            echo "tag '$tag' is not a valid PEP 440-compatible semver tag (expected vX.Y.Z or vX.Y.Z-{alpha,beta,rc,dev}N)" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF}" != "refs/tags/${tag}" ]]; then
+            echo "run this workflow from the tag ${tag} (Use workflow from: ${tag}), not from ${GITHUB_REF}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # Do not remove this step as dead code. Since #179 no setup action logs in
+      # to GHCR: ko (in nix develop) pushes the images and cosign sign pushes
+      # their signatures with the credentials this step writes to
+      # ~/.docker/config.json.
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "${GH_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build and push the images
+        id: images
+        shell: nix develop -c bash -eo pipefail {0}
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          api=$(./hack/release/ko-publish.sh "${TAG}" "${IMAGE_PREFIX}/ate-env-api" ./cmd/ate-env-api)
+          guest=$(./hack/release/ko-publish.sh "${TAG}" "${IMAGE_PREFIX}/ate-env-guest" ./cmd/ate-env-guest)
+          echo "api=${api}" >> "$GITHUB_OUTPUT"
+          echo "guest=${guest}" >> "$GITHUB_OUTPUT"
+          echo "ate-env-api:   ${api}"
+          echo "ate-env-guest: ${guest}"
+
+      - name: Sign the images (keyless, bound to this workflow's identity)
+        env:
+          API_IMAGE: ${{ steps.images.outputs.api }}
+          GUEST_IMAGE: ${{ steps.images.outputs.guest }}
+        run: cosign sign --yes "$API_IMAGE" "$GUEST_IMAGE"
+
+      - name: Build the CLI with the image digests as defaults
+        shell: nix develop -c bash -eo pipefail {0}
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          API_IMAGE: ${{ steps.images.outputs.api }}
+          GUEST_IMAGE: ${{ steps.images.outputs.guest }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ldflags="-s -w -X main.version=${TAG} -X main.defaultAPIImage=${API_IMAGE} -X main.defaultGuestImage=${GUEST_IMAGE}"
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$ldflags" \
+                -o "dist/ate-env_${TAG}_${os}_${arch}" ./cmd/ate-env
+            done
+          done
+          {
+            echo "ate-env-api=${API_IMAGE}"
+            echo "ate-env-guest=${GUEST_IMAGE}"
+          } > "dist/images_${TAG}.txt"
+          (cd dist && sha256sum ate-env_* images_* > "SHA256SUMS_${TAG}.txt")
+          ls -l dist
+
+      - name: Sign CLI binaries and checksums with Cosign
+        run: |
+          set -euo pipefail
+          for f in dist/ate-env_* dist/SHA256SUMS_* dist/images_*; do
+            if [[ -f "$f" && "$f" != *.sigstore.json ]]; then
+              cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+            fi
+          done
+
+      - name: Attach assets to draft release and update image table
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          API_IMAGE: ${{ steps.images.outputs.api }}
+          GUEST_IMAGE: ${{ steps.images.outputs.guest }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Check if release exists; if not, create draft release
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --draft --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          # The API can hand the body back with CRLF line endings; strip them or the
+          # block below is appended twice on republish instead of replaced.
+          existing=$(gh release view "$TAG" --json body --jq .body | tr -d '\r')
+          # Replace a previous images block (republish) rather than append twice.
+          existing=$(printf '%s\n' "$existing" | awk '/^## Images$/{skip=1} skip&&/^## /&&!/^## Images$/{skip=0} !skip')
+          sub_ver=$(awk '$1 == "go.ate.dev/substrate" {print $2; exit}' go.mod)
+          {
+            printf '%s\n\n' "$existing"
+            echo "## Images"
+            echo
+            echo "Pinned by digest and signed with Cosign (keyless, GitHub Actions OIDC):"
+            echo
+            echo "- \`${API_IMAGE}\`"
+            echo "- \`${GUEST_IMAGE}\`"
+            echo
+            echo "The \`ate-env\` binaries attached to this release default \`manifest --api-image\` and \`manifest template --guest-image\` to these digests."
+            if [[ -n "${sub_ver}" ]]; then
+              echo "Built against \`go.ate.dev/substrate ${sub_ver}\`; deploy \`ate-system\` and \`--worker-image\` (\`ateworker-gvisor\`) from the matching Substrate revision."
+            fi
+            echo
+            echo '```bash'
+            echo "cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${REPO}/\.github/workflows/release\.yaml@refs/tags/' ${GUEST_IMAGE}"
+            echo '```'
+          } > notes.md
+          gh release edit "$TAG" --notes-file notes.md
+
+  publish-pypi:
+    name: Publish Python client to PyPI
+    if: >-
+      vars.PYPI_PUBLISH_ENABLED == 'true' && (
+        (github.event_name == 'release' && github.event.action == 'published') ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish_pypi)
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # PyPA Trusted Publishing
+    environment: pypi
+    steps:
+      - name: Resolve the tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$RELEASE_TAG}"
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|a|beta|b|rc|c|dev)\.?[0-9]+)?$ ]]; then
+            echo "tag '${tag}' is not a valid PEP 440-compatible semver tag (expected vX.Y.Z or vX.Y.Z-{alpha,beta,rc,dev}N)" >&2
+            exit 1
+          fi
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${GITHUB_REF}" != "refs/tags/${tag}" ]]; then
+              echo "run this workflow from the tag ${tag} (Use workflow from: ${tag}), not from ${GITHUB_REF}" >&2
+              exit 1
+            fi
+            is_draft=$(gh release view "${tag}" --repo "${REPO}" --json isDraft --jq .isDraft)
+            if [[ "${is_draft}" != "false" ]]; then
+              echo "release '${tag}' is still a draft (or missing); publish the GitHub Release before backfilling PyPI" >&2
+              exit 1
+            fi
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build client distribution
+        shell: nix develop -c bash -eo pipefail {0}
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: ./hack/release/build-dists.sh pypi-dist "${RELEASE_TAG}"
+
+      - name: Publish client distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: pypi-dist/
+          repository-url: ${{ vars.PYPI_REPOSITORY_URL || 'https://upload.pypi.org/legacy/' }}
+          verify-metadata: true
+          skip-existing: true

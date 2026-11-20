@@ -1,0 +1,348 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The lazy ``ate_env_client_*`` histograms in ate_env_rl.telemetry.metrics."""
+
+from __future__ import annotations
+
+import logging
+import subprocess
+import sys
+import textwrap
+
+import pytest
+
+from ate_env_rl.telemetry import metrics
+
+FAMILIES = {
+    "acquire": "ate_env_client_acquire_seconds",
+    "exec": "ate_env_client_exec_seconds",
+    "suspend": "ate_env_client_suspend_seconds",
+    "warm_claim": "ate_env_client_warm_claim_seconds",
+    "release": "ate_env_client_release_seconds",
+}
+BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
+
+
+def test_client_families_match_the_contract():
+    assert {op: name for op, (name, _doc) in metrics.CLIENT_FAMILIES.items()} == FAMILIES
+    assert metrics.SEC_BUCKETS == BUCKETS
+
+
+def test_disabled_client_metrics_are_a_noop(monkeypatch):
+    monkeypatch.setattr(metrics, "_ENABLED", False)
+    monkeypatch.setattr(metrics, "_HISTOGRAMS", {})
+    metrics.observe("exec", 1.0)
+    with metrics.timed("acquire"):
+        pass
+    assert metrics._HISTOGRAMS == {}
+
+
+def test_missing_extra_logs_one_warning(monkeypatch, caplog):
+    monkeypatch.setattr(metrics, "_PROM", False)
+    monkeypatch.setattr(metrics, "_MISSING_LOGGED", False)
+    monkeypatch.setattr(metrics, "_ENABLED", False)
+    caplog.set_level(logging.WARNING, logger="ate_env_rl.telemetry.metrics")
+    assert metrics.enable_client_metrics() is False
+    assert metrics.enable_client_metrics() is False
+    assert len(caplog.records) == 1
+    assert "ate-env-rl[metrics]" in caplog.records[0].getMessage()
+    metrics.observe("exec", 1.0)  # still a no-op
+
+
+def test_histogram_first_call_imports_prometheus_without_deadlock():
+    # In a fresh process nothing has imported prometheus_client yet, so the
+    # first _histogram or _subphase_histogram call runs _load_prom, which
+    # takes _LOCK. It must not do so while holding _LOCK (a plain Lock).
+    pytest.importorskip("prometheus_client")
+    code = textwrap.dedent(
+        """
+        from ate_env_rl.telemetry import metrics
+
+        assert metrics._PROM is None
+        metrics._histogram("exec")
+        metrics._subphase_histogram("ready_to_first_command")
+        print("ok")
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "ok"
+
+
+def test_histograms_register_on_first_use_only():
+    pytest.importorskip("prometheus_client")
+    code = textwrap.dedent(
+        """
+        import prometheus_client
+        from ate_env_rl.telemetry import metrics
+
+        def names():
+            return {n for n in prometheus_client.REGISTRY._names_to_collectors
+                    if n.startswith("ate_env_client_")}
+
+        assert metrics.enable_client_metrics()
+        assert names() == set(), names()
+        metrics.observe("exec", 0.2)
+        assert {n.removesuffix("_bucket").removesuffix("_count").removesuffix("_sum")
+                .removesuffix("_created") for n in names()} == {
+            "ate_env_client_exec_seconds",
+            "ate_env_client_exec_max_seconds",
+            "ate_env_client_exec_min_seconds",
+        }
+        with metrics.timed("acquire"):
+            pass
+        try:
+            with metrics.timed("acquire"):
+                raise ValueError("boom")
+        except ValueError:
+            pass
+        get = prometheus_client.REGISTRY.get_sample_value
+        assert get("ate_env_client_acquire_seconds_count", {"status": "ok"}) == 1
+        assert get("ate_env_client_acquire_seconds_count", {"status": "error"}) == 1
+        assert get("ate_env_client_exec_seconds_bucket", {"status": "ok", "le": "0.25"}) == 1
+        hist = prometheus_client.REGISTRY._names_to_collectors["ate_env_client_exec_seconds"]
+        assert tuple(hist._labelnames) == ("status",)
+        assert tuple(hist._upper_bounds[:-1]) == metrics.SEC_BUCKETS
+        # Exact extremes ride alongside the histogram as two gauges per family.
+        metrics.observe("exec", 0.05)
+        assert get("ate_env_client_exec_max_seconds", {"status": "ok"}) == 0.2
+        assert get("ate_env_client_exec_min_seconds", {"status": "ok"}) == 0.05
+        metrics.observe_subphase("ttfi", 1.5, source="warm_pool")
+        assert get("ate_env_client_ttfi_max_seconds", {"status": "ok", "source": "warm_pool"}) == 1.5
+        print("ok")
+        """
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "ok"
+
+
+def test_metric_helper_is_idempotent():
+    prom = pytest.importorskip("prometheus_client")
+    a = metrics._metric(prom.Histogram, "ate_env_test_idempotent_seconds", "test", ["status"])
+    b = metrics._metric(prom.Histogram, "ate_env_test_idempotent_seconds", "test", ["status"])
+    assert a is b
+    c = metrics._metric(prom.Counter, "ate_env_test_idempotent_total", "test", ["status"])
+    d = metrics._metric(prom.Counter, "ate_env_test_idempotent_total", "test", ["status"])
+    assert c is d
+
+
+async def test_substrate_driver_records_client_timings(fake_stack):
+    prom = pytest.importorskip("prometheus_client")
+    from ate_env_rl.backend.substrate import SubstrateBackendDriver
+    from ate_env_rl.config import ObservabilityConfig
+    from ate_env_rl.observability import Observer
+
+    client, _fakes = fake_stack
+    Observer(ObservabilityConfig(enable_metrics=True))  # enables client metrics
+    get = prom.REGISTRY.get_sample_value
+
+    def count(op, status="ok"):
+        return get(f"ate_env_client_{op}_seconds_count", {"status": status}) or 0.0
+
+    before = {op: count(op) for op in FAMILIES}
+    driver = SubstrateBackendDriver(client=client)
+    await driver.warm_pool_async("tmpl", replicas=1)  # create + suspend
+    inst = await driver.acquire_async("tmpl", run_id="r")  # claims the warm actor
+    await driver.release_async(inst.instance_id)
+    assert count("suspend") == before["suspend"] + 1
+    assert count("acquire") == before["acquire"] + 1
+    assert count("warm_claim") == before["warm_claim"] + 1
+    assert count("release") == before["release"] + 1
+
+
+def test_metric_cache_does_not_outlive_a_custom_registry():
+    """A new registry gets its own collector, even when it reuses a dead one's id."""
+    import gc
+
+    prom = pytest.importorskip("prometheus_client")
+    seen_ids = set()
+    for _ in range(50):
+        reg = prom.CollectorRegistry()
+        seen_ids.add(id(reg))
+        metrics._metric(prom.Counter, "ate_env_test_registry_reuse", "test",
+                        ["status"], registry=reg).labels(status="ok").inc()
+        assert reg.get_sample_value("ate_env_test_registry_reuse_total",
+                                    {"status": "ok"}) == 1
+        del reg
+        gc.collect()
+    # CPython reuses the freed id almost every time, so the loop hit the reuse case.
+    assert len(seen_ids) < 50
+
+
+def test_subphase_families_and_handle_recording(monkeypatch):
+    from ate_env_rl import FleetConfig, SandboxFleet, Task
+
+    for phase in (
+        "slot_wait",
+        "wire_claim",
+        "ready_to_first_command",
+        "ttfi",
+        "grade",
+        "read_file",
+        "write_file",
+    ):
+        assert phase in metrics.SUBPHASE_FAMILIES
+
+    metrics.reset_recorded_metrics()
+    monkeypatch.setattr(metrics, "is_measure_mode", lambda: True)
+
+    handle = SandboxFleet(FleetConfig(backend="mock")).acquire(Task(id="t1", image="img"))
+    handle.exec("echo hi", check=False)
+    handle.exec("bash /testbed/run_tests.sh", check=False)  # default marker -> grade
+    handle.exec("pytest -q", check=False, phase="grade")  # explicit signal -> grade
+    handle.exec("bash /testbed/run_tests.sh", check=False, phase="")  # opt out
+    handle.write_file("/tmp/a.txt", "hello")
+    assert handle.read_file_bytes("/tmp/a.txt") == b"hello"
+    handle.release()
+
+    sub = metrics.get_recorded_summary()["subphases"]
+    assert sub["ttfi:mock"]["count"] == 1
+    assert sub["ready_to_first_command:mock"]["count"] == 1
+    assert sub["grade:mock"]["count"] == 2
+    assert sub["write_file:mock"]["count"] == 1
+    assert sub["read_file:mock"]["count"] == 1
+
+
+def test_handle_without_acquire_start_records_no_ttfi(monkeypatch):
+    """A handle built outside a fleet knows no ask time: no ttfi sample, rather
+    than one that repeats ready_to_first_command under the ttfi family."""
+    from ate_env_rl import FleetConfig, SandboxFleet, Task
+    from ate_env_rl.handle import SandboxHandle
+
+    metrics.reset_recorded_metrics()
+    monkeypatch.setattr(metrics, "is_measure_mode", lambda: True)
+    fleet = SandboxFleet(FleetConfig(backend="mock"))
+    inner = fleet.acquire(Task(id="t2", image="img"))
+    outside = SandboxHandle(
+        sandbox_id=inner.sandbox_id, endpoint=inner.endpoint, task=inner.task, run_id=inner.run_id,
+        backend=inner.backend, runtime=inner.runtime, claim_source="mock",
+    )
+    outside.exec("true", check=False)
+    sub = metrics.get_recorded_summary()["subphases"]
+    assert "ttfi:mock" not in sub
+    assert sub["ready_to_first_command:mock"]["count"] == 1
+    inner.release()
+
+
+def test_timed_out_exec_records_error_status_regardless_of_check(monkeypatch):
+    from ate_env_rl import FleetConfig, SandboxFleet, Task
+    from ate_env_rl.types import ExecResult
+
+    metrics.reset_recorded_metrics()
+    monkeypatch.setattr(metrics, "is_measure_mode", lambda: True)
+    handle = SandboxFleet(FleetConfig(backend="mock")).acquire(Task(id="t3", image="img"))
+    monkeypatch.setattr(
+        handle.runtime, "exec",
+        lambda *a, **k: ExecResult(exit_code=None, stdout="", stderr="", timed_out=True),
+    )
+    handle.exec("sleep 999", check=False, phase="grade")
+    sub = metrics.get_recorded_summary()["subphases"]
+    assert sub["grade:mock"]["error"] == 1 and sub["grade:mock"]["ok"] == 0
+    # The in-memory Prometheus rendering keeps the error count too.
+    monkeypatch.setattr(metrics, "_ENABLED", False)
+    text = metrics.render_prometheus()
+    assert 'ate_env_client_grade_seconds_count{source="mock",status="error"} 1' in text
+    assert 'ate_env_client_grade_seconds_count{source="mock",status="ok"} 0' in text
+
+
+def test_recorded_summary_and_render_keep_exact_extremes(monkeypatch):
+    """Both the in-memory summary and its Prometheus rendering carry the exact
+    min and max alongside the histogram counters."""
+    metrics.reset_recorded_metrics()
+    monkeypatch.setattr(metrics, "is_measure_mode", lambda: True)
+    metrics.observe("release", 0.3)
+    metrics.observe("release", 0.02)
+    metrics.observe_subphase("ttfi", 2.0, source="warm_pool")
+    metrics.observe_subphase("ttfi", 0.5, source="warm_pool")
+
+    snap = metrics.get_recorded_summary()
+    assert snap["ops"]["release"]["max_s"] == 0.3
+    assert snap["ops"]["release"]["min_s"] == 0.02
+    assert snap["subphases"]["ttfi:warm_pool"]["min_s"] == 0.5
+
+    # Force the in-memory rendering even when prometheus_client is installed.
+    monkeypatch.setattr(metrics, "_ENABLED", False)
+    text = metrics.render_prometheus()
+    assert "ate_env_client_release_max_seconds 0.300000" in text
+    assert "ate_env_client_release_min_seconds 0.020000" in text
+    assert 'ate_env_client_ttfi_max_seconds{source="warm_pool"} 2.000000' in text
+    assert 'ate_env_client_ttfi_min_seconds{source="warm_pool"} 0.500000' in text
+    assert text.count("# TYPE ate_env_client_ttfi_seconds histogram") == 1
+
+
+def test_inmem_rendering_subphase_fallback(monkeypatch):
+    # The in-memory rendering (no prometheus_client registry in use) skips an
+    # op named like a sub-phase family only when that family has samples.
+    from ate_env_rl.telemetry import metrics
+
+    monkeypatch.setattr(metrics, "_ENABLED", False)
+    metrics.reset_recorded_metrics()
+    metrics._record_inmem_op("ready_to_first_command", 1.5, "ok")
+    text = metrics.render_prometheus()
+    assert "ate_env_client_ready_to_first_command_seconds_count" in text
+
+    metrics.reset_recorded_metrics()
+    metrics._record_inmem_op("ready_to_first_command", 1.5, "ok")
+    metrics._record_inmem_subphase("ready_to_first_command", 2.0, "ok", "direct")
+    text2 = metrics.render_prometheus()
+    family = "ate_env_client_ready_to_first_command_seconds"
+    assert text2.count(f"# TYPE {family} histogram") == 1
+    counts = [line for line in text2.splitlines() if line.startswith(f"{family}_count")]
+    assert counts and all('source="direct"' in line for line in counts)
+    metrics.reset_recorded_metrics()
+
+
+def test_extreme_gauges_track_each_label_set_independently():
+    pytest.importorskip("prometheus_client")
+    code = textwrap.dedent(
+        """
+        import prometheus_client
+        from ate_env_rl.telemetry import metrics
+
+        assert metrics.enable_client_metrics()
+        get = prometheus_client.REGISTRY.get_sample_value
+        warm = {"status": "ok", "source": "warm_pool"}
+        cold = {"status": "ok", "source": "cold_create"}
+
+        # First observation sets both max and min gauges.
+        metrics.observe_subphase("ttfi", 1.0, source="warm_pool")
+        assert get("ate_env_client_ttfi_max_seconds", warm) == 1.0
+        assert get("ate_env_client_ttfi_min_seconds", warm) == 1.0
+
+        # A larger observation raises max and leaves min at 1.0.
+        metrics.observe_subphase("ttfi", 2.5, source="warm_pool")
+        assert get("ate_env_client_ttfi_max_seconds", warm) == 2.5
+        assert get("ate_env_client_ttfi_min_seconds", warm) == 1.0
+
+        # A second label set starts its own extremes even inside warm_pool's [1.0, 2.5].
+        metrics.observe_subphase("ttfi", 1.5, source="cold_create")
+        assert get("ate_env_client_ttfi_max_seconds", cold) == 1.5
+        assert get("ate_env_client_ttfi_min_seconds", cold) == 1.5
+        assert get("ate_env_client_ttfi_max_seconds", warm) == 2.5
+        assert get("ate_env_client_ttfi_min_seconds", warm) == 1.0
+
+        metrics.observe_subphase("ttfi", 0.4, source="cold_create")
+        assert get("ate_env_client_ttfi_max_seconds", cold) == 1.5
+        assert get("ate_env_client_ttfi_min_seconds", cold) == 0.4
+        assert get("ate_env_client_ttfi_min_seconds", warm) == 1.0
+        print("ok")
+        """
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "ok"

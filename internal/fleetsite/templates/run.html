@@ -1,0 +1,60 @@
+{{/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/}}
+{{define "content"}}
+{{$r := .Run}}
+<p class="crumbs"><a href="/runs">Runs</a> / {{$r.Kind}}</p>
+<h1 class="mono">{{$r.ID}}{{if $r.Traced}} <span class="badge stale">traced: latencies include trace overhead</span>{{end}}</h1>
+<p class="muted">{{with $r.Bucket}}gs://{{.}}/ · {{end}}<a href="{{runAPIURL $r.Path}}">JSON</a></p>
+{{range $r.Notes}}<p class="error">{{.}}</p>{{end}}
+
+{{if eq $r.Kind "trainer"}}
+  {{if $r.HasHTML}}<p><a href="{{runFileURL $r.Path "report.html"}}">HTML report</a> <span class="muted">(a download; open it from your disk)</span></p>{{end}}
+  {{range $i, $rep := $r.Reports}}
+  <h2>Run report {{$rep.File}}</h2>
+  <p>strategy {{$rep.Strategy}} · total {{sec $rep.TotalS}} s · claims {{$rep.Claims}} · tasks {{$rep.TasksOK}} ok, {{$rep.TasksErr}} err · warm replicas {{$rep.WarmTotal}}, peak {{$rep.WarmPeak}}</p>
+  <table>
+    <tr><th>Phase</th><th>Count</th><th>Total s</th><th>Max s</th></tr>
+    {{range index $.Phases $i}}<tr><td>{{.Name}}</td><td>{{.Count}}</td><td>{{sec .TotalS}}</td><td>{{sec .MaxS}}</td></tr>{{end}}
+  </table>
+  {{else}}<p class="muted">No RunReport JSON in the folder.</p>{{end}}
+
+  {{with $r.Trace}}
+  <h2>Trace</h2>
+  <p>{{if $r.TraceURL}}<a href="{{$r.TraceURL}}" rel="noopener noreferrer" target="_blank">{{.TraceID}}</a> in Cloud Trace{{else}}<span class="mono">{{.TraceID}}</span> <span class="muted">(the span file names no project, so no Cloud Trace link)</span>{{end}} · {{ms .DurationMS}} ms{{if .Omitted}} · the first 300 spans shown, {{.Omitted}} more{{end}}</p>
+  <div class="waterfall">
+    <svg viewBox="0 0 100 {{$.Height}}" height="{{$.Height}}" preserveAspectRatio="none" role="img">
+      {{range $.Bars}}<rect class="{{if .Error}}span-error{{else}}span-ok{{end}}" x="{{.X}}" y="{{.Y}}" width="{{.Width}}" height="12"><title>{{.Name}}{{with .Service}} ({{.}}){{end}}: {{ms .DurMS}} ms at +{{ms .OffsetMS}} ms</title></rect>{{end}}
+    </svg>
+  </div>
+  <table>
+    <tr><th>Span</th><th>Service</th><th>Start, ms</th><th>Duration, ms</th></tr>
+    {{range $.Bars}}<tr><td class="indent-{{.Indent}}{{if .Error}} error{{end}}">{{.Name}}</td><td>{{.Service}}</td><td>{{ms .OffsetMS}}</td><td>{{ms .DurMS}}</td></tr>{{end}}
+  </table>
+  {{end}}
+{{else}}
+  {{range $r.Bundle}}
+  <h2>{{.Name}}</h2>
+  {{with .Note}}<p class="muted">{{.}}</p>{{else}}<pre class="mono">{{.JSON}}</pre>{{end}}
+  {{end}}
+{{end}}
+
+<h2>Files</h2>
+<table>
+  <tr><th>Name</th><th>Bytes</th><th>Updated</th></tr>
+  {{range $r.Files}}<tr><td><a href="{{runFileURL $r.Path .Name}}">{{.Name}}</a></td><td>{{.Size}}</td><td>{{timestamp .Updated}}</td></tr>
+  {{else}}<tr><td colspan="3" class="muted">none</td></tr>{{end}}
+</table>
+{{end}}

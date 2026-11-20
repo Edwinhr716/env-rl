@@ -1,0 +1,1237 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package apiservice_test
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"maps"
+	"math"
+	"net"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/agent-substrate/env/guest"
+	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
+	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
+	"github.com/agent-substrate/env/internal/unknownfields"
+	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+type testEnv struct {
+	envClient  ateenvv1alpha.EnvironmentServiceClient
+	procClient ateenvv1alpha.ProcessServiceClient
+	fsClient   ateenvv1alpha.FileSystemServiceClient
+	conn       *grpc.ClientConn
+	router     *fakerouter.Router
+	control    *fakecontrol.Server
+	srv        *apiservice.Server
+}
+
+func newTestEnv(t *testing.T) (ateenvv1alpha.EnvironmentServiceClient, *fakecontrol.Server) {
+	t.Helper()
+	te := newFullTestEnv(t)
+	return te.envClient, te.control
+}
+
+func newFullTestEnv(t *testing.T) *testEnv {
+	t.Helper()
+	return newFullTestEnvTLS(t, nil, nil)
+}
+
+// newFullTestEnvTLS serves the fake router over TLS with serverTLS and gives
+// the API clientTLS for it; nil for both is the plaintext router.
+func newFullTestEnvTLS(t *testing.T, serverTLS, clientTLS *tls.Config) *testEnv {
+	t.Helper()
+
+	control := fakecontrol.New()
+	controlAddr, stopControl, err := control.Serve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stopControl)
+
+	router := fakerouter.New()
+	router.Running = func(id string) bool {
+		return control.Status(id) == ateapipb.ActorState_ACTOR_STATE_RUNNING
+	}
+	var routerAddr string
+	var stopRouter func()
+	if serverTLS != nil {
+		routerAddr, stopRouter = router.ServeTLS(serverTLS)
+	} else {
+		routerAddr, stopRouter = router.Serve()
+	}
+	t.Cleanup(stopRouter)
+
+	client, err := ate.New(ate.Options{
+		ControlAddr: controlAddr,
+		RouterAddr:  routerAddr,
+		SkipVerify:  true,
+		RouterTLS:   clientTLS,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	srv := apiservice.New(client, routerAddr, "")
+	srv.RouterTLS = clientTLS
+	t.Cleanup(srv.Close)
+
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(unknownfields.UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(unknownfields.StreamServerInterceptor()),
+	)
+	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, srv)
+	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, srv)
+	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, srv)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go grpcServer.Serve(lis)
+	t.Cleanup(grpcServer.Stop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	return &testEnv{
+		envClient:  ateenvv1alpha.NewEnvironmentServiceClient(conn),
+		procClient: ateenvv1alpha.NewProcessServiceClient(conn),
+		fsClient:   ateenvv1alpha.NewFileSystemServiceClient(conn),
+		conn:       conn,
+		router:     router,
+		control:    control,
+		srv:        srv,
+	}
+}
+
+func TestCreateAndGetEnvironment(t *testing.T) {
+	client, _ := newTestEnv(t)
+	ctx := context.Background()
+
+	// Create with defaults.
+	createResp, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
+		Id: "env-1",
+	})
+	if err != nil {
+		t.Fatalf("CreateEnvironment failed: %v", err)
+	}
+	if createResp.GetEnvironment().GetId() != "env-1" {
+		t.Errorf("got id %q, want env-1", createResp.GetEnvironment().GetId())
+	}
+	if createResp.GetEnvironment().GetTemplate().GetName() != apiservice.DefaultTemplate {
+		t.Errorf("got template name %q, want %q", createResp.GetEnvironment().GetTemplate().GetName(), apiservice.DefaultTemplate)
+	}
+	if createResp.GetEnvironment().GetTemplate().GetAtespace() != apiservice.DefaultAtespace {
+		t.Errorf("got template atespace %q, want %q", createResp.GetEnvironment().GetTemplate().GetAtespace(), apiservice.DefaultAtespace)
+	}
+	if createResp.GetEnvironment().GetAtespace() != apiservice.DefaultAtespace {
+		t.Errorf("got atespace %q, want %q", createResp.GetEnvironment().GetAtespace(), apiservice.DefaultAtespace)
+	}
+	if createResp.GetEnvironment().GetStatus() != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED {
+		t.Errorf("got status %v, want UNSPECIFIED", createResp.GetEnvironment().GetStatus())
+	}
+
+	// Get environment.
+	getResp, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{
+		Id: "env-1",
+	})
+	if err != nil {
+		t.Fatalf("GetEnvironment failed: %v", err)
+	}
+	if getResp.GetEnvironment().GetId() != "env-1" {
+		t.Errorf("got id %q, want env-1", getResp.GetEnvironment().GetId())
+	}
+	if getResp.GetEnvironment().GetTemplate().GetName() != apiservice.DefaultTemplate {
+		t.Errorf("got template name %q, want %q", getResp.GetEnvironment().GetTemplate().GetName(), apiservice.DefaultTemplate)
+	}
+	if getResp.GetEnvironment().GetAtespace() != apiservice.DefaultAtespace {
+		t.Errorf("got atespace %q, want %q", getResp.GetEnvironment().GetAtespace(), apiservice.DefaultAtespace)
+	}
+	if getResp.GetEnvironment().GetStatus() != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_RUNNING {
+		t.Errorf("got status %v, want RUNNING", getResp.GetEnvironment().GetStatus())
+	}
+}
+
+func TestCustomAtespace(t *testing.T) {
+	client, _ := newTestEnv(t)
+	ctx := context.Background()
+
+	createResp, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
+		Id:       "custom-env",
+		Atespace: "my-space",
+		Template: &ateenvv1alpha.Template{
+			Name:     "custom-tmpl",
+			Atespace: "my-space",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateEnvironment failed: %v", err)
+	}
+	if createResp.GetEnvironment().GetAtespace() != "my-space" {
+		t.Errorf("got atespace %q, want my-space", createResp.GetEnvironment().GetAtespace())
+	}
+	if createResp.GetEnvironment().GetTemplate().GetName() != "custom-tmpl" {
+		t.Errorf("got template name %q, want custom-tmpl", createResp.GetEnvironment().GetTemplate().GetName())
+	}
+	if createResp.GetEnvironment().GetTemplate().GetAtespace() != "my-space" {
+		t.Errorf("got template atespace %q, want my-space", createResp.GetEnvironment().GetTemplate().GetAtespace())
+	}
+
+	getResp, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{
+		Id:       "custom-env",
+		Atespace: "my-space",
+	})
+	if err != nil {
+		t.Fatalf("GetEnvironment failed: %v", err)
+	}
+	if getResp.GetEnvironment().GetAtespace() != "my-space" {
+		t.Errorf("got atespace %q, want my-space", getResp.GetEnvironment().GetAtespace())
+	}
+
+	_, err = client.SuspendEnvironment(ctx, &ateenvv1alpha.SuspendEnvironmentRequest{
+		Id:       "custom-env",
+		Atespace: "my-space",
+	})
+	if err != nil {
+		t.Fatalf("SuspendEnvironment failed: %v", err)
+	}
+
+	_, err = client.DeleteEnvironment(ctx, &ateenvv1alpha.DeleteEnvironmentRequest{
+		Id:       "custom-env",
+		Atespace: "my-space",
+	})
+	if err != nil {
+		t.Fatalf("DeleteEnvironment failed: %v", err)
+	}
+}
+
+func TestCreateValidation(t *testing.T) {
+	client, _ := newTestEnv(t)
+	ctx := context.Background()
+
+	_, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{})
+	if err == nil {
+		t.Fatal("expected error for empty id")
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("got code %v, want %v", status.Code(err), codes.InvalidArgument)
+	}
+}
+
+func TestGetNotFound(t *testing.T) {
+	client, _ := newTestEnv(t)
+	ctx := context.Background()
+
+	_, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{
+		Id: "nonexistent",
+	})
+	if err == nil {
+		t.Fatal("expected error for nonexistent environment")
+	}
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("got code %v, want %v", status.Code(err), codes.NotFound)
+	}
+}
+
+func TestSuspendEnvironment(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+
+	_, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
+		Id: "env-susp",
+		Template: &ateenvv1alpha.Template{
+			Name: "custom-template",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateEnvironment failed: %v", err)
+	}
+
+	if got := control.Status("env-susp"); got != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+		t.Fatalf("status before suspend = %v, want RUNNING", got)
+	}
+
+	suspResp, err := client.SuspendEnvironment(ctx, &ateenvv1alpha.SuspendEnvironmentRequest{
+		Id: "env-susp",
+	})
+	if err != nil {
+		t.Fatalf("SuspendEnvironment failed: %v", err)
+	}
+	if suspResp == nil {
+		t.Fatal("expected non-nil SuspendEnvironmentResponse")
+	}
+	if got := control.Status("env-susp"); got != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("control plane status after suspend = %v, want SUSPENDED", got)
+	}
+
+	getResp, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{
+		Id: "env-susp",
+	})
+	if err != nil {
+		t.Fatalf("GetEnvironment after suspend failed: %v", err)
+	}
+	if getResp.GetEnvironment().GetStatus() != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED {
+		t.Errorf("got status %v, want SUSPENDED", getResp.GetEnvironment().GetStatus())
+	}
+	// No mode on the request is a durable suspend, what ate-env always did.
+	if got := control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS {
+		t.Errorf("suspend modes = %v, want one SYNCHRONOUS", got)
+	}
+}
+
+func TestSuspendEnvironmentLocal(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+
+	if _, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "env-local"}); err != nil {
+		t.Fatalf("CreateEnvironment failed: %v", err)
+	}
+	envStatus := func() ateenvv1alpha.EnvironmentStatus {
+		t.Helper()
+		resp, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "env-local"})
+		if err != nil {
+			t.Fatalf("GetEnvironment failed: %v", err)
+		}
+		return resp.GetEnvironment().GetStatus()
+	}
+
+	_, err := client.SuspendEnvironment(ctx, &ateenvv1alpha.SuspendEnvironmentRequest{
+		Id:   "env-local",
+		Mode: ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL,
+	})
+	if err != nil {
+		t.Fatalf("SuspendEnvironment(local) failed: %v", err)
+	}
+	if got := control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS {
+		t.Fatalf("suspend modes = %v, want one ASYNCHRONOUS", got)
+	}
+	// PAUSED while the snapshot is on the node only, SUSPENDED once the
+	// background upload lands.
+	if got := envStatus(); got != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_PAUSED {
+		t.Errorf("status after a local suspend = %v, want PAUSED", got)
+	}
+	control.CompleteUpload("env-local")
+	if got := envStatus(); got != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED {
+		t.Errorf("status after the upload landed = %v, want SUSPENDED", got)
+	}
+
+	// A mode the server does not know is refused, not treated as durable.
+	_, err = client.SuspendEnvironment(ctx, &ateenvv1alpha.SuspendEnvironmentRequest{
+		Id:   "env-local",
+		Mode: ateenvv1alpha.SuspendMode(7),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("unknown mode: got %v, want InvalidArgument", err)
+	}
+}
+
+func TestDeleteEnvironment(t *testing.T) {
+	client, _ := newTestEnv(t)
+	ctx := context.Background()
+
+	_, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
+		Id: "env-del",
+	})
+	if err != nil {
+		t.Fatalf("CreateEnvironment failed: %v", err)
+	}
+
+	delResp, err := client.DeleteEnvironment(ctx, &ateenvv1alpha.DeleteEnvironmentRequest{
+		Id: "env-del",
+	})
+	if err != nil {
+		t.Fatalf("DeleteEnvironment failed: %v", err)
+	}
+	if delResp == nil {
+		t.Fatal("expected non-nil DeleteEnvironmentResponse")
+	}
+
+	// Should no longer exist.
+	_, err = client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{
+		Id: "env-del",
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("after delete, got code %v, want %v", status.Code(err), codes.NotFound)
+	}
+}
+
+// A crashed environment is deleted. Substrate rejects the suspend of a
+// CRASHED actor, but DeleteActor takes an actor in any state.
+func TestDeleteCrashedEnvironment(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+
+	if _, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "env-crashed"}); err != nil {
+		t.Fatalf("CreateEnvironment failed: %v", err)
+	}
+	control.SetState("env-crashed", ateapipb.ActorState_ACTOR_STATE_CRASHED)
+
+	if _, err := client.DeleteEnvironment(ctx, &ateenvv1alpha.DeleteEnvironmentRequest{Id: "env-crashed"}); err != nil {
+		t.Fatalf("DeleteEnvironment of a crashed environment: %v", err)
+	}
+	if _, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "env-crashed"}); status.Code(err) != codes.NotFound {
+		t.Errorf("after delete, got code %v, want %v", status.Code(err), codes.NotFound)
+	}
+}
+
+func TestProxyGuestServices(t *testing.T) {
+	te := newFullTestEnv(t)
+	ctx := context.Background()
+
+	// 1. Create environment
+	_, err := te.envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
+		Id: "guest-test",
+	})
+	if err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+
+	// 2. Register guest server on router
+	workDir := t.TempDir()
+	grpcGuestServer, cleanup, err := guest.NewServer(guest.Config{
+		Workspace:        workDir,
+		EnableProcess:    true,
+		EnableFileSystem: true,
+	})
+	if err != nil {
+		t.Fatalf("guest.NewServer: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	te.router.Register("guest-test", grpcGuestServer)
+
+	envCtx := metadata.AppendToOutgoingContext(ctx, "x-env-id", "guest-test", "x-env-atespace", "default")
+
+	// 3. Test FileSystemService proxying
+	writeStream, err := te.fsClient.WriteFile(envCtx)
+	if err != nil {
+		t.Fatalf("WriteFile stream: %v", err)
+	}
+	if err := writeStream.Send(&ateenvv1alpha.WriteFileRequest{
+		Path:  "proxy-file.txt",
+		Mode:  0644,
+		Chunk: []byte("proxied content"),
+	}); err != nil {
+		t.Fatalf("WriteFile send: %v", err)
+	}
+	writeResp, err := writeStream.CloseAndRecv()
+	if err != nil {
+		t.Fatalf("WriteFile CloseAndRecv: %v", err)
+	}
+	if writeResp.GetBytesWritten() != int64(len("proxied content")) {
+		t.Errorf("bytes written = %d, want %d", writeResp.GetBytesWritten(), len("proxied content"))
+	}
+
+	readStream, err := te.fsClient.ReadFile(envCtx, &ateenvv1alpha.ReadFileRequest{
+		Path: "proxy-file.txt",
+	})
+	if err != nil {
+		t.Fatalf("ReadFile stream: %v", err)
+	}
+	var readBuf []byte
+	for {
+		chunk, err := readStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ReadFile recv: %v", err)
+		}
+		readBuf = append(readBuf, chunk.GetChunk()...)
+	}
+	if string(readBuf) != "proxied content" {
+		t.Errorf("read %q, want %q", string(readBuf), "proxied content")
+	}
+
+	// 4. Test ProcessService proxying
+	startResp, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{
+		Command: []string{"echo", "hello-from-proxy"},
+	})
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	if startResp.GetProcessId() == "" {
+		t.Fatal("empty process ID")
+	}
+
+	outStream, err := te.procClient.StreamProcessOutput(envCtx, &ateenvv1alpha.StreamProcessOutputRequest{
+		ProcessId: startResp.GetProcessId(),
+		Follow:    true,
+	})
+	if err != nil {
+		t.Fatalf("StreamProcessOutput: %v", err)
+	}
+	var stdout string
+	var exit *ateenvv1alpha.Process
+	for {
+		msg, err := outStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("StreamProcessOutput recv: %v", err)
+		}
+		switch out := msg.GetOutput().(type) {
+		case *ateenvv1alpha.ProcessOutput_Stdout:
+			stdout += string(out.Stdout)
+		case *ateenvv1alpha.ProcessOutput_Exit:
+			exit = out.Exit
+		}
+	}
+	if stdout != "hello-from-proxy\n" {
+		t.Errorf("stdout = %q, want hello-from-proxy\\n", stdout)
+	}
+	if exit == nil || exit.GetState() != ateenvv1alpha.ProcessState_PROCESS_STATE_EXITED || exit.GetExitCode() != 0 {
+		t.Errorf("exit message = %v, want EXITED with code 0", exit)
+	}
+
+	getProc, err := te.procClient.GetProcess(envCtx, &ateenvv1alpha.GetProcessRequest{
+		ProcessId: startResp.GetProcessId(),
+	})
+	if err != nil {
+		t.Fatalf("GetProcess: %v", err)
+	}
+	if getProc.GetExitCode() != 0 {
+		t.Errorf("exit code = %d, want 0", getProc.GetExitCode())
+	}
+
+	// Stdin and signals proxy through the client stream and unary paths.
+	catProc, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{
+		Command: []string{"cat"},
+		Stdin:   true,
+	})
+	if err != nil {
+		t.Fatalf("StartProcess cat: %v", err)
+	}
+	inStream, err := te.procClient.WriteProcessInput(envCtx)
+	if err != nil {
+		t.Fatalf("WriteProcessInput: %v", err)
+	}
+	if err := inStream.Send(&ateenvv1alpha.WriteProcessInputRequest{
+		ProcessId: catProc.GetProcessId(),
+		Data:      []byte("proxied stdin\n"),
+		Close:     true,
+	}); err != nil {
+		t.Fatalf("WriteProcessInput send: %v", err)
+	}
+	inResp, err := inStream.CloseAndRecv()
+	if err != nil {
+		t.Fatalf("WriteProcessInput CloseAndRecv: %v", err)
+	}
+	if inResp.GetBytesWritten() != int64(len("proxied stdin\n")) {
+		t.Errorf("bytes written = %d", inResp.GetBytesWritten())
+	}
+	catDone := waitProcess(t, te.procClient, envCtx, catProc.GetProcessId())
+	if catDone.GetExitCode() != 0 {
+		t.Errorf("cat exit code = %d", catDone.GetExitCode())
+	}
+
+	sleeper, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sleep", "30"}})
+	if err != nil {
+		t.Fatalf("StartProcess sleep: %v", err)
+	}
+	if _, err := te.procClient.SignalProcess(envCtx, &ateenvv1alpha.SignalProcessRequest{
+		ProcessId: sleeper.GetProcessId(),
+		Signal:    ateenvv1alpha.Signal_SIGNAL_TERM,
+	}); err != nil {
+		t.Fatalf("SignalProcess: %v", err)
+	}
+	sleeperDone := waitProcess(t, te.procClient, envCtx, sleeper.GetProcessId())
+	if sleeperDone.GetExitCode() != 143 {
+		t.Errorf("sleeper exit code = %d, want 143 (128+SIGTERM)", sleeperDone.GetExitCode())
+	}
+
+	// 5. Test missing metadata error
+	_, err = te.procClient.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{
+		Command: []string{"echo", "no-meta"},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("got error code %v, want InvalidArgument", status.Code(err))
+	}
+}
+
+// waitProcess follows the output stream past the spool end and returns the exit message.
+func waitProcess(t *testing.T, client ateenvv1alpha.ProcessServiceClient, ctx context.Context, id string) *ateenvv1alpha.Process {
+	t.Helper()
+	stream, err := client.StreamProcessOutput(ctx, &ateenvv1alpha.StreamProcessOutputRequest{
+		ProcessId: id, Follow: true, StdoutOffset: math.MaxInt64, StderrOffset: math.MaxInt64,
+	})
+	if err != nil {
+		t.Fatalf("StreamProcessOutput: %v", err)
+	}
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("waiting for %s: %v", id, err)
+		}
+		if exit := msg.GetExit(); exit != nil {
+			return exit
+		}
+		t.Fatalf("unexpected output while waiting: %v", msg)
+	}
+}
+
+// TestProxyGuestServicesClientTargetActorHeader covers the two ways a
+// caller-supplied ate-target-actor header used to break guest calls. Forwarded
+// next to the one guestSession adds, the router saw the header twice and rejected
+// the request as an invalid actor reference (agent-substrate/substrate#2308).
+// Forwarded alone, it would have let the caller retarget the call. The server
+// must not forward it, so a call that names another actor still reaches the
+// environment from x-env-id, over both the unary and the streaming path.
+func TestProxyGuestServicesClientTargetActorHeader(t *testing.T) {
+	te := newFullTestEnv(t)
+	ctx := context.Background()
+
+	if _, err := te.envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "header-test"}); err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	grpcGuestServer, cleanup, err := guest.NewServer(guest.Config{
+		Workspace:        t.TempDir(),
+		EnableProcess:    true,
+		EnableFileSystem: true,
+	})
+	if err != nil {
+		t.Fatalf("guest.NewServer: %v", err)
+	}
+	t.Cleanup(cleanup)
+	te.router.Register("header-test", grpcGuestServer)
+
+	envCtx := metadata.AppendToOutgoingContext(ctx,
+		"x-env-id", "header-test",
+		"x-env-atespace", "default",
+		ate.TargetActorHeader, "default/some-other-actor",
+	)
+
+	// Unary interceptor path.
+	if _, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{
+		Command: []string{"true"},
+	}); err != nil {
+		t.Fatalf("StartProcess with a client ate-target-actor header: %v", err)
+	}
+
+	// Stream interceptor path.
+	writeStream, err := te.fsClient.WriteFile(envCtx)
+	if err != nil {
+		t.Fatalf("WriteFile stream: %v", err)
+	}
+	if err := writeStream.Send(&ateenvv1alpha.WriteFileRequest{Path: "f.txt", Mode: 0644, Chunk: []byte("x")}); err != nil {
+		t.Fatalf("WriteFile send: %v", err)
+	}
+	if _, err := writeStream.CloseAndRecv(); err != nil {
+		t.Fatalf("WriteFile with a client ate-target-actor header: %v", err)
+	}
+}
+
+func TestActorStatusToEnvStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		in   *ateapipb.ActorStatus
+		want ateenvv1alpha.EnvironmentStatus
+	}{
+		{"nil status", nil, ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED},
+		{"resuming", &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RESUMING}, ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_RESUMING},
+		{"running", &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}, ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_RUNNING},
+		{"suspending", &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDING}, ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDING},
+		{"suspended", &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED}, ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED},
+		{"crashed", &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_CRASHED}, ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_CRASHED},
+		{"deleting", &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_DELETING}, ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_DELETING},
+	}
+	for _, tc := range cases {
+		if got := apiservice.ActorStatusToEnvStatus(tc.in); got != tc.want {
+			t.Errorf("%s: ActorStatusToEnvStatus = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+const (
+	testGuestImage  = "example.com/ate-env-guest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testRootfsImage = "docker.io/library/python@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+)
+
+// seedGuestTemplate registers the template `ate-env manifest template`
+// writes: the guest is the container image.
+func seedGuestTemplate(control *fakecontrol.Server, atespace, name string) {
+	control.AddTemplate(&ateapipb.ActorTemplate{
+		Metadata:       &ateapipb.ResourceMetadata{Atespace: atespace, Name: name},
+		WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"workload": "default-env"}},
+		Containers: []*ateapipb.Container{{
+			Name:        "guest",
+			Image:       testGuestImage,
+			Command:     []string{"/ko-app/ate-env-guest"},
+			Env:         []*ateapipb.EnvVar{{Name: "PORT", Value: "80"}},
+			WakeupProbe: &ateapipb.WakeupProbe{HttpGet: &ateapipb.HttpGetAction{Path: "/readyz", Port: 80}},
+		}},
+		SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: "gs://bucket/ate-env/"},
+	})
+}
+
+func TestCreateFromImageDerivesTemplate(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	seedGuestTemplate(control, "ate-env", "default-template")
+	ctx := context.Background()
+
+	resp, err := envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "img1", RootfsImage: testRootfsImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "default-template-0123456789ab"
+	if got := resp.GetEnvironment().GetTemplate().GetName(); got != want {
+		t.Errorf("response template = %q, want %q", got, want)
+	}
+
+	tmpl := control.Template("ate-env", want)
+	if tmpl == nil {
+		t.Fatalf("derived template %q was not created", want)
+	}
+	c := tmpl.GetContainers()[0]
+	if c.GetImage() != testRootfsImage {
+		t.Errorf("derived container image = %q", c.GetImage())
+	}
+	if len(tmpl.GetVolumes()) != 1 || tmpl.GetVolumes()[0].GetImage().GetReference() != testGuestImage {
+		t.Errorf("derived volumes = %v, want the guest image volume", tmpl.GetVolumes())
+	}
+	if len(c.GetVolumeMounts()) != 1 || c.GetVolumeMounts()[0].GetMountPath() != apiservice.GuestMountPath {
+		t.Errorf("derived mounts = %v", c.GetVolumeMounts())
+	}
+	if len(c.GetCommand()) != 1 || c.GetCommand()[0] != "/ate/ko-app/ate-env-guest" {
+		t.Errorf("derived command = %v", c.GetCommand())
+	}
+	if tmpl.GetSnapshotConfig().GetStorageLocation() != "gs://bucket/ate-env/" || tmpl.GetWorkerSelector() == nil {
+		t.Error("snapshots config or worker selector did not carry over")
+	}
+
+	// The actor references the derived template.
+	got, err := envClient.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "img1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetEnvironment().GetTemplate().GetName() != want {
+		t.Errorf("actor template = %q, want %q", got.GetEnvironment().GetTemplate().GetName(), want)
+	}
+
+	// A second environment on the same image reuses the template.
+	if _, err := envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "img2", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatal(err)
+	}
+	if n := control.TemplateCount(); n != 2 {
+		t.Errorf("template count = %d, want 2 (base + one derived)", n)
+	}
+
+	// Another repository path with the same digest is the same image and
+	// reuses the template too.
+	samePath := "example.com/mirror/python@sha256:" + testRootfsImage[len(testRootfsImage)-64:]
+	resp, err = envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "img3", RootfsImage: samePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.GetEnvironment().GetTemplate().GetName(); got != want {
+		t.Errorf("same-digest template = %q, want %q", got, want)
+	}
+	if n := control.TemplateCount(); n != 2 {
+		t.Errorf("template count after same-digest create = %d, want 2", n)
+	}
+}
+
+func TestCreateFromImageUsesNamedBaseAndAtespace(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	seedGuestTemplate(control, "team-a", "py-base")
+
+	resp, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{
+		Id:          "img1",
+		Atespace:    "team-a",
+		Template:    &ateenvv1alpha.Template{Name: "py-base"},
+		RootfsImage: testRootfsImage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.GetEnvironment().GetTemplate().GetName(); got != "py-base-0123456789ab" {
+		t.Errorf("template = %q", got)
+	}
+	if control.Template("team-a", "py-base-0123456789ab") == nil {
+		t.Error("derived template not created in the environment's atespace")
+	}
+}
+
+const (
+	testDerivedTemplate = "default-template-0123456789ab"
+	testGoldenError     = "GoldenActorCrashed: golden actor crashed before its snapshot was taken"
+)
+
+// seedDerivedTemplate registers the template that ensureImageTemplate derives
+// for testRootfsImage from default-template, with uid "seeded", the given
+// golden snapshot status, and an update time failedAgo in the past (none
+// when zero).
+func seedDerivedTemplate(t *testing.T, control *fakecontrol.Server, golden *ateapipb.GoldenSnapshotStatus, failedAgo time.Duration) {
+	t.Helper()
+	seedGuestTemplate(control, "ate-env", "default-template")
+	derived, err := apiservice.DeriveImageTemplate(control.Template("ate-env", "default-template"), testDerivedTemplate, testRootfsImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derived.Metadata.Uid = "seeded"
+	if failedAgo != 0 {
+		derived.Metadata.UpdateTime = timestamppb.New(time.Now().Add(-failedAgo))
+	}
+	derived.Status = &ateapipb.ActorTemplateStatus{GoldenSnapshotStatus: golden}
+	control.AddTemplate(derived)
+}
+
+func failedGolden() *ateapipb.GoldenSnapshotStatus {
+	return &ateapipb.GoldenSnapshotStatus{ErrorMessage: testGoldenError}
+}
+
+// createOnDerived creates environment id on the derived template by name, as
+// an environment created before the golden snapshot failed.
+func createOnDerived(t *testing.T, envClient ateenvv1alpha.EnvironmentServiceClient, id string) {
+	t.Helper()
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{
+		Id: id, Template: &ateenvv1alpha.Template{Name: testDerivedTemplate},
+	}); err != nil {
+		t.Fatalf("CreateEnvironment %s on the derived template: %v", id, err)
+	}
+}
+
+// A derived template whose golden snapshot failed more than the backoff ago,
+// and that no actor uses, is deleted and created again under the same name.
+// A recent failure, a baking template and a ready one are used as is.
+func TestCreateFromImageRecreatesFailedTemplate(t *testing.T) {
+	cases := []struct {
+		name      string
+		golden    *ateapipb.GoldenSnapshotStatus
+		failedAgo time.Duration
+		recreate  bool
+	}{
+		{"failed", failedGolden(), time.Hour, true},
+		{"failed inside the backoff", failedGolden(), time.Minute, false},
+		{"baking", nil, time.Hour, false},
+		{"ready", &ateapipb.GoldenSnapshotStatus{GoldenTag: &ateapipb.ObjectRef{Atespace: "ate-env", Name: "golden"}}, time.Hour, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envClient, control := newTestEnv(t)
+			seedDerivedTemplate(t, control, tc.golden, tc.failedAgo)
+			// The golden actor, named after the template uid, does not count
+			// as a user of the template.
+			createOnDerived(t, envClient, "seeded")
+			control.RequireTemplate = true
+
+			resp, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img", RootfsImage: testRootfsImage})
+			if err != nil {
+				t.Fatalf("CreateEnvironment: %v", err)
+			}
+			if got := resp.GetEnvironment().GetTemplate().GetName(); got != testDerivedTemplate {
+				t.Errorf("response template = %q, want %q", got, testDerivedTemplate)
+			}
+			tmpl := control.Template("ate-env", testDerivedTemplate)
+			if tmpl == nil {
+				t.Fatalf("derived template %q is gone", testDerivedTemplate)
+			}
+			if recreated := tmpl.GetMetadata().GetUid() != "seeded"; recreated != tc.recreate {
+				t.Errorf("derived template recreated = %v (uid %q), want %v", recreated, tmpl.GetMetadata().GetUid(), tc.recreate)
+			}
+			if tc.recreate && tmpl.GetStatus().GetGoldenSnapshotStatus().GetErrorMessage() != "" {
+				t.Errorf("recreated template still failed")
+			}
+			if tmpl.GetContainers()[0].GetImage() != testRootfsImage {
+				t.Errorf("derived container image = %q, want %q", tmpl.GetContainers()[0].GetImage(), testRootfsImage)
+			}
+			if control.Template("ate-env", "default-template") == nil || control.TemplateCount() != 2 {
+				t.Errorf("templates after create: base present = %v, count = %d; want the base and one derived",
+					control.Template("ate-env", "default-template") != nil, control.TemplateCount())
+			}
+		})
+	}
+}
+
+// A failed template that an environment can lose state on is kept: a
+// recreate gives it a new uid, and a suspended environment would resume
+// without its rootfs. Creates on a kept template still succeed. A crashed
+// environment without a snapshot under the old uid does not block the
+// recreate.
+func TestCreateFromImageKeepsFailedTemplateInUse(t *testing.T) {
+	cases := []struct {
+		name     string
+		state    ateapipb.ActorState
+		snapshot bool // a snapshot taken under the failed template
+		recreate bool
+	}{
+		{"suspended", ateapipb.ActorState_ACTOR_STATE_SUSPENDED, true, false},
+		{"running", ateapipb.ActorState_ACTOR_STATE_RUNNING, false, false},
+		{"crashed with a snapshot", ateapipb.ActorState_ACTOR_STATE_CRASHED, true, false},
+		{"crashed without a snapshot", ateapipb.ActorState_ACTOR_STATE_CRASHED, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envClient, control := newTestEnv(t)
+			seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+			createOnDerived(t, envClient, "old-env")
+			control.MutateActor("old-env", func(a *ateapipb.Actor) {
+				a.Status = &ateapipb.ActorStatus{State: tc.state}
+				if tc.snapshot {
+					a.Status.Snapshots = []*ateapipb.Snapshot{{Uuid: "snap-1", ActorTemplateUid: "seeded"}}
+				}
+			})
+
+			for _, id := range []string{"img1", "img2"} {
+				if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: id, RootfsImage: testRootfsImage}); err != nil {
+					t.Fatalf("CreateEnvironment %s: %v", id, err)
+				}
+			}
+			uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid()
+			if recreated := uid != "seeded"; recreated != tc.recreate {
+				t.Errorf("derived template recreated = %v (uid %q), want %v", recreated, uid, tc.recreate)
+			}
+			wantDeletes := 0
+			if tc.recreate {
+				wantDeletes = 1
+			}
+			if deletes, _ := control.TemplateCalls(); deletes != wantDeletes {
+				t.Errorf("DeleteActorTemplate calls = %d, want %d", deletes, wantDeletes)
+			}
+		})
+	}
+}
+
+// Concurrent creates that all see the failed template recreate it once, and
+// no create runs while no template exists.
+func TestCreateFromImageRecreatesFailedTemplateConcurrently(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	control.RequireTemplate = true
+
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{
+				Id: fmt.Sprintf("img-%d", i), RootfsImage: testRootfsImage,
+			})
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("CreateEnvironment img-%d: %v", i, err)
+		}
+	}
+	tmpl := control.Template("ate-env", testDerivedTemplate)
+	if tmpl == nil || tmpl.GetMetadata().GetUid() == "seeded" || tmpl.GetStatus().GetGoldenSnapshotStatus().GetErrorMessage() != "" {
+		t.Fatalf("derived template after concurrent creates = %v, want a recreated template without an error", tmpl)
+	}
+	if deletes, creates := control.TemplateCalls(); deletes != 1 || creates != 1 {
+		t.Errorf("DeleteActorTemplate calls = %d, CreateActorTemplate calls = %d; want 1 and 1", deletes, creates)
+	}
+}
+
+// While the template reconciler (or another delete) holds the template's
+// lease, Substrate answers the delete with Aborted and the failed template
+// stays. The create waits for the replacement instead of using the template
+// that is about to go away.
+func TestCreateFromImageRecreateWaitsForTemplateLease(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	control.RequireTemplate = true
+	release := control.HoldTemplateLease("ate-env", testDerivedTemplate)
+	time.AfterFunc(500*time.Millisecond, release)
+
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	if uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid(); uid == "seeded" {
+		t.Errorf("derived template uid = %q, want a recreated template", uid)
+	}
+	if deletes, _ := control.TemplateCalls(); deletes < 2 {
+		t.Errorf("DeleteActorTemplate calls = %d, want a retry after Aborted", deletes)
+	}
+}
+
+// A delete that fails for another reason keeps the failed template: the
+// create goes on as a cold boot on it, and later creates wait for the
+// backoff instead of trying again.
+func TestCreateFromImageRecreateDeleteFailsColdBoots(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	control.DeleteTemplateErr = status.Error(codes.Internal, "database unavailable")
+
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img1", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("CreateEnvironment after a failed delete: %v, want a cold boot", err)
+	}
+	lists := control.ListCalls()
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img2", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("second CreateEnvironment: %v", err)
+	}
+	if deletes, _ := control.TemplateCalls(); deletes != 1 {
+		t.Errorf("DeleteActorTemplate calls = %d, want 1", deletes)
+	}
+	if n := control.ListCalls(); n != lists {
+		t.Errorf("ListActors calls after the second create = %d, want %d", n, lists)
+	}
+	if uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid(); uid != "seeded" {
+		t.Errorf("derived template uid = %q, want the kept %q", uid, "seeded")
+	}
+}
+
+// A recreate that the template lease blocks past its bound keeps the failed
+// template: its create cold-boots on it, and later creates wait for the
+// backoff.
+func TestCreateFromImageRecreateLeaseTimeoutColdBoots(t *testing.T) {
+	apiservice.SetTemplateRecreateTimeout(t, time.Second)
+	envClient, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	control.HoldTemplateLease("ate-env", testDerivedTemplate)
+
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img1", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("CreateEnvironment: %v, want a cold boot on the kept template", err)
+	}
+	deletes, _ := control.TemplateCalls()
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img2", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("second CreateEnvironment: %v", err)
+	}
+	if again, _ := control.TemplateCalls(); again != deletes {
+		t.Errorf("DeleteActorTemplate calls after the backoff started: %d, want %d", again, deletes)
+	}
+	if uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid(); uid != "seeded" {
+		t.Errorf("derived template uid = %q, want the kept %q", uid, "seeded")
+	}
+}
+
+func TestCreateFromImageRejects(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	seedGuestTemplate(control, "ate-env", "default-template")
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		req  *ateenvv1alpha.CreateEnvironmentRequest
+		code codes.Code
+	}{
+		{"unpinned image", &ateenvv1alpha.CreateEnvironmentRequest{Id: "a", RootfsImage: "python:3.12"}, codes.InvalidArgument},
+		{"missing base", &ateenvv1alpha.CreateEnvironmentRequest{Id: "b", Template: &ateenvv1alpha.Template{Name: "nope"}, RootfsImage: testRootfsImage}, codes.FailedPrecondition},
+	}
+	for _, tc := range cases {
+		_, err := envClient.CreateEnvironment(ctx, tc.req)
+		if status.Code(err) != tc.code {
+			t.Errorf("%s: code = %v (%v), want %v", tc.name, status.Code(err), err, tc.code)
+		}
+	}
+
+	// A derived name already taken by a template running something else.
+	control.AddTemplate(&ateapipb.ActorTemplate{
+		Metadata:   &ateapipb.ResourceMetadata{Atespace: "ate-env", Name: "default-template-0123456789ab"},
+		Containers: []*ateapipb.Container{{Name: "guest", Image: "example.com/other@sha256:" + testGuestImage[len(testGuestImage)-64:]}},
+	})
+	_, err := envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "c", RootfsImage: testRootfsImage})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("conflicting derived template: code = %v (%v), want FailedPrecondition", status.Code(err), err)
+	}
+}
+
+func TestCreatePassesWorkerSelectorAndGetReportsNode(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+	selector := map[string]string{"ate-env/domain": "d0"}
+
+	resp, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "placed", WorkerSelector: selector})
+	if err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	if got := resp.GetEnvironment().GetWorkerSelector(); !maps.Equal(got, selector) {
+		t.Errorf("create response worker_selector = %v, want %v", got, selector)
+	}
+	if got := resp.GetEnvironment().GetNode(); got != "" {
+		t.Errorf("create response node = %q, want empty before placement", got)
+	}
+
+	// The selector reaches the actor; the node comes back from its status.
+	var actorSelector map[string]string
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		actorSelector = a.GetWorkerSelector().GetMatchLabels()
+		a.Status.AssignedNode = "gke-pool-a-7"
+	})
+	if !maps.Equal(actorSelector, selector) {
+		t.Errorf("actor worker_selector = %v, want %v", actorSelector, selector)
+	}
+	got, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "gke-pool-a-7" {
+		t.Errorf("node = %q, want gke-pool-a-7", n)
+	}
+	if sel := got.GetEnvironment().GetWorkerSelector(); !maps.Equal(sel, selector) {
+		t.Errorf("get worker_selector = %v, want %v", sel, selector)
+	}
+
+	// A running actor without assigned_node reports the worker assignment's node.
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		a.Status.AssignedNode = ""
+		a.Status.WorkerAssignment = &ateapipb.WorkerAssignment{NodeName: "gke-pool-a-8"}
+	})
+	got, err = client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "gke-pool-a-8" {
+		t.Errorf("node = %q, want gke-pool-a-8 from the worker assignment", n)
+	}
+
+	// A detach clears assigned_node, and Substrate unsets the worker
+	// assignment whenever the actor has no worker: both clear, no node.
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		a.Status.AssignedNode = ""
+		a.Status.WorkerAssignment = nil
+	})
+	got, err = client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "" {
+		t.Errorf("node = %q after a detach, want empty", n)
+	}
+
+	// No selector in the request: the actor carries none, so the template's
+	// selection stands.
+	if _, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "plain"}); err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	control.MutateActor("plain", func(a *ateapipb.Actor) {
+		if a.GetWorkerSelector() != nil {
+			t.Errorf("plain actor has worker_selector %v, want none", a.GetWorkerSelector())
+		}
+	})
+}
+
+func TestImageStatusFollowsTheDerivedTemplate(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+	seedGuestTemplate(control, "ate-env", "default-template")
+
+	if _, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: "docker.io/library/python:3.11"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("unpinned image: code %v, want InvalidArgument", status.Code(err))
+	}
+
+	// No template yet: reported, not created.
+	st, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: testRootfsImage})
+	if err != nil {
+		t.Fatalf("GetImageStatus: %v", err)
+	}
+	if st.GetTemplateExists() || st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_NONE {
+		t.Errorf("before ensure: exists=%v golden=%v, want false NONE", st.GetTemplateExists(), st.GetGolden())
+	}
+	if st.GetTemplate().GetName() != testDerivedTemplate || st.GetTemplate().GetAtespace() != "ate-env" {
+		t.Errorf("template = %s/%s, want ate-env/%s", st.GetTemplate().GetAtespace(), st.GetTemplate().GetName(), testDerivedTemplate)
+	}
+	if n := control.TemplateCount(); n != 1 {
+		t.Errorf("GetImageStatus created a template: count %d, want 1", n)
+	}
+
+	// Ensure derives it once; the bake is pending until Substrate tags it.
+	for i := 0; i < 2; i++ {
+		st, err = client.EnsureImageTemplate(ctx, &ateenvv1alpha.EnsureImageTemplateRequest{RootfsImage: testRootfsImage})
+		if err != nil {
+			t.Fatalf("EnsureImageTemplate: %v", err)
+		}
+		if !st.GetTemplateExists() || st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING {
+			t.Errorf("after ensure: exists=%v golden=%v, want true PENDING", st.GetTemplateExists(), st.GetGolden())
+		}
+	}
+	if n := control.TemplateCount(); n != 2 {
+		t.Errorf("template count = %d, want 2 (base + one derived)", n)
+	}
+	if tmpl := control.Template("ate-env", testDerivedTemplate); tmpl == nil || tmpl.GetContainers()[0].GetImage() != testRootfsImage {
+		t.Errorf("derived template missing or runs another image: %v", tmpl)
+	}
+
+	// Another repository path with the same digest is the same image: the
+	// status follows the existing template, as CreateEnvironment reuses it.
+	samePath := "example.com/mirror/python@sha256:" + testRootfsImage[len(testRootfsImage)-64:]
+	st, err = client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: samePath})
+	if err != nil {
+		t.Fatalf("GetImageStatus(same digest): %v", err)
+	}
+	if !st.GetTemplateExists() || st.GetTemplate().GetName() != testDerivedTemplate {
+		t.Errorf("same-digest status: exists=%v template=%q, want true %q", st.GetTemplateExists(), st.GetTemplate().GetName(), testDerivedTemplate)
+	}
+	if n := control.TemplateCount(); n != 2 {
+		t.Errorf("template count after same-digest status = %d, want 2", n)
+	}
+
+	// A different digest whose first 12 hex digits match derives the same
+	// template name, which an existing template running another image holds.
+	otherDigest := testRootfsImage[:len(testRootfsImage)-52] + strings.Repeat("f", 52)
+	if _, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: otherDigest}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("other digest: code %v (%v), want FailedPrecondition", status.Code(err), err)
+	}
+}
+
+func TestImageStatusReportsReadyAndFailedGoldens(t *testing.T) {
+	ctx := context.Background()
+
+	client, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, &ateapipb.GoldenSnapshotStatus{GoldenTag: &ateapipb.ObjectRef{Atespace: "ate-env", Name: "golden-7"}}, 0)
+	st, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: testRootfsImage})
+	if err != nil {
+		t.Fatalf("GetImageStatus: %v", err)
+	}
+	if st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_READY || st.GetGoldenTag() != "golden-7" {
+		t.Errorf("ready golden: golden=%v tag=%q, want READY golden-7", st.GetGolden(), st.GetGoldenTag())
+	}
+
+	// A failed bake is reported with its reason; ensure recreates the template
+	// once the failure is old enough and nothing uses it, and the new one bakes.
+	client, control = newTestEnv(t)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	st, err = client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: testRootfsImage})
+	if err != nil {
+		t.Fatalf("GetImageStatus: %v", err)
+	}
+	if st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_FAILED || st.GetGoldenError() != testGoldenError {
+		t.Errorf("failed golden: golden=%v error=%q, want FAILED %q", st.GetGolden(), st.GetGoldenError(), testGoldenError)
+	}
+	st, err = client.EnsureImageTemplate(ctx, &ateenvv1alpha.EnsureImageTemplateRequest{RootfsImage: testRootfsImage})
+	if err != nil {
+		t.Fatalf("EnsureImageTemplate: %v", err)
+	}
+	if st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING {
+		t.Errorf("after recreate: golden=%v, want PENDING", st.GetGolden())
+	}
+	if tmpl := control.Template("ate-env", testDerivedTemplate); tmpl == nil || tmpl.GetMetadata().GetUid() == "seeded" {
+		t.Errorf("failed template was not recreated: %v", tmpl)
+	}
+}

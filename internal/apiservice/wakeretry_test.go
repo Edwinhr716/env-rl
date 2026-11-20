@@ -1,0 +1,272 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package apiservice_test
+
+import (
+	"context"
+	"crypto/tls"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/agent-substrate/env/guest"
+	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/internaltest/testcerts"
+	"github.com/agent-substrate/env/internal/routertls"
+	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+// registerGuest creates an environment and serves a real guest for it on the
+// fake router, returning the metadata context that addresses it.
+func registerGuest(t *testing.T, te *testEnv, id string) context.Context {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := te.envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: id}); err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	srv, cleanup, err := guest.NewServer(guest.Config{Workspace: t.TempDir(), EnableProcess: true, EnableFileSystem: true})
+	if err != nil {
+		t.Fatalf("guest.NewServer: %v", err)
+	}
+	t.Cleanup(cleanup)
+	te.router.Register(id, srv)
+	return metadata.AppendToOutgoingContext(ctx, "x-env-id", id, "x-env-atespace", apiservice.DefaultAtespace)
+}
+
+// A guest call made while the environment is still suspended is held until
+// the environment is running, instead of failing with the router's 503.
+func TestGuestCallWaitsForWake(t *testing.T) {
+	te := newFullTestEnv(t)
+	envCtx := registerGuest(t, te, "wake-test")
+	te.control.SetState("wake-test", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+
+	// The fake router has no resume path of its own; stand in for it.
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		te.control.SetState("wake-test", ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	}()
+
+	start := time.Now()
+	proc, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "echo awake"}})
+	if err != nil {
+		t.Fatalf("StartProcess while suspended: %v", err)
+	}
+	if proc.GetProcessId() == "" {
+		t.Fatal("StartProcess returned no process id")
+	}
+	if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
+		t.Errorf("call returned after %s, before the environment was running", elapsed)
+	}
+}
+
+// A router whose allow-list lacks the API's SPIFFE ID rejects the client
+// certificate after the handshake. That is a deployment error, not a sleeping
+// environment: the call fails at once, naming the ID and the setting, instead
+// of waiting out the wake budget as it would for any other Unavailable.
+func TestGuestCallFailsFastOnRejectedCertificate(t *testing.T) {
+	ca := testcerts.NewAuthority(t, "test podcert")
+	serverTLS := &tls.Config{
+		Certificates:          []tls.Certificate{ca.Server(t, "atenet-router.ate-system.svc")},
+		ClientAuth:            tls.RequireAndVerifyClientCert,
+		ClientCAs:             ca.Pool(),
+		VerifyPeerCertificate: testcerts.Allow(routertls.SPIFFEID("ate-env", "someone-else")),
+	}
+	dir := t.TempDir()
+	id := routertls.SPIFFEID("ate-env", "ate-env-api")
+	clientTLS, err := routertls.Options{
+		CredentialBundleFile: testcerts.WriteFile(t, dir, "bundle.pem", ca.ClientBundle(t, id)),
+		TrustBundleFile:      testcerts.WriteFile(t, dir, "trust.pem", ca.PEM),
+		ServerName:           "atenet-router.ate-system.svc",
+	}.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	te := newFullTestEnvTLS(t, serverTLS, clientTLS)
+	te.srv.RouterIdentity = id
+	envCtx := registerGuest(t, te, "identity-test")
+	te.control.SetState("identity-test", ateapipb.ActorState_ACTOR_STATE_RUNNING)
+
+	start := time.Now()
+	_, err = te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "true"}})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code %v (%v), want FailedPrecondition", status.Code(err), err)
+	}
+	if msg := status.Convert(err).Message(); !strings.Contains(msg, id) || !strings.Contains(msg, "ATE_INGRESS_ALLOWED_SPIFFE_IDS") {
+		t.Errorf("message %q should name the API's SPIFFE ID and the allow-list setting", msg)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %s to report; the wake budget must not apply", elapsed)
+	}
+}
+
+// A crashed environment fails the call at once rather than consuming the
+// wake budget.
+func TestGuestCallFailsFastOnCrash(t *testing.T) {
+	te := newFullTestEnv(t)
+	envCtx := registerGuest(t, te, "crash-test")
+	te.control.SetState("crash-test", ateapipb.ActorState_ACTOR_STATE_CRASHED)
+
+	start := time.Now()
+	_, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "true"}})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("StartProcess on a crashed environment: code %v (%v), want FailedPrecondition", status.Code(err), err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("crash took %s to report; the wake budget must not apply", elapsed)
+	}
+}
+
+// A deleting environment will not wake: the call fails at once with
+// NotFound, as the port proxy answers 404 for it.
+func TestGuestCallFailsFastOnDeleting(t *testing.T) {
+	te := newFullTestEnv(t)
+	envCtx := registerGuest(t, te, "deleting-test")
+	te.control.SetState("deleting-test", ateapipb.ActorState_ACTOR_STATE_DELETING)
+
+	start := time.Now()
+	_, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "true"}})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("StartProcess on a deleting environment: code %v (%v), want NotFound", status.Code(err), err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %s to report; the wake budget must not apply", elapsed)
+	}
+}
+
+// Wake is the wait of a guest call without the call: it returns once a
+// suspended environment's guest answers, fails at once for a crashed or
+// deleting one, and ends with its context. The port proxy holds a request on
+// it (X-Env-Wake-Wait).
+func TestWake(t *testing.T) {
+	te := newFullTestEnv(t)
+	registerGuest(t, te, "wake-only")
+	te.control.SetState("wake-only", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		te.control.SetState("wake-only", ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	}()
+	start := time.Now()
+	if err := te.srv.Wake(context.Background(), apiservice.DefaultAtespace, "wake-only"); err != nil {
+		t.Fatalf("Wake of a suspended environment: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
+		t.Errorf("Wake returned after %s, before the environment was running", elapsed)
+	}
+
+	for _, tc := range []struct {
+		state ateapipb.ActorState
+		code  codes.Code
+	}{
+		{ateapipb.ActorState_ACTOR_STATE_CRASHED, codes.FailedPrecondition},
+		{ateapipb.ActorState_ACTOR_STATE_DELETING, codes.NotFound},
+	} {
+		te.control.SetState("wake-only", tc.state)
+		start = time.Now()
+		if err := te.srv.Wake(context.Background(), apiservice.DefaultAtespace, "wake-only"); status.Code(err) != tc.code {
+			t.Errorf("Wake in %s: code %v (%v), want %v", tc.state, status.Code(err), err, tc.code)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("Wake in %s took %s to fail; the wake budget must not apply", tc.state, elapsed)
+		}
+	}
+
+	te.control.SetState("wake-only", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start = time.Now()
+	if err := te.srv.Wake(ctx, apiservice.DefaultAtespace, "wake-only"); status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("Wake past its context: code %v (%v), want DeadlineExceeded", status.Code(err), err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("Wake ended %s after a 300 ms context", elapsed)
+	}
+}
+
+// An environment that stays suspended past the wake budget fails with
+// Unavailable, naming the state and the attempt count.
+func TestGuestCallFailsWhenWakeBudgetExpires(t *testing.T) {
+	te := newFullTestEnv(t)
+	envCtx := registerGuest(t, te, "budget-test")
+	te.control.SetState("budget-test", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	te.srv.WakeBudget = 1500 * time.Millisecond
+
+	start := time.Now()
+	_, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "true"}})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code %v (%v), want Unavailable", status.Code(err), err)
+	}
+	if msg := status.Convert(err).Message(); !strings.Contains(msg, "did not answer within") || !strings.Contains(msg, "SUSPENDED") {
+		t.Errorf("message %q should name the budget and the state", msg)
+	}
+	if elapsed := time.Since(start); elapsed < 1400*time.Millisecond || elapsed > 6*time.Second {
+		t.Errorf("gave up after %s, want about the 1.5 s budget", elapsed)
+	}
+}
+
+// An environment the control plane reports RUNNING, whose guest the router
+// still cannot reach, fails after the shorter running budget rather than
+// holding the call for the full wake budget.
+func TestGuestCallCapsWaitWhenRunning(t *testing.T) {
+	te := newFullTestEnv(t)
+	envCtx := registerGuest(t, te, "running-test")
+	te.control.SetState("running-test", ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	te.router.Running = func(string) bool { return false } // path down: 503 regardless of state
+	te.srv.WakeBudget = time.Minute
+	te.srv.WakeRunningBudget = time.Second
+
+	start := time.Now()
+	_, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "true"}})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code %v (%v), want Unavailable", status.Code(err), err)
+	}
+	if msg := status.Convert(err).Message(); !strings.Contains(msg, "RUNNING") {
+		t.Errorf("message %q should name the RUNNING state", msg)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("waited %s; the running budget (1 s) must apply, not the wake budget (1 min)", elapsed)
+	}
+}
+
+// A wake whose suspended phase outlasts the running budget must still get
+// the running budget once the actor is RUNNING: the guest listens a moment
+// after the state flips.
+func TestGuestCallRunningBudgetStartsAtRunning(t *testing.T) {
+	te := newFullTestEnv(t)
+	envCtx := registerGuest(t, te, "late-running-test")
+	te.control.SetState("late-running-test", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	te.srv.WakeBudget = time.Minute
+	te.srv.WakeRunningBudget = 3 * time.Second
+
+	start := time.Now()
+	flip := start.Add(2500 * time.Millisecond)   // the control plane reports RUNNING; the next attempt is at ~3.0 s
+	listen := start.Add(4500 * time.Millisecond) // the guest answers 2 s later, inside the 3 s running budget
+	te.router.Running = func(string) bool { return time.Now().After(listen) }
+	go func() {
+		time.Sleep(time.Until(flip))
+		te.control.SetState("late-running-test", ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	}()
+
+	_, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "true"}})
+	if err != nil {
+		t.Fatalf("StartProcess after a 2.5 s suspended phase and a 2 s listen lag: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 4400*time.Millisecond {
+		t.Errorf("call returned after %s, before the guest was listening", elapsed)
+	}
+}

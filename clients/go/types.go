@@ -1,0 +1,78 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package env
+
+import "time"
+
+// chunkSize is the maximum payload per streamed message.
+const chunkSize = 64 * 1024
+
+// ShellRequest describes a shell command line to run inside an env.
+type ShellRequest struct {
+	// Command is the shell command line to run inside the environment.
+	Command string `json:"command"`
+
+	// Env holds additional environment variables set for the process, on
+	// top of the guest daemon's environment.
+	Env map[string]string `json:"env,omitempty"`
+
+	// Cwd is the working directory for the process. Defaults to the guest
+	// daemon's working directory.
+	Cwd string `json:"cwd,omitempty"`
+
+	// Stdin is fed to the process's standard input, then stdin is closed.
+	// Nil leaves stdin empty. It is base64-encoded in JSON.
+	Stdin []byte `json:"stdin,omitempty"`
+
+	// Timeout kills the command with SIGKILL after this duration. Zero uses
+	// the guest default.
+	Timeout time.Duration `json:"timeout,omitempty"`
+
+	// Poll runs the command without holding a stream open while it runs:
+	// Run starts the process, polls its state with short calls (50 ms at
+	// first, doubling to 2 s), and reads its output in one call once it has
+	// exited. Use it for commands that can outlive the router's route
+	// timeout (five minutes by default). Ten consecutive Unavailable or
+	// DeadlineExceeded polls are tolerated; the eleventh fails the Run. If
+	// Run returns before the process has exited (ctx ends, a poll fails),
+	// it kills the process. False streams the output while the process
+	// runs.
+	Poll bool `json:"poll,omitempty"`
+}
+
+// ShellResponse is the outcome of a ShellRequest.
+type ShellResponse struct {
+	// Stdout and Stderr hold the captured output.
+	Stdout string `json:"stdout"`
+	Stderr string `json:"stderr"`
+
+	// ExitCode is the process exit code, or 128 + signal number if the
+	// process was killed by a signal (e.g. 137 for SIGKILL).
+	ExitCode int `json:"exit_code"`
+
+	// Duration is the time from the start request to the process's exit,
+	// as the client measured it. With Poll it also holds the time until the
+	// poll that saw the exit, at most one poll interval (2 s), and not the
+	// read of the output after it.
+	Duration time.Duration `json:"duration"`
+
+	// TimedOut reports that the guest killed the process because Timeout,
+	// or the guest's default timeout, elapsed. It is the guest's
+	// Process.timed_out. A guest that predates that field does not report
+	// it; then TimedOut falls back to a heuristic, the Python client's: exit
+	// code 137 and a Duration of at least a nonzero Timeout, which also
+	// reads another SIGKILL that late (the OOM killer, for one) as a timeout.
+	TimedOut bool `json:"timed_out"`
+}

@@ -1,0 +1,536 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import threading
+import time
+from contextlib import nullcontext
+from dataclasses import dataclass, field
+from typing import Any
+
+from .backend.base import BackendDriver
+from .errors import CommandExecutionError, CommandTimeoutError
+from .runtime.base import RuntimeGuestHook
+from .telemetry import metrics
+from .telemetry.trace_recorder import (
+    annotate_span,
+    in_handle_span,
+    normalize_command_list,
+)
+from .telemetry.tracing import (
+    CLIENT_SPAN_PREFIX,
+    executable_attr,
+    mark_error,
+    set_attributes,
+    start_span,
+)
+from .types import DataPlaneEndpoint, ExecResult, Task
+
+
+@dataclass
+class SandboxHandle:
+    """Unified handle to a claimed sandbox bound to a specific task.
+
+    Provides high-level command execution, file operations,
+    and release/recycling through the fleet.
+
+    ``data_plane`` holds this sandbox's own connection coordinates (address
+    plus routing headers) for harnesses that talk to the sandbox
+    directly; it is None for the mock backend.
+
+    ``tracer`` (set by the fleet when tracing is on) wraps exec and file
+    operations in ``ate_env_client.exec`` / ``.write_file`` / ``.read_file``
+    spans. Each carries ``ate.actor.name`` and ``ate_env.run_id``, so one
+    run's step-level spans are selectable without walking parents. The first
+    exec on a handle also carries ``ate_env.first_command=true``: it holds the
+    wake and readiness wait, and ends the time-to-first-command window that
+    starts with ``ate_env_client.acquire``.
+    """
+
+    sandbox_id: str
+    endpoint: str
+    task: Task
+    run_id: str
+    backend: BackendDriver = field(repr=False)
+    runtime: RuntimeGuestHook = field(repr=False)
+    data_plane: DataPlaneEndpoint | None = None
+    default_timeout_s: float = 120.0
+    tracer: Any = field(default=None, repr=False, compare=False)
+    claim_source: str = field(default="direct", repr=False, compare=False)
+    _acquired_at: float = field(default_factory=time.monotonic, init=False, repr=False, compare=False)
+    # When the caller asked the fleet for a sandbox (before any slot wait).
+    # None for a handle built outside a fleet: no ttfi sample then, rather
+    # than one that merely repeats ready_to_first_command.
+    _acquire_started_at: float | None = field(default=None, repr=False, compare=False)
+    _first_command_started: bool = field(default=False, init=False, repr=False, compare=False)
+    _on_release: Any = field(default=None, repr=False, compare=False)
+    # _released: a release or recycle succeeded. _releasing: one is running.
+    _released: bool = field(default=False, init=False, repr=False, compare=False)
+    _releasing: bool = field(default=False, init=False, repr=False, compare=False)
+    _release_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+
+    # Commands that grade a task when the caller passes no ``phase``: the
+    # SWE-bench / R2E graders. ``exec(..., phase="grade")`` is the explicit
+    # signal; other harnesses should use it rather than extend this list.
+    DEFAULT_GRADE_COMMAND_MARKERS: tuple[str, ...] = ("run_tests.sh", "/eval.sh")
+
+    @classmethod
+    def _is_grade_command(cls, command: str | list[str]) -> bool:
+        parts = [command] if isinstance(command, str) else [str(c) for c in command]
+        return any(m in p for p in parts for m in cls.DEFAULT_GRADE_COMMAND_MARKERS)
+
+    def _exec_phase(self, command: str | list[str], phase: str | None) -> str | None:
+        if phase is not None:
+            return phase or None
+        return "grade" if self._is_grade_command(command) else None
+
+    def _span_ids(self) -> dict[str, Any]:
+        return {
+            "ate.actor.name": self.sandbox_id,
+            # The runtime's atespace, when it has one (the Substrate runtime);
+            # the Go client records it on its exec and file spans too.
+            "ate.atespace": getattr(self.runtime, "atespace", None) or None,
+            "ate_env.run_id": self.run_id or None,
+        }
+
+    def _note_first_command(self) -> bool:
+        """Mark the first command and record its wait metrics.
+
+        ``ttfi`` (time to first instruction) runs from the ask for a sandbox
+        to the moment the first command is issued. The boot or wake wait that
+        ate-env-api performs inside that first call is not visible here, so
+        ``ttfi`` understates the time until the instruction actually runs by
+        up to the first command's round trip; the server's
+        ``ate_env_api_create_to_ready_seconds`` sizes that wait.
+        """
+        first = not self._first_command_started
+        if first:
+            self._first_command_started = True
+            now = time.monotonic()
+            metrics.observe_subphase(
+                "ready_to_first_command",
+                max(0.0, now - self._acquired_at),
+                status="ok",
+                source=self.claim_source,
+            )
+            if self._acquire_started_at is not None:
+                metrics.observe_subphase(
+                    "ttfi",
+                    max(0.0, now - self._acquire_started_at),
+                    status="ok",
+                    source=self.claim_source,
+                )
+        return first
+
+    @staticmethod
+    def _exec_status(res: ExecResult, check: bool) -> str:
+        # A timeout is an error whatever ``check`` says; a non-zero exit is
+        # one only when the caller asked for it to be.
+        if res.timed_out or (check and res.exit_code != 0):
+            return "error"
+        return "ok"
+
+    def _record_exec_phases(self, phase: str | None, started: float, status: str) -> None:
+        if phase == "grade":
+            metrics.observe_subphase(
+                "grade", max(0.0, time.monotonic() - started), status=status, source=self.claim_source
+            )
+
+    def _raise_for_result(self, command: str | list[str], res: ExecResult, to_s: float, check: bool) -> None:
+        if check and res.timed_out:
+            raise CommandTimeoutError(
+                f"Command '{command}' timed out after {to_s:g}s:\n"
+                f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}",
+                result=res,
+            )
+        if check and res.exit_code != 0:
+            raise CommandExecutionError(
+                f"Command '{command}' failed with exit code {res.exit_code}:\n"
+                f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}",
+                result=res,
+            )
+
+    def _exec_span(self, command: str | list[str], *, first: bool) -> Any:
+        if not self.tracer:
+            return nullcontext()
+        return start_span(
+            self.tracer,
+            f"{CLIENT_SPAN_PREFIX}.exec",
+            {
+                **self._span_ids(),
+                "ate_env.command.executable": executable_attr(command),
+                "ate_env.first_command": True if first else None,
+            },
+        )
+
+    def _file_span(self, op: str, path: str, content: bytes | str | None = None) -> Any:
+        if not self.tracer:
+            return nullcontext()
+        return start_span(
+            self.tracer,
+            f"{CLIENT_SPAN_PREFIX}.{op}",
+            {
+                **self._span_ids(),
+                "ate_env.file.path": path,
+                "ate_env.file.size": None if content is None else _size(content),
+            },
+        )
+
+    @staticmethod
+    def _exec_result_attrs(span: Any, res: ExecResult, check: bool) -> None:
+        set_attributes(
+            span, {"ate_env.exit_code": res.exit_code, "ate_env.timed_out": res.timed_out}
+        )
+        annotate_span(span, exit=res.exit_code)
+        # check=True raises after the span closes; mark it failed here so the
+        # trace agrees with the caller. Only the exit state is recorded.
+        if check and res.timed_out:
+            mark_error(span, "command timed out")
+            annotate_span(span, ok=False, err="command timed out")
+        elif check and res.exit_code != 0:
+            mark_error(span, f"command exited with code {res.exit_code}")
+            annotate_span(span, ok=False, err=f"command exited with code {res.exit_code}")
+
+    def exec(
+        self,
+        command: str | list[str],
+        cwd: str = "",
+        env: dict[str, str] | None = None,
+        timeout_s: float | None = None,
+        check: bool = True,
+        phase: str | None = None,
+    ) -> ExecResult:
+        """Execute command inside the sandbox.
+
+        If check=True, raises CommandExecutionError on non-zero exit code
+        (CommandTimeoutError if the command hit its deadline).
+        Infrastructure failures always raise InfrastructureError, regardless
+        of ``check``.
+        ``phase`` names what the command is for in the benchmark metrics:
+        ``"grade"`` records it in ``ate_env_client_grade_seconds`` as well as
+        in the exec family. Unset, commands matching
+        ``DEFAULT_GRADE_COMMAND_MARKERS`` count as grading; ``""`` opts out.
+        Returns ExecResult.
+        """
+        first = self._note_first_command()
+        to_s = self.default_timeout_s if timeout_s is None else timeout_s
+        exec_phase = self._exec_phase(command, phase)
+        token = in_handle_span.set(True)
+        cmd_t0 = time.monotonic()
+        status = "ok"
+        try:
+            with self._exec_span(command, first=first) as span, metrics.timed("exec"):
+                annotate_span(
+                    span,
+                    op="exec",
+                    env=self.sandbox_id,
+                    command=normalize_command_list(command, is_shell=True),
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                    phase=exec_phase,
+                )
+                res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
+                status = self._exec_status(res, check)
+                self._exec_result_attrs(span, res, check)
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            in_handle_span.reset(token)
+            self._record_exec_phases(exec_phase, cmd_t0, status)
+        self._raise_for_result(command, res, to_s, check)
+        return res
+
+    async def exec_async(
+        self,
+        command: str | list[str],
+        cwd: str = "",
+        env: dict[str, str] | None = None,
+        timeout_s: float | None = None,
+        check: bool = True,
+        phase: str | None = None,
+    ) -> ExecResult:
+        """Asynchronously execute command inside the sandbox; see ``exec``."""
+        first = self._note_first_command()
+        to_s = self.default_timeout_s if timeout_s is None else timeout_s
+        exec_phase = self._exec_phase(command, phase)
+        token = in_handle_span.set(True)
+        cmd_t0 = time.monotonic()
+        status = "ok"
+        try:
+            with self._exec_span(command, first=first) as span, metrics.timed("exec"):
+                annotate_span(
+                    span,
+                    op="exec",
+                    env=self.sandbox_id,
+                    command=normalize_command_list(command, is_shell=True),
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                    phase=exec_phase,
+                )
+                res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
+                status = self._exec_status(res, check)
+                self._exec_result_attrs(span, res, check)
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            in_handle_span.reset(token)
+            self._record_exec_phases(exec_phase, cmd_t0, status)
+        self._raise_for_result(command, res, to_s, check)
+        return res
+
+    def write_file(self, path: str, content: bytes | str) -> None:
+        """Write file content directly into sandbox filesystem."""
+        token = in_handle_span.set(True)
+        t0 = time.monotonic()
+        status = "ok"
+        try:
+            with self._file_span("write_file", path, content) as span:
+                annotate_span(
+                    span,
+                    op="write_file",
+                    env=self.sandbox_id,
+                    path=path,
+                    bytes=_size(content),
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                self.runtime.write_file(path, content)
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            metrics.observe_subphase(
+                "write_file",
+                max(0.0, time.monotonic() - t0),
+                status=status,
+                source=self.claim_source,
+            )
+            in_handle_span.reset(token)
+
+    async def write_file_async(self, path: str, content: bytes | str) -> None:
+        """Asynchronously write file content directly into sandbox filesystem."""
+        token = in_handle_span.set(True)
+        t0 = time.monotonic()
+        status = "ok"
+        try:
+            with self._file_span("write_file", path, content) as span:
+                annotate_span(
+                    span,
+                    op="write_file",
+                    env=self.sandbox_id,
+                    path=path,
+                    bytes=_size(content),
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                await self.runtime.write_file_async(path, content)
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            metrics.observe_subphase(
+                "write_file",
+                max(0.0, time.monotonic() - t0),
+                status=status,
+                source=self.claim_source,
+            )
+            in_handle_span.reset(token)
+
+    def read_file_bytes(self, path: str) -> bytes:
+        """Read binary file content from sandbox filesystem."""
+        token = in_handle_span.set(True)
+        t0 = time.monotonic()
+        status = "ok"
+        try:
+            with self._file_span("read_file", path) as span:
+                annotate_span(
+                    span,
+                    op="read_file",
+                    env=self.sandbox_id,
+                    path=path,
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                data = self.runtime.read_file_bytes(path)
+                set_attributes(span, {"ate_env.file.size": len(data)})
+                annotate_span(span, bytes=len(data))
+                return data
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            metrics.observe_subphase(
+                "read_file",
+                max(0.0, time.monotonic() - t0),
+                status=status,
+                source=self.claim_source,
+            )
+            in_handle_span.reset(token)
+
+    async def read_file_bytes_async(self, path: str) -> bytes:
+        """Asynchronously read binary file content from sandbox filesystem."""
+        token = in_handle_span.set(True)
+        t0 = time.monotonic()
+        status = "ok"
+        try:
+            with self._file_span("read_file", path) as span:
+                annotate_span(
+                    span,
+                    op="read_file",
+                    env=self.sandbox_id,
+                    path=path,
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                data = await self.runtime.read_file_bytes_async(path)
+                set_attributes(span, {"ate_env.file.size": len(data)})
+                annotate_span(span, bytes=len(data))
+                return data
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            metrics.observe_subphase(
+                "read_file",
+                max(0.0, time.monotonic() - t0),
+                status=status,
+                source=self.claim_source,
+            )
+            in_handle_span.reset(token)
+
+    def initialize(
+        self,
+        init_script: str | None = None,
+        cwd: str = "",
+        timeout_s: float = 120.0,
+    ) -> ExecResult:
+        """Run post-boot initialization script inside the guest container."""
+        return self.runtime.initialize(init_script=init_script, cwd=cwd, timeout_s=timeout_s)
+
+    def _begin_release(self) -> bool:
+        """Claim the release: False when it is done or another caller runs it."""
+        with self._release_lock:
+            if self._released or self._releasing:
+                return False
+            self._releasing = True
+            return True
+
+    def _end_release(self, ok: bool) -> None:
+        """Mark the handle released only when the backend call succeeded, so
+        a failed, interrupted or cancelled release can run again."""
+        with self._release_lock:
+            self._releasing = False
+            self._released = ok
+        if ok and self._on_release:
+            self._on_release(self)
+
+    def _release_started(self) -> bool:
+        return self._released or self._releasing
+
+    def _release_sync(self, recycle: bool) -> bool:
+        """Release or recycle once; returns whether this call did it."""
+        if not self._begin_release():
+            return False
+        ok = False
+        try:
+            try:
+                self.backend.release(self.sandbox_id, recycle=recycle)
+                ok = True
+            finally:
+                self.runtime.close()
+        finally:
+            self._end_release(ok)
+        return True
+
+    async def _release_async(self, recycle: bool) -> bool:
+        """Release or recycle once; returns whether this call did it."""
+        if not self._begin_release():
+            return False
+        ok = False
+        try:
+            try:
+                if hasattr(self.backend, "release_async"):
+                    await self.backend.release_async(self.sandbox_id, recycle=recycle)
+                else:
+                    self.backend.release(self.sandbox_id, recycle=recycle)
+                ok = True
+            finally:
+                if hasattr(self.runtime, "close_async"):
+                    await self.runtime.close_async()
+                else:
+                    self.runtime.close()
+        finally:
+            self._end_release(ok)
+        return True
+
+    def release(self) -> None:
+        """Release this sandbox back to the backend or terminate it.
+
+        After a release or recycle that succeeded, a call does nothing; so does
+        a call while another caller releases the handle. A release that failed
+        or was interrupted can be called again."""
+        self._release_sync(recycle=False)
+
+    async def release_async(self) -> None:
+        """Asynchronously release this sandbox back to the backend or terminate it.
+
+        Runs once per handle, as ``release`` does."""
+        await self._release_async(recycle=False)
+
+    def recycle(self) -> None:
+        """Return sandbox to warm pool.
+
+        Note: This suspends the actor and places it back in the pool without
+        resetting filesystem or process state. The next claim will receive
+        the actor in the state left by the previous workload.
+
+        Runs once per handle, as ``release`` does.
+        """
+        self._release_sync(recycle=True)
+
+    async def recycle_async(self) -> None:
+        """Asynchronously return sandbox to warm pool.
+
+        Note: This suspends the actor and places it back in the pool without
+        resetting filesystem or process state. The next claim will receive
+        the actor in the state left by the previous workload.
+
+        Runs once per handle, as ``release`` does.
+        """
+        await self._release_async(recycle=True)
+
+    def __enter__(self) -> SandboxHandle:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.release()
+
+    async def __aenter__(self) -> SandboxHandle:
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.release_async()
+
+
+def _size(content: bytes | str) -> int:
+    return len(content.encode("utf-8")) if isinstance(content, str) else len(content)
