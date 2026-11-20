@@ -1,0 +1,214 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Async Python client for the Agent Substrate Environment API (ate-env-api).
+
+Quickstart:
+
+    import asyncio
+    from ate_env_rl import Client
+
+    async def main():
+        client = Client("localhost:7777")
+        try:
+            env = await client.create("dev1")
+            result = await env.shell("echo hello")
+            print(result.stdout)
+            await env.delete()
+        finally:
+            await client.close()
+
+    asyncio.run(main())
+"""
+
+# Layer 1: Core Client & Env
+# Layer 2: High-Level Fleet Management & Abstractions
+# Layer 3: Benchmark & RL Task Adapters
+from .adapters import BenchmarkAdapter, EvalResult, SweBenchAdapter
+from .async_fleet import AsyncSandboxFleet
+from .client import DEFAULT_ATESPACE, Client
+from .config import FleetConfig, ObservabilityConfig, TracerConfig
+from .env import Env, Process
+
+# Exceptions
+from .errors import (
+    CommandExecutionError,
+    CommandStartError,
+    CommandTimeoutError,
+    EnvError,
+    FailedPreconditionError,
+    InfrastructureError,
+    InvalidArgumentError,
+    NotFoundError,
+    PermissionDeniedError,
+    PreflightError,
+    ProcessExitedError,
+    RpcError,
+    SandboxProtocolError,
+    SandboxStartError,
+    SandboxUnavailableError,
+    map_rpc_error,
+)
+from .exceptions import SandboxError
+from .fleet import SandboxFleet
+from .handle import SandboxHandle
+from .lookahead import LookaheadWarmer, WarmReport
+from .observability import Observer, RunReport
+from .preflight import (
+    ImagePlacement,
+    PlacementEntry,
+    PreflightCoverage,
+    PreflightWarmer,
+)
+from .sources import (
+    DEFAULT_ID_FIELDS,
+    DEFAULT_IMAGE_FIELDS,
+    DEFAULT_SWEBENCH_DATASET,
+    FieldSpec,
+    ImageListSource,
+    JsonlSource,
+    ListSource,
+    SweBenchSource,
+    TaskSource,
+    extract_image,
+    load_image_list,
+    read_bytes,
+    row_to_task,
+    to_tasks,
+)
+
+# Types
+from .types import (
+    DataPlaneEndpoint,
+    EnvironmentInfo,
+    EnvironmentPage,
+    EnvironmentSpec,
+    EnvironmentStatus,
+    ExecResult,
+    FleetPlan,
+    GoldenSnapshotState,
+    ImageStatus,
+    PlacementDomain,
+    PlacementSpec,
+    PlanEntry,
+    PoolReadiness,
+    PreflightCheck,
+    PreflightReport,
+    ProcessInfo,
+    ProcessOutput,
+    ProcessState,
+    RawSandboxInstance,
+    ResourceLimits,
+    ServerInfo,
+    ShellResult,
+    Signal,
+    SuspendMode,
+    Task,
+    TeardownReport,
+    Template,
+    WarmImageCoverage,
+    WarmProbe,
+)
+
+__all__ = [
+    # Low-level API
+    "Client",
+    "DEFAULT_ATESPACE",
+    "Env",
+    "Process",
+    # High-level Fleet API
+    "FleetConfig",
+    "SandboxFleet",
+    "AsyncSandboxFleet",
+    "SandboxHandle",
+    "LookaheadWarmer",
+    "WarmReport",
+    "PreflightWarmer",
+    "PreflightCoverage",
+    "ImagePlacement",
+    "PlacementEntry",
+    # Task sources
+    "TaskSource",
+    "ListSource",
+    "JsonlSource",
+    "ImageListSource",
+    "SweBenchSource",
+    "DEFAULT_SWEBENCH_DATASET",
+    "DEFAULT_IMAGE_FIELDS",
+    "DEFAULT_ID_FIELDS",
+    "FieldSpec",
+    "extract_image",
+    "load_image_list",
+    "read_bytes",
+    "row_to_task",
+    "to_tasks",
+    # Telemetry
+    "TracerConfig",
+    "ObservabilityConfig",
+    "Observer",
+    "RunReport",
+    # Benchmark Adapters
+    "BenchmarkAdapter",
+    "EvalResult",
+    "SweBenchAdapter",
+    # Low-level Errors
+    "EnvError",
+    "FailedPreconditionError",
+    "InvalidArgumentError",
+    "NotFoundError",
+    "PermissionDeniedError",
+    "ProcessExitedError",
+    "RpcError",
+    "map_rpc_error",
+    # Fleet / Execution Exceptions
+    "SandboxError",
+    "CommandExecutionError",
+    "CommandStartError",
+    "CommandTimeoutError",
+    "InfrastructureError",
+    "PreflightError",
+    "SandboxProtocolError",
+    "SandboxStartError",
+    "SandboxUnavailableError",
+    # Types
+    "EnvironmentInfo",
+    "EnvironmentPage",
+    "EnvironmentStatus",
+    "SuspendMode",
+    "ProcessInfo",
+    "ProcessOutput",
+    "ProcessState",
+    "GoldenSnapshotState",
+    "ImageStatus",
+    "PlacementDomain",
+    "PreflightCheck",
+    "PreflightReport",
+    "PoolReadiness",
+    "WarmImageCoverage",
+    "WarmProbe",
+    "ServerInfo",
+    "ShellResult",
+    "Signal",
+    "Template",
+    "ResourceLimits",
+    "PlacementSpec",
+    "EnvironmentSpec",
+    "Task",
+    "TeardownReport",
+    "ExecResult",
+    "DataPlaneEndpoint",
+    "RawSandboxInstance",
+    "PlanEntry",
+    "FleetPlan",
+]

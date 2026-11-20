@@ -1,0 +1,32 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Image-delivery workload: byte-compile every Python file under COMPILE_DIR
+# with PYTHON (-set to change; the defaults fit a SWE-bench image), which
+# reads each one and writes next to it. compileall's own exit code is ignored
+# because test fixtures with syntax errors are common; the step passes when
+# at least one .pyc is newer than a mark taken as the step starts, so in
+# steps mode each step's compile is judged on its own. Probe first, see
+# workload-file-read.
+name: workload-compile
+steps:
+  - name: probe
+    run: "true"
+  - name: compile
+    run: >-
+      touch /tmp/.compile-mark &&
+      { {{var "PYTHON" "python3"}} -m compileall -f -q {{var "COMPILE_DIR" "/testbed"}} >/dev/null 2>&1 || true; } &&
+      test -n "$(find {{var "COMPILE_DIR" "/testbed"}} -xdev -name '*.pyc' -newer /tmp/.compile-mark 2>/dev/null | head -n 1)"
+    timeout: 20m
+    reward: true

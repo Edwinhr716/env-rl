@@ -1,0 +1,444 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package swebench
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+)
+
+// DefaultKind is assumed when a dataset manifest row omits "kind", so existing
+// SWE-bench manifests load without modification.
+const DefaultKind = "swebench"
+
+// Grader parses the stdout/stderr of a trajectory's reward step into a 0/1
+// reward and a human-readable detail/verdict string (for example
+// "f2p 1/1 p2p 3/4" or "invalid run"). When Parse returns a non-nil error or
+// a nil reward, the runner falls back to grading by process exit code.
+type Grader interface {
+	Parse(stdout []byte) (reward *int, detail string, err error)
+}
+
+// InstanceGrader is an optional extension implemented by dataset adapters whose
+// grading depends on per-instance expectations (such as expected_stdout or
+// expected_exit_code) in addition to the process Result.
+type InstanceGrader interface {
+	GradeInstance(in Instance, res Result) (reward *int, detail string, err error)
+}
+
+// Adapter plugs a dataset kind (such as "swebench" or a trace-replayed dataset)
+// into the benchmark runner and reporter.
+type Adapter interface {
+	// Kind returns the dataset identifier matched against Instance.Kind.
+	Kind() string
+	// Validate checks any dataset-specific invariants on in.
+	Validate(in Instance) error
+	// RequireGrading checks that in carries the material needed by a grading
+	// trajectory.
+	RequireGrading(in Instance) error
+	// TemplateData decodes in into the value passed to text/template when
+	// rendering a trajectory.
+	TemplateData(in Instance) (any, error)
+	// Grades reports whether t references grading material specific to this
+	// dataset kind.
+	Grades(t *Trajectory) bool
+	// Grader returns the output parser for reward steps of this dataset kind,
+	// or nil when exit code alone decides the reward.
+	Grader() Grader
+}
+
+var (
+	adaptersMu sync.RWMutex
+	adapters   = map[string]Adapter{}
+)
+
+// RegisterAdapter registers a dataset adapter by its Kind().
+func RegisterAdapter(a Adapter) {
+	k := a.Kind()
+	adaptersMu.Lock()
+	defer adaptersMu.Unlock()
+	adapters[k] = a
+}
+
+func unregisterAdapter(kind string) {
+	adaptersMu.Lock()
+	defer adaptersMu.Unlock()
+	delete(adapters, kind)
+}
+
+// AdapterFor returns the registered adapter for kind (defaulting an empty kind
+// to DefaultKind), or nil if none is registered.
+func AdapterFor(kind string) Adapter {
+	if kind == "" {
+		kind = DefaultKind
+	}
+	adaptersMu.RLock()
+	defer adaptersMu.RUnlock()
+	return adapters[kind]
+}
+
+func init() {
+	RegisterAdapter(SWEBenchAdapter{})
+	RegisterAdapter(CommandAdapter{})
+}
+
+// errNoVerdict indicates that a reward step's output did not end with a
+// swebench-grade.py JSON line.
+var errNoVerdict = errors.New("no swebench grader JSON in output")
+
+// SWEBenchGrader parses swebench-grade.py JSON lines
+// ({"valid","resolved","f2p","p2p"}) into a 0/1 reward and a
+// "f2p A/B p2p C/D" or "invalid run" detail string.
+type SWEBenchGrader struct{}
+
+// Parse implements Grader.
+func (SWEBenchGrader) Parse(stdout []byte) (reward *int, detail string, err error) {
+	s := string(stdout)
+	i := strings.LastIndex(s, `{"valid"`)
+	if i < 0 {
+		return nil, "", errNoVerdict
+	}
+	var g struct {
+		Valid    bool   `json:"valid"`
+		Resolved *bool  `json:"resolved"`
+		F2P      string `json:"f2p"`
+		P2P      string `json:"p2p"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(s[i:])), &g); err != nil {
+		return nil, "", err
+	}
+	if !g.Valid {
+		r := 0
+		return &r, "invalid run", nil
+	}
+	if g.Resolved != nil {
+		r := 0
+		if *g.Resolved {
+			r = 1
+		}
+		reward = &r
+	}
+	return reward, fmt.Sprintf("f2p %s p2p %s", g.F2P, g.P2P), nil
+}
+
+// SWEBenchAdapter is the built-in default Adapter for SWE-bench manifests.
+type SWEBenchAdapter struct{}
+
+// Kind implements Adapter.
+func (SWEBenchAdapter) Kind() string { return DefaultKind }
+
+// Validate implements Adapter.
+func (SWEBenchAdapter) Validate(Instance) error { return nil }
+
+// RequireGrading checks that in carries an eval_script and a log_parser, as
+// required by a grading SWE-bench trajectory.
+func (SWEBenchAdapter) RequireGrading(in Instance) error {
+	switch {
+	case in.EvalScript == "":
+		return fmt.Errorf("%s: eval_script is required by a grading trajectory", in.InstanceID)
+	case in.LogParser == "":
+		return fmt.Errorf("%s: log_parser is required by a grading trajectory", in.InstanceID)
+	}
+	return nil
+}
+
+// TemplateData implements Adapter.
+func (SWEBenchAdapter) TemplateData(in Instance) (any, error) { return in, nil }
+
+// Grades reports whether t references SWE-bench grading material (.EvalScript,
+// .LogParser, or the full instance JSON).
+func (SWEBenchAdapter) Grades(t *Trajectory) bool {
+	for _, steps := range [][]Step{t.Setup, t.Reset, t.Steps} {
+		for _, s := range steps {
+			texts := []string{s.Run}
+			if s.Write != nil {
+				texts = append(texts, s.Write.Content)
+			}
+			for _, text := range texts {
+				if strings.Contains(text, ".EvalScript") || strings.Contains(text, ".LogParser") || strings.Contains(text, "json .}}") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// Grader implements Adapter.
+func (SWEBenchAdapter) Grader() Grader { return SWEBenchGrader{} }
+
+// Instance is one SWE-bench (or custom dataset) task: the digest-pinned task
+// image and the material a trajectory needs to evaluate it. The manifest is
+// produced by benchmarking/swebench/make-dataset.py, one JSON object per line.
+type Instance struct {
+	InstanceID string `json:"instance_id"`
+	Repo       string `json:"repo"`
+	// Image is the task image, pinned by digest (repo@sha256:...). Substrate
+	// requires pinned images because changing the image invalidates snapshots.
+	Image string `json:"image"`
+	// ImageBytesCompressed is the sum of the image's compressed layer sizes
+	// from the registry manifest, as make-dataset.py records it; 0 when it
+	// was not recorded. The unpacked size on a node is about 2 to 2.5 times
+	// this.
+	ImageBytesCompressed int64 `json:"image_bytes_compressed,omitempty"`
+	// Kind identifies the dataset adapter; when omitted in JSON it stays ""
+	// and AdapterFor("") resolves to DefaultKind.
+	Kind string `json:"kind,omitempty"`
+	// Material holds optional raw dataset-specific JSON for non-default
+	// dataset kinds.
+	Material json.RawMessage `json:"material,omitempty"`
+	// Patch is the gold patch; applying it makes FailToPass pass.
+	Patch string `json:"patch"`
+	// TestPatch adds or changes the tests that check the fix.
+	TestPatch string `json:"test_patch"`
+	// EvalScript is the SWE-bench harness eval script for this instance: it
+	// applies TestPatch, runs the repo's test command and restores the test
+	// files. Exit code 0 means every selected test passed.
+	EvalScript string   `json:"eval_script"`
+	FailToPass []string `json:"fail_to_pass"`
+	PassToPass []string `json:"pass_to_pass"`
+	// LogParser names the SWE-bench harness parser for this repo's test
+	// output (parse_log_pytest, parse_log_django, ...); EvalType is
+	// pass_and_fail or fail_only. Both come from the dataset row.
+	LogParser string `json:"log_parser"`
+	EvalType  string `json:"eval_type"`
+}
+
+// UnmarshalJSON decodes a manifest row, preserving raw JSON in Material when a
+// non-default Kind is specified without an explicit "material" sub-object.
+func (in *Instance) UnmarshalJSON(b []byte) error {
+	type plain Instance
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*in = Instance(p)
+	if in.Kind != "" && in.Kind != DefaultKind && (len(in.Material) == 0 || string(in.Material) == "null") {
+		in.Material = append(json.RawMessage(nil), b...)
+	}
+	return nil
+}
+
+var digestPinned = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
+
+// Validate reports the first thing that would make the instance unusable.
+func (in Instance) Validate() error {
+	switch {
+	case in.InstanceID == "":
+		return errors.New("instance_id is required")
+	case in.Image == "":
+		return fmt.Errorf("%s: image is required", in.InstanceID)
+	case !digestPinned.MatchString(in.Image):
+		return fmt.Errorf("%s: image %q is not digest-pinned", in.InstanceID, in.Image)
+	case in.ImageBytesCompressed < 0:
+		return fmt.Errorf("%s: image_bytes_compressed %d must be >= 0", in.InstanceID, in.ImageBytesCompressed)
+	}
+	a := AdapterFor(in.Kind)
+	if a == nil {
+		return fmt.Errorf("%s: no dataset adapter registered for kind %q", in.InstanceID, in.Kind)
+	}
+	return a.Validate(in)
+}
+
+// RequireGrading checks that every instance carries what a grading
+// trajectory needs (an eval script and a log parser for SWE-bench), so a
+// missing field is a configuration error before the run and not a reward of
+// zero after it. When a trajectory is supplied, each instance's adapter
+// decides via Adapter.Grades whether that trajectory requires grading material
+// for that instance's Kind.
+func RequireGrading(instances []Instance, traj ...*Trajectory) error {
+	var t *Trajectory
+	if len(traj) > 0 {
+		t = traj[0]
+	}
+	for _, in := range instances {
+		a := AdapterFor(in.Kind)
+		if a == nil {
+			return fmt.Errorf("%s: no dataset adapter registered for kind %q", in.InstanceID, in.Kind)
+		}
+		if t != nil && !a.Grades(t) {
+			continue
+		}
+		if err := a.RequireGrading(in); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// datasetFetchTimeout bounds a manifest download; a stalled server must not
+// hang the loader before it starts.
+const datasetFetchTimeout = 2 * time.Minute
+
+// LoadDataset reads a JSONL manifest from a local path or an https URL. The
+// manifest carries scripts that run inside the sandboxes, so a remote source
+// must be https.
+func LoadDataset(source string) ([]Instance, error) {
+	var r io.ReadCloser
+	if strings.HasPrefix(source, "http://") {
+		return nil, fmt.Errorf("dataset %s: remote manifests must use https", source)
+	}
+	if strings.HasPrefix(source, "https://") {
+		client := &http.Client{
+			Timeout: datasetFetchTimeout,
+			// The https rule holds for each hop: a redirect to http would
+			// fetch the scripts in clear text.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if req.URL.Scheme != "https" {
+					return fmt.Errorf("redirect to %s: remote manifests must use https", req.URL.Redacted())
+				}
+				if len(via) >= 10 {
+					return errors.New("stopped after 10 redirects")
+				}
+				return nil
+			},
+		}
+		resp, err := client.Get(source)
+		if err != nil {
+			return nil, fmt.Errorf("fetch dataset: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("fetch dataset: HTTP %d", resp.StatusCode)
+		}
+		r = resp.Body
+	} else {
+		f, err := os.Open(source)
+		if err != nil {
+			return nil, fmt.Errorf("open dataset: %w", err)
+		}
+		r = f
+	}
+	defer r.Close()
+	return ParseDataset(r)
+}
+
+// ParseDataset decodes a JSONL manifest. Blank lines are skipped; every
+// record must validate and instance ids must be unique.
+func ParseDataset(r io.Reader) ([]Instance, error) {
+	sc := bufio.NewScanner(r)
+	// Eval scripts and patches run to hundreds of KiB for some repos.
+	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	var out []Instance
+	seen := map[string]bool{}
+	line := 0
+	for sc.Scan() {
+		line++
+		b := bytes.TrimSpace(sc.Bytes())
+		if len(b) == 0 {
+			continue
+		}
+		var in Instance
+		if err := json.Unmarshal(b, &in); err != nil {
+			return nil, fmt.Errorf("dataset line %d: %w", line, err)
+		}
+		if err := in.Validate(); err != nil {
+			return nil, fmt.Errorf("dataset line %d: %w", line, err)
+		}
+		if seen[in.InstanceID] {
+			return nil, fmt.Errorf("dataset line %d: duplicate instance %s", line, in.InstanceID)
+		}
+		seen[in.InstanceID] = true
+		out = append(out, in)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read dataset: %w", err)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("dataset is empty")
+	}
+	return out, nil
+}
+
+// Select narrows a dataset: exclude drops the named instances first (a
+// known-bad list; unknown names are ignored), ids then keeps only the named
+// instances (in manifest order) and errors on an unknown or excluded id, and
+// limit > 0 keeps the first limit of what is left.
+func Select(all []Instance, ids, exclude []string, limit int) ([]Instance, error) {
+	out := all
+	drop := map[string]bool{}
+	if len(exclude) > 0 {
+		for _, id := range exclude {
+			drop[id] = true
+		}
+		out = nil
+		for _, in := range all {
+			if !drop[in.InstanceID] {
+				out = append(out, in)
+			}
+		}
+		all = out
+	}
+	if len(ids) > 0 {
+		for _, id := range ids {
+			if drop[id] {
+				return nil, fmt.Errorf("instance %s is on the exclude list", id)
+			}
+		}
+		want := map[string]bool{}
+		for _, id := range ids {
+			want[id] = true
+		}
+		out = nil
+		for _, in := range all {
+			if want[in.InstanceID] {
+				out = append(out, in)
+				delete(want, in.InstanceID)
+			}
+		}
+		if len(want) > 0 {
+			missing := make([]string, 0, len(want))
+			for id := range want {
+				missing = append(missing, id)
+			}
+			return nil, fmt.Errorf("instances not in dataset: %s", strings.Join(missing, ", "))
+		}
+	}
+	if limit > 0 && limit < len(out) {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ReadIDList reads instance ids from a file, one per line. Blank lines and
+// lines starting with '#' are skipped, and anything after the first
+// whitespace on a line is a comment, so a list can say why each id is there.
+func ReadIDList(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var ids []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		ids = append(ids, strings.Fields(line)[0])
+	}
+	return ids, sc.Err()
+}

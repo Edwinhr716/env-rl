@@ -1,0 +1,2238 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"bytes"
+	"io"
+	"reflect"
+	"regexp"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/envstore"
+	"github.com/agent-substrate/env/internal/hostcheck"
+	"github.com/agent-substrate/env/internal/portproxy"
+	"github.com/agent-substrate/env/internal/sidecarenv"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
+)
+
+func testManifestConfig() manifestConfig {
+	return manifestConfig{
+		namespace:   "ate-env",
+		template:    "default-template",
+		workerPool:  "default-template-workerpool",
+		workerImage: "example.com/ateom@sha256:bbbb",
+		apiImage:    "example.com/api@sha256:cccc",
+		replicas:    3,
+		apiReplicas: 1,
+		apiPort:     7777,
+	}
+}
+
+func testTemplateConfig() templateConfig {
+	return templateConfig{
+		template:        "default-template",
+		atespace:        "ate-env",
+		guestImage:      "example.com/guest@sha256:aaaa",
+		snapshotsBucket: "gs://bucket/ate-env/",
+		guestCommand:    []string{"/ko-app/ate-env-guest"},
+	}
+}
+
+func TestManifestConfigResolveImages(t *testing.T) {
+	cfg := testManifestConfig()
+	if err := cfg.resolveImages(); err != nil {
+		t.Errorf("resolveImages with images set: %v", err)
+	}
+	cfg.apiImage = ""
+	if err := cfg.resolveImages(); err == nil {
+		t.Error("resolveImages with a missing api image: want error, got nil")
+	}
+	cfg = testManifestConfig()
+	cfg.workerImage = ""
+	if err := cfg.resolveImages(); err == nil {
+		t.Error("resolveImages with a missing worker image: want error, got nil")
+	}
+}
+
+func TestTemplateConfigResolveImages(t *testing.T) {
+	cfg := testTemplateConfig()
+	if err := cfg.resolveImages(); err != nil {
+		t.Errorf("resolveImages with template images and bucket set: %v", err)
+	}
+	cfg.guestImage = ""
+	if err := cfg.resolveImages(); err == nil {
+		t.Error("resolveImages with a missing guest image: want error, got nil")
+	}
+	cfg = testTemplateConfig()
+	cfg.snapshotsBucket = ""
+	if err := cfg.resolveImages(); err != nil {
+		t.Errorf("resolveImages without a snapshots bucket: %v, want nil (the cluster location applies)", err)
+	}
+}
+
+// Without --snapshots-bucket the template names no storageLocation, so a
+// Substrate without the PerTemplateSnapshotLocation preview gate accepts it
+// and stores its snapshots under the cluster's --snapshot-location.
+func TestTemplateWithoutSnapshotsBucketNamesNoLocation(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.snapshotsBucket = ""
+	template := buildActorTemplate(cfg)
+	if got := template.GetSnapshotConfig().GetStorageLocation(); got != "" {
+		t.Errorf("storageLocation = %q, want empty", got)
+	}
+	if got := template.GetSnapshotConfig().GetPreferredFidelity(); got != ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+		t.Errorf("preferred fidelity = %v, want SNAPSHOT_FIDELITY_MEMORY", got)
+	}
+	var buf bytes.Buffer
+	if err := writeActorTemplate(&buf, template); err != nil {
+		t.Fatalf("writeActorTemplate: %v", err)
+	}
+	if out := buf.String(); strings.Contains(out, "storageLocation") || !strings.Contains(out, "preferredFidelity: SNAPSHOT_FIDELITY_MEMORY") {
+		t.Errorf("rendered template must keep the fidelity and name no storageLocation:\n%s", out)
+	}
+	cmd := newManifestCommand()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"template", "--guest-image=example.com/guest@sha256:aaaa"})
+	if err := cmd.Execute(); err != nil {
+		t.Errorf("manifest template without --snapshots-bucket: %v", err)
+	}
+}
+
+func TestBuildManifests(t *testing.T) {
+	cfg := testManifestConfig()
+	objs := buildManifests(cfg)
+	if len(objs) != 5 {
+		t.Fatalf("got %d manifests, want 5", len(objs))
+	}
+
+	ns := objs[0].(*corev1.Namespace)
+	if ns.Name != "ate-env" {
+		t.Errorf("namespace = %q, want ate-env", ns.Name)
+	}
+	if got := ns.Labels[apiAccessLabel]; got != "true" {
+		t.Errorf("namespace label %s = %q, want \"true\" (ate-system admits API clients by it)", apiAccessLabel, got)
+	}
+
+	pool := objs[1].(*atev1.WorkerPool)
+	if pool.APIVersion != "ate.dev/v1" {
+		t.Errorf("workerpool apiVersion = %q, want ate.dev/v1", pool.APIVersion)
+	}
+	if pool.Namespace != cfg.namespace || pool.Name != "default-template-workerpool" {
+		t.Errorf("workerpool = %s/%s, want %s/default-template-workerpool", pool.Namespace, pool.Name, cfg.namespace)
+	}
+	if pool.Spec.Replicas != 3 || pool.Spec.WorkerImage != cfg.workerImage {
+		t.Errorf("workerpool spec = %+v, want replicas 3 and worker image %q", pool.Spec, cfg.workerImage)
+	}
+	if got := pool.Labels; len(got) != 1 || got[workerPoolLabel] != pool.Name {
+		t.Errorf("workerpool labels = %v, want %s=%s", got, workerPoolLabel, pool.Name)
+	}
+	// The default template selects exactly this pool: Substrate copies the
+	// pool's labels to its workers and matches the template's selector
+	// against them, an AND over equal labels.
+	sel := buildActorTemplate(testTemplateConfig()).GetWorkerSelector().GetMatchLabels()
+	for k, v := range sel {
+		if pool.Labels[k] != v {
+			t.Errorf("template selector %v does not match pool labels %v", sel, pool.Labels)
+		}
+	}
+	if len(sel) == 0 {
+		t.Error("template has no worker selector; it can cold-boot on any pool")
+	}
+	if pool.Spec.Template != nil {
+		t.Errorf("workerpool template = %v, want nil", pool.Spec.Template)
+	}
+	if len(pool.Spec.SandboxClasses) != 1 {
+		t.Fatalf("workerpool sandboxClasses = %+v, want exactly one", pool.Spec.SandboxClasses)
+	}
+	sc := pool.Spec.SandboxClasses[0]
+	if sc.Name != atev1.SandboxClassGvisor || sc.ConfigRef == nil || sc.ConfigRef.Name != sandboxConfigName {
+		t.Errorf("workerpool sandboxClasses[0] = %+v, want gvisor with configRef %q", sc, sandboxConfigName)
+	}
+	sa := objs[2].(*corev1.ServiceAccount)
+	if sa.Name != apiName || sa.Namespace != cfg.namespace || sa.AutomountServiceAccountToken == nil || *sa.AutomountServiceAccountToken {
+		t.Errorf("service account = %s/%s automount %v, want %s/%s with no API token", sa.Namespace, sa.Name, sa.AutomountServiceAccountToken, cfg.namespace, apiName)
+	}
+
+	deployment := objs[3].(*appsv1.Deployment)
+	if pod := deployment.Spec.Template.Spec; pod.ServiceAccountName != apiName {
+		t.Errorf("api pod service account = %q, want %q (the principal the access policy names)", pod.ServiceAccountName, apiName)
+	}
+	containers := deployment.Spec.Template.Spec.Containers
+	if len(containers) != 1 || containers[0].Image != cfg.apiImage {
+		t.Errorf("api containers = %+v, want one container with image %q", containers, cfg.apiImage)
+	}
+	if *deployment.Spec.Replicas != 1 {
+		t.Errorf("api replicas = %d, want 1", *deployment.Spec.Replicas)
+	}
+
+	service := objs[4].(*corev1.Service)
+	if service.Spec.Selector["app"] != apiName {
+		t.Errorf("api service selector = %v, want app=%s", service.Spec.Selector, apiName)
+	}
+	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 7777 || service.Spec.Ports[0].TargetPort.IntValue() != 7777 {
+		t.Errorf("api service ports = %+v, want 7777 -> 7777", service.Spec.Ports)
+	}
+}
+
+func TestBuildActorTemplate(t *testing.T) {
+	cfg := testTemplateConfig()
+	var template *ateapipb.ActorTemplate = buildActorTemplate(cfg)
+
+	if template.GetMetadata().GetName() != "default-template" {
+		t.Errorf("template name = %q, want default-template", template.GetMetadata().GetName())
+	}
+	if template.GetMetadata().GetAtespace() != "ate-env" {
+		t.Errorf("template atespace = %q, want ate-env", template.GetMetadata().GetAtespace())
+	}
+	if len(template.Containers) != 1 || template.Containers[0].Image != cfg.guestImage {
+		t.Errorf("template containers = %+v, want one guest container with image %q",
+			template.Containers, cfg.guestImage)
+	}
+	if template.GetSnapshotConfig().GetStorageLocation() != cfg.snapshotsBucket {
+		t.Errorf("snapshots location = %q, want %q", template.GetSnapshotConfig().GetStorageLocation(), cfg.snapshotsBucket)
+	}
+	if got := template.GetSnapshotConfig().GetPreferredFidelity(); got != ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+		t.Errorf("preferred fidelity = %v, want SNAPSHOT_FIDELITY_MEMORY", got)
+	}
+	if got := template.GetSnapshotConfig().GetGoldenSnapshotConfig(); got != nil {
+		t.Errorf("golden snapshot config = %v, want nil (omitted means enabled)", got)
+	}
+	if got := template.GetWorkerSelector().GetMatchLabels(); len(got) != 1 || got[workerPoolLabel] != "default-template-workerpool" {
+		t.Errorf("worker selector = %v, want %s=default-template-workerpool", got, workerPoolLabel)
+	}
+	probe := template.Containers[0].GetWakeupProbe()
+	if probe.GetHttpGet() == nil || probe.GetHttpGet().GetPath() != "/readyz" || probe.GetHttpGet().GetPort() != 80 {
+		t.Errorf("wakeupProbe = %+v, want HTTP GET /readyz on port 80", probe)
+	}
+	// Without a sidecar readiness URL the template says Substrate's own
+	// default out loud: the API schema marks the field required.
+	if got := probe.GetTimeoutSeconds(); got != 30 {
+		t.Errorf("wakeupProbe.timeoutSeconds = %d, want 30 without --sidecar-readyz", got)
+	}
+	// Substrate rejects an ActorTemplate without both limits (substrate#2285);
+	// since v0.6.0 they are integers: millicores and bytes.
+	if cpu, mem := limits(template); cpu != 2000 || mem != 4<<30 {
+		t.Errorf("resources.limits = %d millicores, %d bytes; want 2000 and %d (the %s / %s defaults)", cpu, mem, 4<<30, defaultActorCPU, defaultActorMemory)
+	}
+}
+
+func limits(tmpl *ateapipb.ActorTemplate) (cpuMillicores, memoryBytes int64) {
+	l := tmpl.GetResources().GetLimits()
+	return l.GetCpuMillicores(), l.GetMemoryBytes()
+}
+
+func TestBuildActorTemplateResources(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.cpu, cfg.memory = "500m", "1Gi"
+	if cpu, mem := limits(buildActorTemplate(cfg)); cpu != 500 || mem != 1<<30 {
+		t.Errorf("resources.limits = %d millicores, %d bytes; want 500 and %d", cpu, mem, 1<<30)
+	}
+}
+
+func TestResourceLimitsRoundUp(t *testing.T) {
+	for _, tc := range []struct {
+		cpu, memory string
+		millicores  int64
+		bytes       int64
+	}{
+		{"1.5", "1.5Gi", 1500, 1610612736},
+		{"999.999", "1G", 999999, 1000000000},
+		{"2", "4Gi", 2000, 4 << 30},
+		// A fraction of a millicore or of a byte rounds up to one; the
+		// flag validation keeps such values out, the conversion stays total.
+		{"100u", "0.5", 1, 1},
+	} {
+		l := resourceLimits(tc.cpu, tc.memory).GetLimits()
+		if l.GetCpuMillicores() != tc.millicores || l.GetMemoryBytes() != tc.bytes {
+			t.Errorf("resourceLimits(%q, %q) = %d millicores, %d bytes; want %d, %d",
+				tc.cpu, tc.memory, l.GetCpuMillicores(), l.GetMemoryBytes(), tc.millicores, tc.bytes)
+		}
+	}
+}
+
+func TestTemplateConfigRejectsBadResources(t *testing.T) {
+	for _, tc := range []struct{ cpu, memory string }{
+		{"two", ""},
+		{"", "4GB!"},
+		{"0", ""},
+		{"", "-1Gi"},
+		// env's bounds: cpu from 1m below 1000 cores, memory from 1Mi to an
+		// int64 byte count. 512m is millibytes, the typo for 512Mi.
+		{"1000", ""},
+		{"1e3", ""},
+		{"999.9991", ""},
+		{"", "9223372036854775808"},
+		{"0.0000000000000000000000000000001", ""},
+		{"100u", ""},
+		{"", "512m"},
+		{"", "512Ki"},
+	} {
+		cfg := testTemplateConfig()
+		cfg.cpu, cfg.memory = tc.cpu, tc.memory
+		if err := cfg.validateResources(); err == nil {
+			t.Errorf("cpu=%q memory=%q: want error, got nil", tc.cpu, tc.memory)
+		}
+	}
+	for _, tc := range []struct{ cpu, memory string }{
+		{"999.999", "9223372036854775807"},
+		{"500m", "8Gi"},
+		{"", ""},
+	} {
+		cfg := testTemplateConfig()
+		cfg.cpu, cfg.memory = tc.cpu, tc.memory
+		if err := cfg.validateResources(); err != nil {
+			t.Errorf("cpu=%q memory=%q: %v, want accepted", tc.cpu, tc.memory, err)
+		}
+	}
+}
+
+func TestManifestTemplateCommandRejectsEmptyResource(t *testing.T) {
+	for _, flag := range []string{"--cpu=", "--memory="} {
+		cmd := newManifestCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs([]string{"template", "--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/", flag})
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "must not be empty") {
+			t.Errorf("%s: got %v, want an error about the empty value", flag, err)
+		}
+	}
+}
+
+func TestBuildManifestsCustomAPIPort(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.apiPort = 9999
+	objs := buildManifests(cfg)
+
+	deployment := objs[3].(*appsv1.Deployment)
+	container := deployment.Spec.Template.Spec.Containers[0]
+	if got := container.Args[1]; got != "0.0.0.0:9999" {
+		t.Errorf("api -listen arg = %q, want 0.0.0.0:9999", got)
+	}
+	if container.Ports[0].ContainerPort != 9999 {
+		t.Errorf("api container port = %d, want 9999", container.Ports[0].ContainerPort)
+	}
+	if got := container.ReadinessProbe.HTTPGet.Port.IntValue(); got != 9999 {
+		t.Errorf("api probe port = %d, want 9999", got)
+	}
+
+	service := objs[4].(*corev1.Service)
+	if service.Spec.Ports[0].Port != 9999 || service.Spec.Ports[0].TargetPort.IntValue() != 9999 {
+		t.Errorf("api service ports = %+v, want 9999 -> 9999", service.Spec.Ports)
+	}
+}
+
+func TestWriteManifests(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeManifests(&buf, buildManifests(testManifestConfig())); err != nil {
+		t.Fatalf("writeManifests: %v", err)
+	}
+	out := buf.String()
+
+	if got := strings.Count(out, "\n---\n"); got != 4 {
+		t.Errorf("got %d document separators, want 4:\n%s", got, out)
+	}
+	for _, want := range []string{
+		"kind: Namespace",
+		"ate.dev/api-access: \"true\"",
+		"kind: WorkerPool",
+		"kind: ServiceAccount",
+		"serviceAccountName: ate-env-api",
+		"kind: Deployment",
+		"kind: Service",
+		"sandboxClasses:",
+		"configRef:",
+		"name: gvisor-default",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "status") {
+		t.Errorf("output should not contain status fields:\n%s", out)
+	}
+	if strings.Contains(out, "{}") {
+		t.Errorf("output should not contain empty map literals ({}):\n%s", out)
+	}
+}
+
+func TestWriteActorTemplate(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeActorTemplate(&buf, buildActorTemplate(testTemplateConfig())); err != nil {
+		t.Fatalf("writeActorTemplate: %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		"name: default-template",
+		"image: example.com/guest@sha256:aaaa",
+		"wakeupProbe:",
+		"snapshotConfig:",
+		"storageLocation: gs://bucket/ate-env/",
+		"preferredFidelity: SNAPSHOT_FIDELITY_MEMORY",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "status") {
+		t.Errorf("output should not contain status fields:\n%s", out)
+	}
+	if strings.Contains(out, "pauseImage") {
+		t.Errorf("output should not contain pauseImage field:\n%s", out)
+	}
+	if strings.Contains(out, "onResume") {
+		t.Errorf("output should not contain empty onResume field:\n%s", out)
+	}
+	if strings.Contains(out, "{}") {
+		t.Errorf("output should not contain empty map literals ({}):\n%s", out)
+	}
+}
+
+func TestManifestCommandExecution(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute manifest: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "kind: Deployment") || !strings.Contains(out, "kind: WorkerPool") {
+		t.Errorf("expected deployment and workerpool in output:\n%s", out)
+	}
+}
+
+func TestManifestTemplateCommandExecution(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--cpu=4",
+		"--memory=8Gi",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute manifest template: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "image: example.com/guest@sha256:aaaa") || !strings.Contains(out, "storageLocation: gs://bucket/prefix/") {
+		t.Errorf("expected guest image and storage location in output:\n%s", out)
+	}
+	// --cpu 4 --memory 8Gi render as Substrate's integer limits.
+	for _, want := range []string{"cpuMillicores: \"4000\"", "memoryBytes: \"8589934592\""} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	// Substrate rejects a template with sandboxConfig since substrate#2780.
+	if strings.Contains(out, "sandboxConfig") || strings.Contains(out, "sandboxClass") {
+		t.Errorf("template names a sandbox; the worker pool decides it now:\n%s", out)
+	}
+}
+
+const testHex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func TestBuildTemplateRootfsImage(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	cfg.workspace = "/workspace"
+
+	tmpl, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatalf("buildTemplate: %v", err)
+	}
+	if tmpl.GetMetadata().GetName() != "default-template" {
+		t.Errorf("name = %q, want the configured template name unchanged", tmpl.GetMetadata().GetName())
+	}
+	c := tmpl.GetContainers()[0]
+	if c.GetImage() != cfg.rootfsImage {
+		t.Errorf("container image = %q, want the rootfs image", c.GetImage())
+	}
+	if len(tmpl.GetVolumes()) != 1 || tmpl.GetVolumes()[0].GetImage().GetReference() != cfg.guestImage {
+		t.Errorf("volumes = %v, want the guest image volume", tmpl.GetVolumes())
+	}
+	if len(c.GetVolumeMounts()) != 1 || c.GetVolumeMounts()[0].GetMountPath() != apiservice.GuestMountPath {
+		t.Errorf("mounts = %v", c.GetVolumeMounts())
+	}
+	want := []string{"/ate/ko-app/ate-env-guest", "-workspace", "/workspace"}
+	if got := c.GetCommand(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("command = %v, want %v", got, want)
+	}
+}
+
+func TestBuildTemplateWorkspaceOnly(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.workspace = "/w"
+	tmpl, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatalf("buildTemplate: %v", err)
+	}
+	c := tmpl.GetContainers()[0]
+	if c.GetImage() != cfg.guestImage || len(tmpl.GetVolumes()) != 0 {
+		t.Errorf("without --rootfs-image the guest stays the container image and no volume is added: %v", tmpl)
+	}
+	if got := c.GetCommand(); len(got) != 3 || got[0] != "/ko-app/ate-env-guest" || got[2] != "/w" {
+		t.Errorf("command = %v", got)
+	}
+}
+
+func TestTemplateConfigResolveImagesRootfsImage(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.rootfsImage = "python:3.12"
+	if err := cfg.resolveImages(); err == nil {
+		t.Error("unpinned --rootfs-image accepted")
+	}
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	if err := cfg.resolveImages(); err == nil {
+		t.Error("short guest digest accepted together with --rootfs-image")
+	}
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	if err := cfg.resolveImages(); err != nil {
+		t.Errorf("pinned images rejected: %v", err)
+	}
+}
+
+func TestBuildTemplateWithRuntimeLayer(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	cfg.layers = []string{"execd=example.com/execd@sha256:" + testHex64 + "=/opt/opensandbox"}
+	cfg.sidecars = []string{"/opt/opensandbox/execd --port 44772"}
+	cfg.sidecarReadyz = []string{"http://127.0.0.1:44772/ready"}
+
+	tmpl, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatalf("buildTemplate: %v", err)
+	}
+	vols := tmpl.GetVolumes()
+	if len(vols) != 2 || vols[0].GetName() != "execd" || vols[0].GetImage().GetReference() != "example.com/execd@sha256:"+testHex64 || vols[1].GetName() != apiservice.GuestVolumeName {
+		t.Errorf("volumes = %v, want the execd layer then the guest volume", vols)
+	}
+	c := tmpl.GetContainers()[0]
+	if len(c.GetVolumeMounts()) != 2 || c.GetVolumeMounts()[0].GetMountPath() != "/opt/opensandbox" || c.GetVolumeMounts()[1].GetMountPath() != apiservice.GuestMountPath {
+		t.Errorf("mounts = %v", c.GetVolumeMounts())
+	}
+	want := "/ate/ko-app/ate-env-guest -sidecar /opt/opensandbox/execd --port 44772 -sidecar-readyz http://127.0.0.1:44772/ready"
+	if got := strings.Join(c.GetCommand(), " "); got != want {
+		t.Errorf("command = %q, want %q", got, want)
+	}
+	if c.GetImage() != cfg.rootfsImage {
+		t.Errorf("image = %q", c.GetImage())
+	}
+}
+
+// 16 OpenHands agent-server boots of one image on a node took up
+// to 29 s and crashed on Substrate's 30 s wakeup-probe default. A template
+// whose readiness waits for a sidecar gets sidecarWakeupTimeout.
+func TestBuildTemplateSidecarReadyzWakeupTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		readyz  []string
+		timeout time.Duration
+		want    int32
+	}{
+		{"sidecar readiness URL", []string{"http://127.0.0.1:8000/health"}, 0, 120},
+		{"explicit timeout wins", []string{"http://127.0.0.1:8000/health"}, 45 * time.Second, 45},
+		{"explicit timeout without sidecar", nil, 10 * time.Minute, 600},
+	} {
+		cfg := testTemplateConfig()
+		cfg.sidecarReadyz = tc.readyz
+		cfg.wakeupTimeout = tc.timeout
+		tmpl, err := buildTemplate(cfg)
+		if err != nil {
+			t.Fatalf("%s: buildTemplate: %v", tc.name, err)
+		}
+		if got := tmpl.GetContainers()[0].GetWakeupProbe().GetTimeoutSeconds(); got != tc.want {
+			t.Errorf("%s: wakeupProbe.timeoutSeconds = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A template derived for an image, by --rootfs-image here or by ate-env-api
+// on CreateEnvironment (ensureImageTemplate), keeps the base's probe timeout.
+func TestDerivedTemplateKeepsWakeupTimeout(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	cfg.sidecarReadyz = []string{"http://127.0.0.1:8000/health"}
+
+	base, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatalf("buildTemplate: %v", err)
+	}
+	task := "example.com/task@sha256:" + testHex64
+	derived, err := apiservice.DeriveImageTemplate(base, "default-template-0123456789ab", task)
+	if err != nil {
+		t.Fatalf("DeriveImageTemplate: %v", err)
+	}
+	if got := derived.GetContainers()[0].GetWakeupProbe().GetTimeoutSeconds(); got != 120 {
+		t.Errorf("derived wakeupProbe.timeoutSeconds = %d, want the base's 120", got)
+	}
+
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	rootfs, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatalf("buildTemplate --rootfs-image: %v", err)
+	}
+	if got := rootfs.GetContainers()[0].GetWakeupProbe().GetTimeoutSeconds(); got != 120 {
+		t.Errorf("--rootfs-image wakeupProbe.timeoutSeconds = %d, want 120", got)
+	}
+	again, err := apiservice.DeriveImageTemplate(rootfs, "default-template-0123456789ab", task)
+	if err != nil {
+		t.Fatalf("DeriveImageTemplate from a rootfs base: %v", err)
+	}
+	if got := again.GetContainers()[0].GetWakeupProbe().GetTimeoutSeconds(); got != 120 {
+		t.Errorf("derived from a rootfs base: wakeupProbe.timeoutSeconds = %d, want 120", got)
+	}
+}
+
+// ate-env-api's guest calls and port-proxy requests wait for a wake up to
+// --wake-budget, and the actor answers only after its wakeup probe passes.
+// The default budget must cover the default probe timeout of a sidecar
+// template plus the two minutes it gave image pulls and snapshot reads.
+func TestDefaultWakeBudgetCoversSidecarWakeupTimeout(t *testing.T) {
+	if want := sidecarWakeupTimeout + 2*time.Minute; apiservice.DefaultWakeBudget < want {
+		t.Errorf("apiservice.DefaultWakeBudget = %s, want at least %s (the %s sidecar wakeup timeout plus 2m)",
+			apiservice.DefaultWakeBudget, want, sidecarWakeupTimeout)
+	}
+	if portproxy.DefaultWakeBudget != apiservice.DefaultWakeBudget {
+		t.Errorf("portproxy.DefaultWakeBudget = %s, want apiservice.DefaultWakeBudget %s",
+			portproxy.DefaultWakeBudget, apiservice.DefaultWakeBudget)
+	}
+}
+
+func TestManifestTemplateCommandWakeupTimeout(t *testing.T) {
+	run := func(extra ...string) (string, error) {
+		cmd := newManifestCommand()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(append([]string{"template", "--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/"}, extra...))
+		err := cmd.Execute()
+		return out.String(), err
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "timeoutSeconds: 30\n"},
+		{[]string{"--sidecar-readyz=http://127.0.0.1:8000/health"}, "timeoutSeconds: 120\n"},
+		{[]string{"--sidecar-readyz=http://127.0.0.1:8000/health", "--wakeup-timeout=5m"}, "timeoutSeconds: 300\n"},
+		{[]string{"--wakeup-timeout=1h"}, "timeoutSeconds: 3600\n"},
+	} {
+		out, err := run(tc.args...)
+		if err != nil {
+			t.Fatalf("%v: %v", tc.args, err)
+		}
+		if !strings.Contains(out, tc.want) {
+			t.Errorf("%v: output lacks %q:\n%s", tc.args, tc.want, out)
+		}
+	}
+	// Substrate accepts whole seconds from 1 to 3600.
+	for _, v := range []string{"500ms", "1500ms", "61m", "-1s"} {
+		if _, err := run("--wakeup-timeout=" + v); err == nil || !strings.Contains(err.Error(), "--wakeup-timeout") {
+			t.Errorf("--wakeup-timeout=%s: got %v, want a --wakeup-timeout error", v, err)
+		}
+	}
+}
+
+func TestParseLayerRejects(t *testing.T) {
+	cases := map[string]string{
+		"missing parts":    "execd=example.com/execd@sha256:" + testHex64,
+		"unpinned image":   "execd=example.com/execd:latest=/opt/execd",
+		"relative mount":   "execd=example.com/execd@sha256:" + testHex64 + "=opt/execd",
+		"guest mount path": "execd=example.com/execd@sha256:" + testHex64 + "=/ate",
+		"reserved name":    "guest=example.com/execd@sha256:" + testHex64 + "=/opt/execd",
+	}
+	for name, v := range cases {
+		if _, err := parseLayer(v); err == nil {
+			t.Errorf("%s: %q accepted", name, v)
+		}
+	}
+	dup := "a=example.com/x@sha256:" + testHex64 + "=/opt/a"
+	if _, err := parseLayers([]string{dup, dup}); err == nil {
+		t.Error("duplicate layer accepted")
+	}
+	cfg := testTemplateConfig()
+	cfg.sidecars = []string{"execd --port 1"}
+	if err := cfg.resolveImages(); err == nil {
+		t.Error("relative sidecar binary accepted")
+	}
+	cfg = testTemplateConfig()
+	cfg.sidecarReadyz = []string{"127.0.0.1:44772/ready"}
+	if err := cfg.resolveImages(); err == nil {
+		t.Error("sidecar-readyz without a scheme accepted")
+	}
+}
+
+const relHex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func TestImageFlagsDefaultToReleaseImages(t *testing.T) {
+	// A source build has no defaults and the flags are required.
+	cmd := newManifestTemplateCommand()
+	if got := cmd.Flags().Lookup("guest-image").DefValue; got != "" {
+		t.Errorf("source build guest-image default = %q, want empty", got)
+	}
+	cfg := templateConfig{template: "t", snapshotsBucket: "gs://b/"}
+	if err := cfg.resolveImages(); err == nil || !strings.Contains(err.Error(), "built from source") {
+		t.Errorf("missing --guest-image should name the source-build case, got %v", err)
+	}
+
+	// A release build carries the digests; the flags default to them.
+	oldAPI, oldGuest := defaultAPIImage, defaultGuestImage
+	defaultAPIImage = "ghcr.io/example/ate-env-api@sha256:" + relHex64
+	defaultGuestImage = "ghcr.io/example/ate-env-guest@sha256:" + relHex64
+	t.Cleanup(func() { defaultAPIImage, defaultGuestImage = oldAPI, oldGuest })
+
+	if got := newManifestTemplateCommand().Flags().Lookup("guest-image").DefValue; got != defaultGuestImage {
+		t.Errorf("guest-image default = %q, want the release image", got)
+	}
+	if got := newManifestCommand().Flags().Lookup("api-image").DefValue; got != defaultAPIImage {
+		t.Errorf("api-image default = %q, want the release image", got)
+	}
+	usage := newManifestCommand().Flags().Lookup("api-image").Usage
+	if !strings.Contains(usage, "published with this release") {
+		t.Errorf("api-image help should say the default is the release image, got %q", usage)
+	}
+	// The worker image stays required: it comes from the Substrate repo.
+	m := manifestConfig{apiImage: defaultAPIImage}
+	if err := m.resolveImages(); err == nil || !strings.Contains(err.Error(), "Substrate") {
+		t.Errorf("missing --worker-image should point at the Substrate repo, got %v", err)
+	}
+}
+
+func TestManifestAccessPolicyCommand(t *testing.T) {
+	for _, ns := range []string{"", "team-env"} {
+		cmd := newManifestCommand()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		args := []string{"access-policy"}
+		if ns != "" {
+			args = append(args, "--namespace", ns)
+		}
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		want := "user:system:serviceaccount:" + map[bool]string{true: "ate-env", false: ns}[ns == ""] + ":ate-env-api"
+		var m map[string]any
+		if err := yaml.Unmarshal(out.Bytes(), &m); err != nil {
+			t.Fatalf("%q: %v", out.String(), err)
+		}
+		md, _ := m["metadata"].(map[string]any)
+		bindings, _ := m["bindings"].([]any)
+		if md["name"] != "default" || md["atespace"] != nil || len(bindings) != 1 {
+			t.Fatalf("policy = %v, want metadata.name default, no atespace, one binding", m)
+		}
+		b := bindings[0].(map[string]any)
+		members, _ := b["members"].([]any)
+		if b["role"] != "editor" || len(members) != 1 || members[0] != want {
+			t.Errorf("binding = %v, want editor for %s", b, want)
+		}
+
+		// --global: the viewer binding at the global scope, for ListPlacementDomains.
+		cmd = newManifestCommand()
+		out.Reset()
+		cmd.SetOut(&out)
+		cmd.SetArgs(append(args, "--global"))
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		m = nil
+		if err := yaml.Unmarshal(out.Bytes(), &m); err != nil {
+			t.Fatalf("%q: %v", out.String(), err)
+		}
+		md, _ = m["metadata"].(map[string]any)
+		bindings, _ = m["bindings"].([]any)
+		if md["name"] != "default" || md["atespace"] != nil || len(bindings) != 1 {
+			t.Fatalf("global policy = %v, want metadata.name default, no atespace, one binding", m)
+		}
+		b = bindings[0].(map[string]any)
+		members, _ = b["members"].([]any)
+		if b["role"] != "viewer" || len(members) != 1 || members[0] != want {
+			t.Errorf("global binding = %v, want viewer for %s", b, want)
+		}
+	}
+}
+
+func TestManifestTemplateSelectsTheNamedPool(t *testing.T) {
+	cmd := newManifestCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"template", "--template", "py", "--workerpool", "team-pool",
+		"--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/p/"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "workerSelector:\n  matchLabels:\n    ate-env/workerpool: team-pool") {
+		t.Errorf("template does not select team-pool:\n%s", out.String())
+	}
+	out.Reset()
+	cmd = newManifestCommand()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"template", "--template", "py", "--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/p/"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	// A template named py still selects the pool ate-env manifest creates by
+	// default; py-workerpool does not exist, and its actors would never
+	// schedule.
+	if !strings.Contains(out.String(), "ate-env/workerpool: default-template-workerpool") {
+		t.Errorf("a template's default pool is not default-template-workerpool:\n%s", out.String())
+	}
+}
+
+func TestManifestTemplateTrimsNames(t *testing.T) {
+	cmd := newManifestCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"template", "--template", "  trimmed-template  ", "--workerpool", "  trimmed-pool  ",
+		"--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/p/"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "name: trimmed-template\n") {
+		t.Errorf("template name not trimmed:\n%s", s)
+	}
+	if !strings.Contains(s, "ate-env/workerpool: trimmed-pool\n") {
+		t.Errorf("workerpool name not trimmed in selector:\n%s", s)
+	}
+}
+
+func TestWorkerPoolNameMustFitALabelValue(t *testing.T) {
+	long := strings.Repeat("t", 53) // 53 + len("-workerpool") = 64
+	for _, args := range [][]string{
+		{"--template", long, "--worker-image", "example.com/w@sha256:bbbb", "--api-image", "example.com/a@sha256:cccc"},
+		{"template", "--workerpool", long + "-workerpool", "--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/p/"},
+	} {
+		cmd := newManifestCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "pass a shorter --workerpool") {
+			t.Errorf("%v: err = %v, want the label-length error", args[:2], err)
+		}
+		cmd = newManifestCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetArgs(append(args, "--workerpool", "short-pool"))
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("%v with --workerpool: %v", args[:2], err)
+		}
+	}
+}
+
+// Without --auth-token-secret, the deployment has no auth mount and no
+// -auth-token-file argument: the default install is unauthenticated.
+func TestBuildAPIDeploymentNoAuthTokenSecret(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.authTokenSecret = ""
+
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	for _, a := range c.Args {
+		if strings.HasPrefix(a, "-auth-token-file") {
+			t.Errorf("container args = %v, want no -auth-token-file", c.Args)
+		}
+	}
+	for _, m := range c.VolumeMounts {
+		if m.Name == "ate-env-auth" {
+			t.Errorf("volume mounts = %+v, want no ate-env-auth mount", c.VolumeMounts)
+		}
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "ate-env-auth" {
+			t.Errorf("volumes = %+v, want no ate-env-auth volume", dep.Spec.Template.Spec.Volumes)
+		}
+	}
+}
+
+// By default the API deployment carries no telemetry flags, env or ports:
+// the manifest is what it was before telemetry existed.
+func TestBuildManifestsTelemetryOffByDefault(t *testing.T) {
+	objs := buildManifests(testManifestConfig())
+	deployment := objs[3].(*appsv1.Deployment)
+	c := deployment.Spec.Template.Spec.Containers[0]
+	for _, a := range c.Args {
+		if strings.Contains(a, "tracing") || strings.Contains(a, "metrics") {
+			t.Errorf("default args carry %q", a)
+		}
+	}
+	// POD_NAMESPACE is always set (for the Host check); no OTEL_* variable is.
+	for _, e := range c.Env {
+		if strings.HasPrefix(e.Name, "OTEL_") {
+			t.Errorf("default container env carries %s", e.Name)
+		}
+	}
+	if len(c.Ports) != 1 || len(deployment.Spec.Template.Annotations) != 0 {
+		t.Errorf("default container ports %v, pod annotations %v; want the API port, none", c.Ports, deployment.Spec.Template.Annotations)
+	}
+}
+
+// The telemetry flags render --enable-tracing, --metrics-listen-addr, the
+// OTLP env, a "metrics" container and Service port, and scrape annotations.
+func TestBuildManifestsTelemetry(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.enableTracing = true
+	cfg.otlpEndpoint = "http://otel-collector.ate-env-telemetry:4317"
+	cfg.otlpInsecure = true
+	cfg.metricsPort = 9090
+	objs := buildManifests(cfg)
+
+	deployment := objs[3].(*appsv1.Deployment)
+	c := deployment.Spec.Template.Spec.Containers[0]
+	args := strings.Join(c.Args, " ")
+	for _, want := range []string{"-enable-tracing", "-metrics-listen-addr=:9090", "-listen 0.0.0.0:7777"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("args %q lack %q", args, want)
+		}
+	}
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	if env["OTEL_EXPORTER_OTLP_ENDPOINT"] != cfg.otlpEndpoint || env["OTEL_EXPORTER_OTLP_INSECURE"] != "true" {
+		t.Errorf("env = %v, want the OTLP endpoint and insecure=true", env)
+	}
+	if len(c.Ports) != 2 || c.Ports[1].Name != "metrics" || c.Ports[1].ContainerPort != 9090 {
+		t.Errorf("container ports = %+v, want the API port and metrics 9090", c.Ports)
+	}
+	ann := deployment.Spec.Template.Annotations
+	if ann["prometheus.io/scrape"] != "true" || ann["prometheus.io/port"] != "9090" || ann["prometheus.io/path"] != "/metrics" {
+		t.Errorf("pod annotations = %v, want prometheus.io scrape on 9090 /metrics", ann)
+	}
+
+	service := objs[4].(*corev1.Service)
+	if len(service.Spec.Ports) != 2 {
+		t.Fatalf("service ports = %+v, want api and metrics", service.Spec.Ports)
+	}
+	api, metrics := service.Spec.Ports[0], service.Spec.Ports[1]
+	if api.Name != "api" || api.Port != 7777 {
+		t.Errorf("service api port = %+v, want api 7777", api)
+	}
+	if metrics.Name != "metrics" || metrics.Port != 9090 || metrics.TargetPort.String() != "metrics" {
+		t.Errorf("service metrics port = %+v, want metrics 9090 -> metrics", metrics)
+	}
+}
+
+func TestManifestCommandTelemetryFlags(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--enable-tracing",
+		"--otlp-endpoint=http://otel-collector.ate-env-telemetry:4317",
+		"--otlp-insecure",
+		"--metrics-port=9090",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute manifest: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"- -enable-tracing",
+		"- -metrics-listen-addr=:9090",
+		"name: OTEL_EXPORTER_OTLP_ENDPOINT",
+		"value: http://otel-collector.ate-env-telemetry:4317",
+		"name: OTEL_EXPORTER_OTLP_INSECURE",
+		"name: metrics",
+		"prometheus.io/scrape: \"true\"",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("manifest lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.authTokenSecret = "ate-env-caller-token"
+
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	wantArg := "-auth-token-file=/var/run/secrets/ate-env-auth/token"
+	foundArg := false
+	for _, a := range c.Args {
+		if a == wantArg {
+			foundArg = true
+			break
+		}
+	}
+	if !foundArg {
+		t.Errorf("container args = %v, want %q", c.Args, wantArg)
+	}
+
+	foundMount := false
+	for _, m := range c.VolumeMounts {
+		if m.Name == "ate-env-auth" && m.MountPath == "/var/run/secrets/ate-env-auth" && m.ReadOnly {
+			foundMount = true
+			break
+		}
+	}
+	if !foundMount {
+		t.Errorf("volume mounts = %+v, want read-only ate-env-auth mount", c.VolumeMounts)
+	}
+
+	foundVol := false
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "ate-env-auth" && v.Secret != nil && v.Secret.SecretName == "ate-env-caller-token" {
+			foundVol = true
+			break
+		}
+	}
+	if !foundVol {
+		t.Errorf("volumes = %+v, want Secret volume for ate-env-caller-token", dep.Spec.Template.Spec.Volumes)
+	}
+}
+
+// runManifest runs "ate-env manifest" with the image flags plus extra and
+// returns the output and the error.
+func runManifest(t *testing.T, extra ...string) (string, error) {
+	t.Helper()
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs(append([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+	}, extra...))
+	err := cmd.Execute()
+	return buf.String(), err
+}
+
+func TestManifestRequiresTheCallerTokenByDefault(t *testing.T) {
+	out, err := runManifest(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"-auth-token-file=/var/run/secrets/ate-env-auth/token", "secretName: " + defaultAuthTokenSecret} {
+		if !strings.Contains(out, want) {
+			t.Errorf("default manifest lacks %q:\n%s", want, out)
+		}
+	}
+	out, err = runManifest(t, "--auth-token-secret=team-token", "--port-proxy-atespaces=ate-env,team-a")
+	if err != nil || !strings.Contains(out, "secretName: team-token") || !strings.Contains(out, "-port-proxy-atespaces=ate-env,team-a") {
+		t.Errorf("--auth-token-secret=team-token --port-proxy-atespaces: err %v, output:\n%s", err, out)
+	}
+}
+
+func TestManifestInsecureNoAuth(t *testing.T) {
+	out, err := runManifest(t, "--insecure-no-auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "auth-token-file") || strings.Contains(out, "ate-env-auth") {
+		t.Errorf("--insecure-no-auth still mounts the caller token:\n%s", out)
+	}
+	if _, err := runManifest(t, "--insecure-no-auth", "--auth-token-secret=x"); err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Errorf("--insecure-no-auth with --auth-token-secret: err %v, want a conflict", err)
+	}
+	if _, err := runManifest(t, "--auth-token-secret="); err == nil || !strings.Contains(err.Error(), "--insecure-no-auth") {
+		t.Errorf("empty --auth-token-secret: err %v, want a pointer to --insecure-no-auth", err)
+	}
+	if _, err := runManifest(t, "--auth-token-secret=   "); err == nil || !strings.Contains(err.Error(), "--insecure-no-auth") {
+		t.Errorf("whitespace --auth-token-secret: err %v, want a pointer to --insecure-no-auth", err)
+	}
+}
+
+func TestManifestAuthSecretCommand(t *testing.T) {
+	run := func(args ...string) map[string]any {
+		t.Helper()
+		cmd := newManifestCommand()
+		var buf bytes.Buffer
+		cmd.SetOut(&buf)
+		cmd.SetArgs(append([]string{"auth-secret"}, args...))
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := yaml.Unmarshal(buf.Bytes(), &m); err != nil {
+			t.Fatalf("%q: %v", buf.String(), err)
+		}
+		return m
+	}
+	token := func(m map[string]any) string {
+		sd, _ := m["stringData"].(map[string]any)
+		s, _ := sd["token"].(string)
+		return s
+	}
+	a, b := run(), run("--namespace", "team-env", "--name", "team-token")
+	if a["kind"] != "Secret" || a["type"] != "Opaque" {
+		t.Errorf("kind %v type %v, want an Opaque Secret", a["kind"], a["type"])
+	}
+	md, _ := a["metadata"].(map[string]any)
+	if md["name"] != defaultAuthTokenSecret || md["namespace"] != "ate-env" {
+		t.Errorf("metadata %v, want %s in ate-env", md, defaultAuthTokenSecret)
+	}
+	if md, _ := b["metadata"].(map[string]any); md["name"] != "team-token" || md["namespace"] != "team-env" {
+		t.Errorf("metadata %v, want team-token in team-env", md)
+	}
+	hex64 := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	if !hex64.MatchString(token(a)) || !hex64.MatchString(token(b)) {
+		t.Errorf("tokens %q, %q: want 64 hex characters each", token(a), token(b))
+	}
+	if token(a) == token(b) {
+		t.Error("two runs printed the same token")
+	}
+	for _, bad := range [][]string{{"--namespace="}, {"--namespace=  "}, {"--name="}, {"--name=  "}} {
+		cmd := newManifestCommand()
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs(append([]string{"auth-secret"}, bad...))
+		if err := cmd.Execute(); err == nil {
+			t.Errorf("auth-secret %v: want error", bad)
+		}
+	}
+}
+
+func TestBuildAPIDeploymentRouterTLS(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.routerTLS = true
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	args := strings.Join(c.Args, " ")
+	for _, want := range []string{"-atenet-client-cert=" + routerCredentialBundlePath, "-atenet-ca-file=" + routerTrustBundlePath} {
+		if !strings.Contains(args, want) {
+			t.Errorf("args %v lack %q", c.Args, want)
+		}
+	}
+	mounts := map[string]string{}
+	for _, m := range c.VolumeMounts {
+		mounts[m.Name] = m.MountPath
+	}
+	if mounts["podidentity"] != "/run/podidentity.podcert.ate.dev" || mounts["servicedns-ca"] != "/run/servicedns-ca" {
+		t.Errorf("mounts = %v", mounts)
+	}
+	var pod, trust bool
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Projected == nil || len(v.Projected.Sources) != 1 {
+			continue
+		}
+		src := v.Projected.Sources[0]
+		switch {
+		case v.Name == "podidentity" && src.PodCertificate != nil:
+			pc := src.PodCertificate
+			pod = pc.SignerName == "podidentity.podcert.ate.dev/identity" && pc.KeyType == "ECDSAP256" && pc.CredentialBundlePath == "credential-bundle.pem"
+		case v.Name == "servicedns-ca" && src.ClusterTrustBundle != nil:
+			tb := src.ClusterTrustBundle
+			trust = tb.SignerName != nil && *tb.SignerName == "servicedns.podcert.ate.dev/identity" && tb.Path == "trust-bundle.pem" &&
+				tb.LabelSelector != nil && tb.LabelSelector.MatchLabels["podcert.ate.dev/canarying"] == "live"
+		}
+	}
+	if !pod || !trust {
+		t.Errorf("volumes = %+v; pod certificate ok %v, trust bundle ok %v", dep.Spec.Template.Spec.Volumes, pod, trust)
+	}
+
+	cfg.routerTLS = false
+	dep = buildAPIDeployment(cfg)
+	c = dep.Spec.Template.Spec.Containers[0]
+	if strings.Contains(strings.Join(c.Args, " "), "-atenet-client-cert") {
+		t.Errorf("args %v: want no router TLS flags when off", c.Args)
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "podidentity" || v.Name == "servicedns-ca" {
+			t.Errorf("volume %s present with router TLS off", v.Name)
+		}
+	}
+}
+
+func envMap(c *ateapipb.Container) (map[string]string, []string) {
+	m := map[string]string{}
+	var order []string
+	for _, e := range c.GetEnv() {
+		m[e.GetName()] = e.GetValue()
+		order = append(order, e.GetName())
+	}
+	return m, order
+}
+
+func TestBuildTemplateEnv(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.env = []string{"OH_SESSION_API_KEYS_0=s3cret", "EMPTY=", "URL=http://x/?a=b"}
+	tmpl, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, order := envMap(tmpl.Containers[0])
+	if strings.Join(order, ",") != "PORT,OH_SESSION_API_KEYS_0,EMPTY,URL" {
+		t.Errorf("env order = %v, want PORT first, then the flags in order", order)
+	}
+	if got["PORT"] != "80" || got["OH_SESSION_API_KEYS_0"] != "s3cret" || got["EMPTY"] != "" || got["URL"] != "http://x/?a=b" {
+		t.Errorf("env = %v", got)
+	}
+
+	// A rootfs-image template keeps the variables: the sidecars that read them
+	// run there.
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	tmpl, err = buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := envMap(tmpl.Containers[0]); got["OH_SESSION_API_KEYS_0"] != "s3cret" {
+		t.Errorf("rootfs-image template env = %v, want the --env values", got)
+	}
+}
+
+func TestTemplateConfigRejectsBadEnv(t *testing.T) {
+	for _, env := range [][]string{
+		{"NOEQUALS"},
+		{"1BAD=x"},
+		{"BAD-NAME=x"},
+		{"=x"},
+		{"PORT=81"},
+		{"A=1", "A=2"},
+	} {
+		cfg := testTemplateConfig()
+		cfg.env = env
+		if err := cfg.validateEnv(); err == nil {
+			t.Errorf("env %q: want error, got nil", env)
+		}
+	}
+}
+
+func TestManifestTemplateCommandEnv(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--env=OH_SESSION_API_KEYS_0=k",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "name: OH_SESSION_API_KEYS_0\n    value: k") {
+		t.Errorf("output lacks the --env variable:\n%s", out)
+	}
+}
+
+// --sidecar-env renders each value under sidecarenv.Prefix, which the guest
+// takes out of its own environment and gives only to the sidecars. A template
+// with --rootfs-image, and each template that ate-env-api derives for a task
+// image, keep it next to the sidecar that reads it.
+func TestBuildTemplateSidecarEnv(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	cfg.sidecars = []string{"/opt/oh/python/bin/python3 -m openhands.agent_server --port 8000"}
+	cfg.env = []string{"LOG_JSON=true"}
+	cfg.sidecarEnv = []string{"OH_SESSION_API_KEYS_0=s3cret", "EMPTY="}
+	want := func(t *testing.T, what string, tmpl *ateapipb.ActorTemplate) {
+		t.Helper()
+		// The guest flag that makes an older guest exit, instead of starting
+		// the sidecars without the values, must survive the re-rooting of
+		// the guest command in a derived template.
+		if n := slices.Index(tmpl.GetContainers()[0].GetCommand(), "-"+sidecarenv.RequiredFlag); n < 1 {
+			t.Errorf("%s: command = %q, want -%s after the guest binary", what, tmpl.GetContainers()[0].GetCommand(), sidecarenv.RequiredFlag)
+		}
+		got, order := envMap(tmpl.GetContainers()[0])
+		if w := "PORT,LOG_JSON," + sidecarenv.Prefix + "OH_SESSION_API_KEYS_0," + sidecarenv.Prefix + "EMPTY"; strings.Join(order, ",") != w {
+			t.Errorf("%s: env order = %v, want %s", what, order, w)
+		}
+		if got[sidecarenv.Prefix+"OH_SESSION_API_KEYS_0"] != "s3cret" {
+			t.Errorf("%s: env = %v, want the --sidecar-env value under %s", what, got, sidecarenv.Prefix)
+		}
+		if _, ok := got["OH_SESSION_API_KEYS_0"]; ok {
+			t.Errorf("%s: env = %v, has the --sidecar-env name without the prefix", what, got)
+		}
+	}
+	base, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "base", base)
+	task := "example.com/task@sha256:" + testHex64
+	derived, err := apiservice.DeriveImageTemplate(base, "default-template-0123456789ab", task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "derived", derived)
+
+	cfg.rootfsImage = "docker.io/library/debian@sha256:" + testHex64
+	rootfs, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "--rootfs-image", rootfs)
+	derived, err = apiservice.DeriveImageTemplate(rootfs, "default-template-0123456789ab", task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "derived from a --rootfs-image base", derived)
+
+	// Without --sidecar-env, the template does not carry the flag, thus an
+	// older guest still runs it.
+	cfg.sidecarEnv = nil
+	for _, rootfs := range []string{"", "docker.io/library/debian@sha256:" + testHex64} {
+		cfg.rootfsImage = rootfs
+		plain, err := buildTemplate(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if slices.Contains(plain.GetContainers()[0].GetCommand(), "-"+sidecarenv.RequiredFlag) {
+			t.Errorf("rootfs %q without --sidecar-env: command = %q, want no -%s", rootfs, plain.GetContainers()[0].GetCommand(), sidecarenv.RequiredFlag)
+		}
+	}
+}
+
+func TestTemplateConfigRejectsBadSidecarEnv(t *testing.T) {
+	sidecar := []string{"/opt/oh/bin/server"}
+	for _, tc := range []struct {
+		name                      string
+		env, sidecarEnv, sidecars []string
+		wantErr                   string
+	}{
+		{"no equals", nil, []string{"NOEQUALS"}, sidecar, "--sidecar-env value 1"},
+		{"bad name", nil, []string{"A=1", "BAD-NAME=x"}, sidecar, "--sidecar-env value 2"},
+		{"PORT", nil, []string{"PORT=81"}, sidecar, "--sidecar-env PORT"},
+		{"twice", nil, []string{"A=1", "A=2"}, sidecar, "--sidecar-env A is given twice"},
+		{"in both flags", []string{"A=1"}, []string{"A=2"}, sidecar, "both --env and --sidecar-env"},
+		{"no sidecar", nil, []string{"A=1"}, nil, "needs a --sidecar"},
+		{"--env with the prefix", []string{sidecarenv.Prefix + "A=1"}, nil, sidecar, "reserved for --sidecar-env"},
+	} {
+		cfg := testTemplateConfig()
+		cfg.env, cfg.sidecarEnv, cfg.sidecars = tc.env, tc.sidecarEnv, tc.sidecars
+		err := cfg.validateEnv()
+		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("%s: validateEnv = %v, want an error with %q", tc.name, err, tc.wantErr)
+		}
+		// A malformed --sidecar-env value can be the secret itself.
+		if err != nil && (strings.Contains(err.Error(), "NOEQUALS") || strings.Contains(err.Error(), "BAD-NAME")) {
+			t.Errorf("%s: validateEnv = %v, echoes the --sidecar-env value", tc.name, err)
+		}
+		if _, err := buildTemplate(cfg); err == nil {
+			t.Errorf("%s: buildTemplate succeeded, want an error", tc.name)
+		}
+	}
+}
+
+func TestManifestTemplateCommandSidecarEnv(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--sidecar=/opt/oh/bin/server",
+		"--sidecar-env=OH_SESSION_API_KEYS_0=k",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "name: "+sidecarenv.Prefix+"OH_SESSION_API_KEYS_0\n    value: k") {
+		t.Errorf("output lacks the --sidecar-env variable under %s:\n%s", sidecarenv.Prefix, out)
+	}
+	if strings.Contains(out, "name: OH_SESSION_API_KEYS_0") {
+		t.Errorf("output has the --sidecar-env variable without the prefix:\n%s", out)
+	}
+}
+
+func TestManifestTemplateCommandRejectsBadEnv(t *testing.T) {
+	cmd := newManifestCommand()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--env=PORT=81",
+	})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--env PORT") {
+		t.Errorf("execute with --env PORT=81: want the --env error, got %v", err)
+	}
+}
+
+func TestBuildTemplateAddCapabilities(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	base, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc := base.GetContainers()[0].GetSecurityContext(); sc != nil {
+		t.Errorf("without --add-capability: securityContext = %v, want none", sc)
+	}
+
+	cfg.addCapabilities = []string{"SETUID", "SETGID"}
+	want := func(t *testing.T, what string, tmpl *ateapipb.ActorTemplate) {
+		t.Helper()
+		caps := tmpl.GetContainers()[0].GetSecurityContext().GetCapabilities()
+		if !slices.Equal(caps.GetAdd(), cfg.addCapabilities) || len(caps.GetDrop()) != 0 {
+			t.Errorf("%s: capabilities = %v, want add %v and no drop", what, caps, cfg.addCapabilities)
+		}
+	}
+	base, err = buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "base", base)
+	// An environment created with an image of its own runs on a derived
+	// template, and needs the capabilities as much as the base does.
+	task := "example.com/task@sha256:" + testHex64
+	derived, err := apiservice.DeriveImageTemplate(base, "default-template-0123456789ab", task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "derived", derived)
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	rootfs, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want(t, "--rootfs-image", rootfs)
+}
+
+func TestTemplateConfigRejectsBadCapabilities(t *testing.T) {
+	// Each error names the value it refuses and lists the accepted names.
+	accepted := strings.Join(addCapabilityNames, ", ")
+	for _, tc := range []struct {
+		caps []string
+		want string
+	}{
+		{[]string{"SETGID", "CAP_SETUID"}, `--add-capability "CAP_SETUID": write it as SETUID`},
+		{[]string{"setuid"}, `--add-capability "setuid": write it as SETUID`},
+		{[]string{"cap_setuid"}, `--add-capability "cap_setuid": write it as SETUID`},
+		{[]string{""}, `--add-capability ""`},
+		{[]string{"SETUID,SETGID"}, `--add-capability "SETUID,SETGID"`},
+		// Linux capabilities that Substrate does not let a container add.
+		{[]string{"SYS_ADMIN"}, `--add-capability "SYS_ADMIN"`},
+		{[]string{"SETUID", "NET_ADMIN"}, `--add-capability "NET_ADMIN"`},
+		{[]string{"CAP_SYS_ADMIN"}, `--add-capability "CAP_SYS_ADMIN"`},
+		{[]string{"ALL"}, `--add-capability "ALL"`},
+	} {
+		cfg := testTemplateConfig()
+		cfg.addCapabilities = tc.caps
+		err := cfg.validateCapabilities()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("validateCapabilities(%q) = %v, want an error with %q", tc.caps, err, tc.want)
+			continue
+		}
+		if !strings.Contains(err.Error(), accepted) {
+			t.Errorf("validateCapabilities(%q) = %v, want the accepted names %q in the error", tc.caps, err, accepted)
+		}
+	}
+}
+
+// A script that forwards the caller's flags after its own can repeat a name.
+// Substrate has no rule against a repeat, thus the CLI has none: the template
+// holds each name once, in the order of the first use.
+func TestBuildTemplateAddCapabilitiesRepeated(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	cfg.addCapabilities = []string{"SETUID", "SETGID", "SETUID", "CHOWN", "SETGID", "SETUID"}
+	given := slices.Clone(cfg.addCapabilities)
+	if err := cfg.validateCapabilities(); err != nil {
+		t.Fatalf("validateCapabilities(%q) = %v, want nil", cfg.addCapabilities, err)
+	}
+	tmpl, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tmpl.GetContainers()[0].GetSecurityContext().GetCapabilities().GetAdd()
+	if want := []string{"SETUID", "SETGID", "CHOWN"}; !slices.Equal(got, want) {
+		t.Errorf("capabilities.add = %v, want %v", got, want)
+	}
+	if !slices.Equal(cfg.addCapabilities, given) {
+		t.Errorf("buildTemplate changed the config: %v, want %v", cfg.addCapabilities, given)
+	}
+}
+
+// TestAddCapabilityNames pins the list to Substrate's AllowedAddCapabilities
+// at the pin in go.mod. Update both when the pin moves.
+func TestAddCapabilityNames(t *testing.T) {
+	want := []string{
+		"AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
+		"NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+	}
+	if !slices.Equal(addCapabilityNames, want) {
+		t.Fatalf("addCapabilityNames = %v, want %v", addCapabilityNames, want)
+	}
+	if !slices.IsSorted(addCapabilityNames) {
+		t.Errorf("addCapabilityNames is not sorted: %v", addCapabilityNames)
+	}
+	for _, name := range want {
+		cfg := testTemplateConfig()
+		cfg.addCapabilities = []string{name}
+		if err := cfg.validateCapabilities(); err != nil {
+			t.Errorf("validateCapabilities([%s]) = %v, want nil", name, err)
+		}
+	}
+	cfg := testTemplateConfig()
+	cfg.addCapabilities = slices.Clone(want)
+	if err := cfg.validateCapabilities(); err != nil {
+		t.Errorf("validateCapabilities(all 12) = %v, want nil", err)
+	}
+	// The flag help comes from the same list.
+	usage := newManifestCommand().Commands()
+	for _, sub := range usage {
+		if sub.Name() != "template" {
+			continue
+		}
+		help := sub.Flags().Lookup("add-capability").Usage
+		if !strings.Contains(help, strings.Join(want, ", ")) {
+			t.Errorf("--add-capability help = %q, want the accepted names", help)
+		}
+		return
+	}
+	t.Fatal("no template command")
+}
+
+// The builder and the validation have their own tests above. This one shows
+// that the command runs the validation: it fails, and prints no template.
+func TestManifestTemplateCommandRejectsBadCapability(t *testing.T) {
+	for _, name := range []string{"SYS_ADMIN", "ALL", "CAP_SETUID"} {
+		var out bytes.Buffer
+		cmd := newManifestCommand()
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"template", "--guest-image=example.com/guest@sha256:aaaa", "--add-capability=SETUID", "--add-capability=" + name})
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), `--add-capability "`+name+`"`) {
+			t.Errorf("execute with --add-capability=%s: want the flag's error, got %v", name, err)
+		}
+		// On an error cobra prints the usage to the same writer.
+		if strings.Contains(out.String(), "containers:") {
+			t.Errorf("execute with --add-capability=%s printed a template:\n%s", name, out.String())
+		}
+	}
+}
+
+// TestManifestEnvironmentMetadata checks the manifest half of EM-2: without
+// --environment-metadata the manifests have no Role, no RoleBinding, no
+// Kubernetes API token in the pod and no store flag; with it they have all
+// four, for ConfigMaps of ate-env-api's namespace only. The Role grants the
+// verbs that the store uses (envstore.Verbs, which a test of the store holds
+// to the calls it makes) and no other.
+func TestManifestEnvironmentMetadata(t *testing.T) {
+	deployment := func(objs []any) *appsv1.Deployment {
+		t.Helper()
+		for _, o := range objs {
+			if d, ok := o.(*appsv1.Deployment); ok {
+				return d
+			}
+		}
+		t.Fatal("no Deployment")
+		return nil
+	}
+
+	cfg := testManifestConfig()
+	off := buildManifests(cfg)
+	for _, o := range off {
+		switch o.(type) {
+		case *rbacv1.Role, *rbacv1.RoleBinding, *rbacv1.ClusterRole, *rbacv1.ClusterRoleBinding:
+			t.Errorf("without --environment-metadata: the manifests have a %T", o)
+		}
+	}
+	pod := deployment(off).Spec.Template.Spec
+	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
+		t.Error("without --environment-metadata: the pod mounts the Kubernetes API token")
+	}
+	if slices.ContainsFunc(pod.Containers[0].Args, func(a string) bool { return strings.Contains(a, "environment-store") }) {
+		t.Errorf("without --environment-metadata: args = %v, want no store flag", pod.Containers[0].Args)
+	}
+
+	cfg.environmentMetadata = true
+	on := buildManifests(cfg)
+	var role *rbacv1.Role
+	var binding *rbacv1.RoleBinding
+	for _, o := range on {
+		switch v := o.(type) {
+		case *rbacv1.Role:
+			role = v
+		case *rbacv1.RoleBinding:
+			binding = v
+		case *rbacv1.ClusterRole, *rbacv1.ClusterRoleBinding:
+			t.Errorf("the store needs no cluster-wide permission, got a %T", o)
+		}
+	}
+	if role == nil || binding == nil {
+		t.Fatalf("with --environment-metadata: role = %v, binding = %v, want both", role, binding)
+	}
+	if role.Namespace != cfg.namespace || len(role.Rules) != 1 {
+		t.Fatalf("role = %+v, want one rule in namespace %s", role, cfg.namespace)
+	}
+	rule := role.Rules[0]
+	if !slices.Equal(rule.APIGroups, []string{""}) || !slices.Equal(rule.Resources, []string{"configmaps"}) ||
+		!slices.Equal(rule.Verbs, envstore.Verbs) {
+		t.Errorf("rule = %+v, want the verbs the store uses, %v, on configmaps and no other", rule, envstore.Verbs)
+	}
+	if binding.Namespace != cfg.namespace || binding.RoleRef.Kind != "Role" || binding.RoleRef.Name != role.Name ||
+		len(binding.Subjects) != 1 || binding.Subjects[0].Kind != "ServiceAccount" ||
+		binding.Subjects[0].Name != apiName || binding.Subjects[0].Namespace != cfg.namespace {
+		t.Errorf("binding = %+v, want the Role bound to ate-env-api's ServiceAccount", binding)
+	}
+	pod = deployment(on).Spec.Template.Spec
+	if pod.AutomountServiceAccountToken == nil || !*pod.AutomountServiceAccountToken {
+		t.Error("with --environment-metadata: the pod does not mount the Kubernetes API token")
+	}
+	if !slices.Contains(pod.Containers[0].Args, "-environment-store=configmaps") {
+		t.Errorf("with --environment-metadata: args = %v, want -environment-store=configmaps", pod.Containers[0].Args)
+	}
+	// The Deployment needs the namespace to place the objects.
+	if !slices.ContainsFunc(pod.Containers[0].Env, func(e corev1.EnvVar) bool { return e.Name == "POD_NAMESPACE" }) {
+		t.Error("with --environment-metadata: the container has no POD_NAMESPACE")
+	}
+}
+
+// allowedHostsArg returns the value of the -allowed-hosts argument, or "" if
+// the deployment has none.
+func allowedHostsArg(dep *appsv1.Deployment) (string, bool) {
+	for _, a := range dep.Spec.Template.Spec.Containers[0].Args {
+		if v, ok := strings.CutPrefix(a, "-allowed-hosts="); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func TestBuildAPIDeploymentAllowedHosts(t *testing.T) {
+	cfg := testManifestConfig()
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	// ate-env-api derives the Service names itself (in the cluster's own
+	// domain); the manifest names the Service and passes the namespace.
+	if !slices.Contains(c.Args, "-service-name="+apiName) {
+		t.Errorf("args = %v, want -service-name=%s", c.Args, apiName)
+	}
+	if got, ok := allowedHostsArg(dep); ok {
+		t.Errorf("-allowed-hosts=%q rendered without --api-allowed-hosts, want none", got)
+	}
+	ns := false
+	for _, e := range c.Env {
+		if e.Name == "POD_NAMESPACE" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil && e.ValueFrom.FieldRef.FieldPath == "metadata.namespace" {
+			ns = true
+		}
+	}
+	if !ns {
+		t.Errorf("env = %+v, want POD_NAMESPACE from metadata.namespace", c.Env)
+	}
+
+	cfg.allowedHosts = []string{"lb.internal.example", "*.corp.example"}
+	got, _ := allowedHostsArg(buildAPIDeployment(cfg))
+	checker, err := hostcheck.New(hostcheck.ParseList(got))
+	if err != nil {
+		t.Fatalf("rendered -allowed-hosts=%q does not parse: %v", got, err)
+	}
+	for _, host := range []string{"lb.internal.example", "api.corp.example:7777"} {
+		if !checker.Allowed(host) {
+			t.Errorf("rendered -allowed-hosts=%q refuses %q", got, host)
+		}
+	}
+}
+
+func TestManifestCommandAPIAllowedHosts(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--api-allowed-hosts=lb.internal.example,*.corp.example",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute manifest: %v", err)
+	}
+	if want := "-allowed-hosts=lb.internal.example,*.corp.example"; !strings.Contains(buf.String(), want) {
+		t.Errorf("manifest output lacks %q:\n%s", want, buf.String())
+	}
+
+	cmd = newManifestCommand()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--api-allowed-hosts=http://lb.internal.example:7777",
+	})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--api-allowed-hosts") {
+		t.Errorf("a URL in --api-allowed-hosts: err = %v, want an --api-allowed-hosts error", err)
+	}
+}
+
+func TestManifestRejectsBadMetricsPort(t *testing.T) {
+	for _, port := range []string{"--metrics-port=7777", "--metrics-port=70000", "--metrics-port=-1"} {
+		cmd := newManifestCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs([]string{"--api-image=example.com/api@sha256:cccc", "--worker-image=example.com/worker@sha256:bbbb", port})
+		if err := cmd.Execute(); err == nil {
+			t.Errorf("%s: manifest succeeded, want an error", port)
+		}
+	}
+}
+
+// PP-12: --port-proxy-host-suffix sets ate-env-api's -port-proxy-host-suffix
+// on the Deployment and adds no object: wildcard DNS and TLS are the
+// operator's. Without the flag the argument is absent.
+func TestManifestPortProxyHostSuffix(t *testing.T) {
+	kinds := func(out string) []string {
+		var got []string
+		for line := range strings.SplitSeq(out, "\n") {
+			if strings.HasPrefix(line, "kind: ") {
+				got = append(got, line)
+			}
+		}
+		return got
+	}
+	plain, err := runManifest(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plain, "port-proxy-host-suffix") {
+		t.Errorf("-port-proxy-host-suffix rendered without the flag:\n%s", plain)
+	}
+	out, err := runManifest(t, "--port-proxy-host-suffix=ports.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(out, "- -port-proxy-host-suffix=ports.example\n"); n != 1 {
+		t.Errorf("-port-proxy-host-suffix=ports.example rendered %d times, want once:\n%s", n, out)
+	}
+	if got, want := kinds(out), kinds(plain); len(want) == 0 || !slices.Equal(got, want) {
+		t.Errorf("the flag changed the objects: %q, want %q", got, want)
+	}
+	for _, bad := range []string{"*.ports.example", "https://ports.example", "ports.example:443", "10.0.0.1"} {
+		if _, err := runManifest(t, "--port-proxy-host-suffix="+bad); err == nil || !strings.Contains(err.Error(), "--port-proxy-host-suffix") {
+			t.Errorf("--port-proxy-host-suffix=%s: err = %v, want a --port-proxy-host-suffix error", bad, err)
+		}
+	}
+	// PP-13: a suffix that covers a name of the API is refused.
+	for _, args := range [][]string{
+		{"--port-proxy-host-suffix=svc.cluster.local"},
+		{"--port-proxy-host-suffix=ate-env.svc"},
+		{"--port-proxy-host-suffix=team-env.svc", "--namespace=team-env"},
+		{"--port-proxy-host-suffix=localhost"},
+		{"--port-proxy-host-suffix=internal.example", "--api-allowed-hosts=lb.internal.example"},
+		{"--port-proxy-host-suffix=corp.example", "--api-allowed-hosts=*.corp.example"},
+	} {
+		if _, err := runManifest(t, args...); err == nil || !strings.Contains(err.Error(), "--port-proxy-host-suffix") {
+			t.Errorf("%q: err = %v, want a --port-proxy-host-suffix error", args, err)
+		}
+	}
+	for _, args := range [][]string{
+		{"--port-proxy-host-suffix=ports.localhost"},
+		{"--port-proxy-host-suffix=ports.internal.example", "--api-allowed-hosts=lb.internal.example"},
+		{"--port-proxy-host-suffix=ports.corp.example", "--api-allowed-hosts=*.corp.example"},
+	} {
+		if _, err := runManifest(t, args...); err != nil {
+			t.Errorf("%q: %v, want the manifest", args, err)
+		}
+	}
+}
+
+// FS-6: --pod-monitoring renders a PodMonitoring that scrapes ate-env-api's
+// metrics port every 5 s, selecting the pods of the API Deployment.
+func TestManifestPodMonitoring(t *testing.T) {
+	out, err := runManifest(t, "--namespace=team-a", "--metrics-port=9090", "--pod-monitoring")
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := strings.Split(out, "\n---\n")
+	var pm struct {
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Metadata   struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+		Spec struct {
+			Selector  metav1.LabelSelector `json:"selector"`
+			Endpoints []struct {
+				Port     string `json:"port"`
+				Path     string `json:"path"`
+				Interval string `json:"interval"`
+			} `json:"endpoints"`
+		} `json:"spec"`
+	}
+	if err := yaml.Unmarshal([]byte(docs[len(docs)-1]), &pm); err != nil {
+		t.Fatal(err)
+	}
+	if pm.APIVersion != "monitoring.googleapis.com/v1" || pm.Kind != "PodMonitoring" {
+		t.Fatalf("last document is %s %s, want monitoring.googleapis.com/v1 PodMonitoring:\n%s", pm.APIVersion, pm.Kind, out)
+	}
+	if pm.Metadata.Name != apiName || pm.Metadata.Namespace != "team-a" {
+		t.Errorf("PodMonitoring %s/%s, want team-a/%s", pm.Metadata.Namespace, pm.Metadata.Name, apiName)
+	}
+
+	cfg := testManifestConfig()
+	cfg.namespace = "team-a"
+	podLabels := buildAPIDeployment(cfg).Spec.Template.Labels
+	if !reflect.DeepEqual(pm.Spec.Selector.MatchLabels, podLabels) {
+		t.Errorf("selector %v, want the API pods' labels %v", pm.Spec.Selector.MatchLabels, podLabels)
+	}
+	if len(pm.Spec.Endpoints) != 1 {
+		t.Fatalf("endpoints = %+v, want one", pm.Spec.Endpoints)
+	}
+	if e := pm.Spec.Endpoints[0]; e.Port != metricsPortName || e.Path != "/metrics" || e.Interval != "5s" {
+		t.Errorf("endpoint = %+v, want port %q, /metrics, every 5s", e, metricsPortName)
+	}
+}
+
+func TestManifestPodMonitoringOffByDefault(t *testing.T) {
+	out, err := runManifest(t, "--metrics-port=9090")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "PodMonitoring") {
+		t.Errorf("manifest without --pod-monitoring renders a PodMonitoring:\n%s", out)
+	}
+}
+
+func TestManifestPodMonitoringNeedsMetricsPort(t *testing.T) {
+	_, err := runManifest(t, "--pod-monitoring")
+	if err == nil || !strings.Contains(err.Error(), "--metrics-port") {
+		t.Errorf("err = %v, want one that asks for --metrics-port", err)
+	}
+}
+
+// PW-48, PW-49 (docs/plans/preflight-warmer/acceptance-criteria.md): running
+// `ate-env manifest` with --domains and --node-selector wires both flags into
+// the rendered WorkerPool objects alongside the Namespace and ate-env-api.
+func TestManifestCommandDomainsAndNodeSelector(t *testing.T) {
+	out, err := runManifest(t, "--domains=3", "--replicas=8", "--node-selector=a=b")
+	if err != nil {
+		t.Fatalf("manifest --domains=3 --node-selector=a=b: %v", err)
+	}
+	docs := strings.Split(strings.TrimSpace(out), "\n---\n")
+	if len(docs) != 7 {
+		t.Fatalf("got %d YAML documents, want 7 (Namespace + 3 WorkerPools + ServiceAccount + Deployment + Service)", len(docs))
+	}
+	for i := range 3 {
+		dom := "d" + string(rune('0'+i))
+		var pool atev1.WorkerPool
+		if err := yaml.Unmarshal([]byte(docs[1+i]), &pool); err != nil {
+			t.Fatalf("unmarshal pool[%d]: %v\n%s", i, err, docs[1+i])
+		}
+		wantName := "default-template-workerpool-" + dom
+		if pool.Kind != "WorkerPool" || pool.Name != wantName {
+			t.Errorf("pool[%d] = %s/%s, want WorkerPool/%s", i, pool.Kind, pool.Name, wantName)
+		}
+		if pool.Spec.Replicas != 8 {
+			t.Errorf("pool[%d] replicas = %d, want 8", i, pool.Spec.Replicas)
+		}
+		if len(pool.Labels) != 2 || pool.Labels[workerPoolLabel] != "default-template-workerpool" || pool.Labels[domainLabel] != dom {
+			t.Errorf("pool[%d] labels = %v, want %s=default-template-workerpool and %s=%s",
+				i, pool.Labels, workerPoolLabel, domainLabel, dom)
+		}
+		if pool.Spec.Template == nil || len(pool.Spec.Template.Labels) != 0 {
+			t.Fatalf("pool[%d] spec.template = %+v, want non-nil with empty labels", i, pool.Spec.Template)
+		}
+		gotSel := pool.Spec.Template.NodeSelector
+		if len(gotSel) != 2 || gotSel["a"] != "b" || gotSel[domainLabel] != dom {
+			t.Errorf("pool[%d] nodeSelector = %v, want a=b and %s=%s", i, gotSel, domainLabel, dom)
+		}
+	}
+}
+
+// PW-48, PW-49 (docs/plans/preflight-warmer/acceptance-criteria.md): --domains
+// renders one WorkerPool per placement domain sharing ate-env/workerpool and
+// carrying ate-env/domain in metadata.labels and spec.template.nodeSelector.
+// --node-selector sets spec.template.nodeSelector.
+func TestBuildManifestsWithDomainsAndNodeSelector(t *testing.T) {
+	// Single pool with --node-selector clones the map and keeps metadata.labels
+	// to ate-env/workerpool alone.
+	single := testManifestConfig()
+	callerSel := map[string]string{"ate-env/role": "sandbox-worker"}
+	single.nodeSelector = callerSel
+	singlePool := buildWorkerPool(single)
+	callerSel["ate-env/role"] = "mutated"
+	if got := singlePool.Spec.Template.NodeSelector; len(got) != 1 || got["ate-env/role"] != "sandbox-worker" {
+		t.Fatalf("single pool nodeSelector = %v, want ate-env/role=sandbox-worker", got)
+	}
+	if _, hasDomain := singlePool.Labels[domainLabel]; hasDomain {
+		t.Errorf("single pool labels = %v, want no %s", singlePool.Labels, domainLabel)
+	}
+
+	cfg := testManifestConfig()
+	cfg.domains = 3
+	cfg.replicas = 8
+	cfg.nodeSelector = map[string]string{"ate-env/role": "sandbox-worker"}
+	objs := buildManifests(cfg)
+	// Namespace + 3 WorkerPools + ServiceAccount + Deployment + Service = 7.
+	if len(objs) != 7 {
+		t.Fatalf("got %d manifests, want 7", len(objs))
+	}
+	baseSel := buildActorTemplate(testTemplateConfig()).GetWorkerSelector().GetMatchLabels()
+	for i := range 3 {
+		dom := "d" + string(rune('0'+i))
+		pool, ok := objs[1+i].(*atev1.WorkerPool)
+		if !ok {
+			t.Fatalf("objs[%d] = %T, want *atev1.WorkerPool", 1+i, objs[1+i])
+		}
+		wantName := "default-template-workerpool-" + dom
+		if pool.Name != wantName {
+			t.Errorf("pool[%d] name = %q, want %q", i, pool.Name, wantName)
+		}
+		if pool.Spec.Replicas != 8 {
+			t.Errorf("pool[%d] replicas = %d, want 8", i, pool.Spec.Replicas)
+		}
+		// WorkerPoolSyncer copies metadata.labels onto Worker.labels and
+		// ignores spec.template.labels. Both workerPoolLabel and domainLabel
+		// belong here.
+		if len(pool.Labels) != 2 || pool.Labels[workerPoolLabel] != "default-template-workerpool" || pool.Labels[domainLabel] != dom {
+			t.Errorf("pool[%d] metadata.labels = %v, want %s=default-template-workerpool and %s=%s",
+				i, pool.Labels, workerPoolLabel, domainLabel, dom)
+		}
+		for k, v := range baseSel {
+			if pool.Labels[k] != v {
+				t.Errorf("base template selector %v does not match pool[%d] labels %v", baseSel, i, pool.Labels)
+			}
+		}
+		if pool.Spec.Template == nil {
+			t.Fatalf("pool[%d] spec.template = nil, want nodeSelector", i)
+		}
+		if len(pool.Spec.Template.Labels) != 0 {
+			t.Errorf("pool[%d] spec.template.labels = %v, want empty", i, pool.Spec.Template.Labels)
+		}
+		wantNodeSel := map[string]string{
+			"ate-env/role": "sandbox-worker",
+			domainLabel:    dom,
+		}
+		if got := pool.Spec.Template.NodeSelector; len(got) != 2 || got["ate-env/role"] != wantNodeSel["ate-env/role"] || got[domainLabel] != dom {
+			t.Errorf("pool[%d] nodeSelector = %v, want %v", i, got, wantNodeSel)
+		}
+	}
+	if _, ok := objs[4].(*corev1.ServiceAccount); !ok {
+		t.Errorf("objs[4] = %T, want *corev1.ServiceAccount after the 3 pools", objs[4])
+	}
+}
+
+// PW-50 (docs/plans/preflight-warmer/acceptance-criteria.md): `ate-env manifest
+// workerpool` prints WorkerPool objects alone and composes across heterogeneous
+// node pools with --domain-offset under one shared ate-env/workerpool label.
+func TestManifestWorkerPoolSubcommandAndHeterogeneousOffsets(t *testing.T) {
+	// Single pool without --domains omits spec.template when --node-selector is unset.
+	cmd := newManifestCommand()
+	var singleOut bytes.Buffer
+	cmd.SetOut(&singleOut)
+	cmd.SetArgs([]string{
+		"workerpool",
+		"--worker-image=example.com/worker@sha256:bbbb",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("manifest workerpool: %v", err)
+	}
+	if strings.Contains(singleOut.String(), "kind: Deployment") || strings.Contains(singleOut.String(), "kind: Namespace") {
+		t.Fatalf("workerpool printed non-WorkerPool objects:\n%s", singleOut.String())
+	}
+	var singlePool atev1.WorkerPool
+	if err := yaml.Unmarshal(singleOut.Bytes(), &singlePool); err != nil {
+		t.Fatalf("unmarshal single workerpool: %v", err)
+	}
+	if singlePool.Kind != "WorkerPool" || singlePool.Name != "default-template-workerpool" || singlePool.Spec.Template != nil {
+		t.Errorf("single workerpool = %+v, want default-template-workerpool with nil spec.template", singlePool)
+	}
+
+	// Heterogeneous two-tier setup sharing fast-base-workerpool:
+	// tier 1 = d0..d1 (32 replicas on big-workers), tier 2 = d2..d4 (8 replicas on fast-workers).
+	runTier := func(extra ...string) []*atev1.WorkerPool {
+		t.Helper()
+		c := newManifestCommand()
+		var buf bytes.Buffer
+		c.SetOut(&buf)
+		args := append([]string{
+			"workerpool",
+			"--workerpool=fast-base-workerpool",
+			"--worker-image=example.com/worker@sha256:bbbb",
+		}, extra...)
+		c.SetArgs(args)
+		if err := c.Execute(); err != nil {
+			t.Fatalf("workerpool %v: %v", extra, err)
+		}
+		docs := strings.Split(strings.TrimSpace(buf.String()), "\n---\n")
+		pools := make([]*atev1.WorkerPool, len(docs))
+		for i, doc := range docs {
+			var p atev1.WorkerPool
+			if err := yaml.Unmarshal([]byte(doc), &p); err != nil {
+				t.Fatalf("unmarshal doc %d: %v\n%s", i, err, doc)
+			}
+			pools[i] = &p
+		}
+		return pools
+	}
+
+	big := runTier("--domains=2", "--replicas=32", "--node-selector=cloud.google.com/gke-nodepool=big-workers")
+	fast := runTier("--domains=3", "--domain-offset=2", "--replicas=8", "--node-selector=cloud.google.com/gke-nodepool=fast-workers")
+	all := append(big, fast...)
+	if len(all) != 5 {
+		t.Fatalf("got %d total pools, want 5", len(all))
+	}
+	wantDomains := []string{"d0", "d1", "d2", "d3", "d4"}
+	wantReplicas := []int32{32, 32, 8, 8, 8}
+	wantNodePool := []string{"big-workers", "big-workers", "fast-workers", "fast-workers", "fast-workers"}
+	for i, p := range all {
+		if p.Name != "fast-base-workerpool-"+wantDomains[i] {
+			t.Errorf("pool[%d] name = %q, want fast-base-workerpool-%s", i, p.Name, wantDomains[i])
+		}
+		if p.Labels[workerPoolLabel] != "fast-base-workerpool" || p.Labels[domainLabel] != wantDomains[i] {
+			t.Errorf("pool[%d] labels = %v, want shared fast-base-workerpool and domain %s", i, p.Labels, wantDomains[i])
+		}
+		if p.Spec.Replicas != wantReplicas[i] {
+			t.Errorf("pool[%d] replicas = %d, want %d", i, p.Spec.Replicas, wantReplicas[i])
+		}
+		gotNS := p.Spec.Template.NodeSelector
+		if gotNS["cloud.google.com/gke-nodepool"] != wantNodePool[i] || gotNS[domainLabel] != wantDomains[i] {
+			t.Errorf("pool[%d] nodeSelector = %v, want gke-nodepool=%s and %s=%s",
+				i, gotNS, wantNodePool[i], domainLabel, wantDomains[i])
+		}
+	}
+}
+
+// PW-51 (docs/plans/preflight-warmer/acceptance-criteria.md): flag and label
+// validation on `ate-env manifest`, `ate-env manifest workerpool` and
+// `ate-env manifest template`.
+func TestManifestDomainsAndNodeSelectorValidation(t *testing.T) {
+	pool60 := strings.Repeat("p", 60) // 60 + len("-d9") = 63 fits; 60 + len("-d10") = 64 overflows ate.dev/worker-pool
+	cmdOK := newManifestCommand()
+	cmdOK.SetOut(&bytes.Buffer{})
+	cmdOK.SetArgs([]string{
+		"workerpool",
+		"--workerpool=" + pool60,
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--domains=10",
+	})
+	if err := cmdOK.Execute(); err != nil {
+		t.Fatalf("63-char domain pool name rejected: %v", err)
+	}
+
+	// Accepted upper bounds: --domains=10000 (d0..d9999) and offset+domains == 10000.
+	cmdMax := newManifestCommand()
+	var maxOut bytes.Buffer
+	cmdMax.SetOut(&maxOut)
+	cmdMax.SetArgs([]string{
+		"workerpool",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--domains=10000",
+	})
+	if err := cmdMax.Execute(); err != nil {
+		t.Fatalf("--domains=10000 rejected: %v", err)
+	}
+	if got := strings.Count(maxOut.String(), "\nkind: WorkerPool\n"); got != 10000 {
+		t.Fatalf("--domains=10000 rendered %d pools, want 10000", got)
+	}
+
+	cmdMaxOffset := newManifestCommand()
+	var offOut bytes.Buffer
+	cmdMaxOffset.SetOut(&offOut)
+	cmdMaxOffset.SetArgs([]string{
+		"workerpool",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--domains=2",
+		"--domain-offset=9998",
+	})
+	if err := cmdMaxOffset.Execute(); err != nil {
+		t.Fatalf("--domains=2 --domain-offset=9998 rejected: %v", err)
+	}
+	if !strings.Contains(offOut.String(), "name: default-template-workerpool-d9999\n") {
+		t.Fatalf("--domains=2 --domain-offset=9998 missing d9999:\n%s", offOut.String())
+	}
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "explicit zero domains on manifest",
+			args: []string{"--api-image=example.com/a@sha256:cccc", "--worker-image=example.com/w@sha256:bbbb", "--domains=0"},
+			want: "--domains 0: want at least 1",
+		},
+		{
+			name: "negative domains",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=-1"},
+			want: "--domains -1: want at least 1",
+		},
+		{
+			name: "domains above cap",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=10001"},
+			want: "exceeds the maximum",
+		},
+		{
+			name: "offset without domains",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domain-offset=1"},
+			want: "--domain-offset requires --domains",
+		},
+		{
+			name: "negative offset",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=2", "--domain-offset=-1"},
+			want: "--domain-offset -1: want 0 or more",
+		},
+		{
+			name: "offset plus domains above cap",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=2", "--domain-offset=9999"},
+			want: "exceeds the maximum domain index",
+		},
+		{
+			name: "maxint offset does not overflow",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=1", "--domain-offset=9223372036854775807"},
+			want: "exceeds the maximum domain index",
+		},
+		{
+			name: "domain suffix pushes WorkerPool name past 63 chars",
+			args: []string{"workerpool", "--workerpool=" + pool60, "--worker-image=example.com/w@sha256:bbbb", "--domains=11"},
+			want: "pass a shorter --workerpool",
+		},
+		{
+			name: "negative replicas",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--replicas=-1"},
+			want: "--replicas -1: want 0 or more",
+		},
+		{
+			name: "missing worker-image on workerpool",
+			args: []string{"workerpool", "--domains=2"},
+			want: "--worker-image is required",
+		},
+		{
+			name: "empty namespace on workerpool",
+			args: []string{"workerpool", "--namespace= ", "--worker-image=example.com/w@sha256:bbbb"},
+			want: "--namespace is empty",
+		},
+		{
+			name: "invalid namespace on workerpool",
+			args: []string{"workerpool", "--namespace=Bad_NS", "--worker-image=example.com/w@sha256:bbbb"},
+			want: "--namespace \"Bad_NS\"",
+		},
+		{
+			name: "explicit empty template",
+			args: []string{"workerpool", "--template=", "--worker-image=example.com/w@sha256:bbbb"},
+			want: "--template must not be empty",
+		},
+		{
+			name: "explicit whitespace workerpool",
+			args: []string{"workerpool", "--workerpool= ", "--worker-image=example.com/w@sha256:bbbb"},
+			want: "--workerpool must not be empty",
+		},
+		{
+			name: "invalid workerpool characters",
+			args: []string{"workerpool", "--workerpool=Bad/Pool-", "--worker-image=example.com/w@sha256:bbbb", "--domains=1"},
+			want: "worker pool name \"Bad/Pool-\"",
+		},
+		{
+			name: "non-DNS-1123 workerpool underscore on manifest",
+			args: []string{"--api-image=example.com/a@sha256:cccc", "--worker-image=example.com/w@sha256:bbbb", "--workerpool=Bad_Pool"},
+			want: "worker pool name \"Bad_Pool\"",
+		},
+		{
+			name: "non-DNS-1123 workerpool underscore on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--workerpool=Bad_Pool"},
+			want: "worker pool name \"Bad_Pool\"",
+		},
+		{
+			name: "explicit empty template on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--template="},
+			want: "--template must not be empty",
+		},
+		{
+			name: "explicit whitespace template on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--template= "},
+			want: "--template must not be empty",
+		},
+		{
+			name: "explicit empty workerpool on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--workerpool="},
+			want: "--workerpool must not be empty",
+		},
+		{
+			name: "explicit whitespace workerpool on manifest template",
+			args: []string{"template", "--guest-image=example.com/g@sha256:aaaa", "--workerpool= "},
+			want: "--workerpool must not be empty",
+		},
+		{
+			name: "explicit empty node-selector",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector="},
+			want: "--node-selector \"\": want key=value",
+		},
+		{
+			name: "empty node-selector after non-empty node-selector",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=a=1", "--node-selector="},
+			want: "--node-selector \"\": want key=value",
+		},
+		{
+			name: "empty node-selector after non-empty node-selector on manifest",
+			args: []string{"--api-image=example.com/a@sha256:cccc", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=a=1", "--node-selector="},
+			want: "--node-selector \"\": want key=value",
+		},
+		{
+			name: "trailing comma in node-selector",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=a=1,"},
+			want: "--node-selector \"\": want key=value",
+		},
+		{
+			name: "malformed node-selector",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=missingequals"},
+			want: "--node-selector \"missingequals\": want key=value",
+		},
+		{
+			name: "duplicate node-selector key",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=a=1", "--node-selector=a=2"},
+			want: "--node-selector a is given twice",
+		},
+		{
+			name: "invalid node-selector key",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=bad key=v"},
+			want: "--node-selector key",
+		},
+		{
+			name: "invalid node-selector value",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=k=bad/val"},
+			want: "--node-selector k=\"bad/val\"",
+		},
+		{
+			name: "node-selector collides with domain label under domains",
+			args: []string{"workerpool", "--worker-image=example.com/w@sha256:bbbb", "--domains=2", "--node-selector=ate-env/domain=d0"},
+			want: "cannot set ate-env/domain",
+		},
+		{
+			name: "node-selector collides with domain label without domains",
+			args: []string{"--api-image=example.com/a@sha256:cccc", "--worker-image=example.com/w@sha256:bbbb", "--node-selector=ate-env/domain=d5"},
+			want: "cannot set ate-env/domain",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newManifestCommand()
+			c.SetOut(&bytes.Buffer{})
+			c.SetErr(&bytes.Buffer{})
+			c.SetArgs(tc.args)
+			err := c.Execute()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}

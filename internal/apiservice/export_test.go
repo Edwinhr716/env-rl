@@ -1,0 +1,95 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package apiservice
+
+import (
+	"testing"
+	"time"
+
+	"google.golang.org/grpc"
+)
+
+// SetWarmTimings shortens the backoff between the attempts of a WarmImage
+// probe's create, resume and delete, and the budget of its delete, for the
+// duration of t.
+func SetWarmTimings(t *testing.T, retryInitial, retryMax, deleteTimeout time.Duration) {
+	oldInitial, oldMax, oldDelete := warmRetryInitial.Load(), warmRetryMax.Load(), warmDeleteTimeout.Load()
+	warmRetryInitial.Store(retryInitial)
+	warmRetryMax.Store(retryMax)
+	warmDeleteTimeout.Store(deleteTimeout)
+	t.Cleanup(func() {
+		warmRetryInitial.Store(oldInitial)
+		warmRetryMax.Store(oldMax)
+		warmDeleteTimeout.Store(oldDelete)
+	})
+}
+
+// SetTemplateRecreateTimeout sets the bound of the recreate loop for the
+// duration of t.
+func SetTemplateRecreateTimeout(t *testing.T, d time.Duration) {
+	old := templateRecreateTimeout
+	templateRecreateTimeout = d
+	t.Cleanup(func() { templateRecreateTimeout = old })
+}
+
+// WarmProbesInFlight reports the probe slots WarmImage calls hold on this
+// server, over every selector, for tests that wait for a cancelled call's
+// cleanup to end.
+func (s *Server) WarmProbesInFlight() int {
+	s.warmSlots.mu.Lock()
+	defer s.warmSlots.mu.Unlock()
+	total := 0
+	for _, w := range s.warmSlots.m {
+		w.mu.Lock()
+		total += w.inflight
+		w.mu.Unlock()
+	}
+	return total
+}
+
+// SetWarmLateCreateSettle sets how long WarmImage watches for the late create
+// of a probe whose create was never confirmed, for the duration of t.
+func SetWarmLateCreateSettle(t *testing.T, d time.Duration) {
+	old := warmLateCreateSettle.Load()
+	warmLateCreateSettle.Store(d)
+	t.Cleanup(func() { warmLateCreateSettle.Store(old) })
+}
+
+// RouterConns returns a slice copy of the active pooled router connections.
+func (s *Server) RouterConns() []*grpc.ClientConn {
+	s.routerPoolMu.Lock()
+	defer s.routerPoolMu.Unlock()
+	out := make([]*grpc.ClientConn, len(s.routerConns))
+	copy(out, s.routerConns)
+	return out
+}
+
+// IsAwakeCached reports whether targetActor is currently recorded as awake in the awake cache.
+func (s *Server) IsAwakeCached(targetActor string) bool {
+	if s.awakeEnvs == nil {
+		return false
+	}
+	return s.awakeEnvs.Contains(targetActor)
+}
+
+// AwakeCacheLen reports the total number of entries held in boundedAwakeCache.
+func (s *Server) AwakeCacheLen() int {
+	if s.awakeEnvs == nil {
+		return 0
+	}
+	s.awakeEnvs.mu.Lock()
+	defer s.awakeEnvs.mu.Unlock()
+	return len(s.awakeEnvs.entries)
+}

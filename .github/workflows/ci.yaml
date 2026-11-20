@@ -1,0 +1,266 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Checks for pull requests and main: Go build, vet, test, protos, license
+# headers, Markdown formatting and the generated docs/metrics.md; Python
+# client (base install and telemetry extras), telemetry report tool and
+# integration tests; the OpenHands, Harbor and E2B integrations; release builds and
+# distributions; the Dafny models in docs/plans/telemetry/verify; and Kind
+# E2E smoke tests. Release publishing lives in release.yaml. Actions are
+# pinned by commit SHA (version in the trailing comment), as the
+# organization's workflow security scan requires.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Required status check on main (or planned); renaming requires a matching ruleset update.
+  go:
+    name: Go build, vet, test and license headers
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: restore
+          scope: go
+      - name: Run Go CI checks via Nix
+        shell: nix develop -c bash -eo pipefail {0}
+        run: ci-go
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: save
+          scope: go
+      - name: Upload Go coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-go
+          path: coverage/
+          if-no-files-found: ignore
+
+  # Required status check on main (or planned); renaming requires a matching ruleset update.
+  python:
+    name: Python client and integration tests
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run Python CI checks via Nix
+        shell: nix develop -c bash -eo pipefail {0}
+        run: ci-python
+      - name: Upload Python coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-python
+          path: coverage/
+          if-no-files-found: ignore
+
+  # Required status check on main (or planned); renaming requires a matching ruleset update.
+  e2e-kind:
+    name: E2E Kind and Smoke Test
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    # A run with a restored cache takes 12 to 17 minutes. A run with no cache
+    # of the scope at all (the first one, or after GitHub evicted them) took
+    # 30m13 on 2026-11-12, of which the Substrate install was 15m24, and then
+    # still has to upload the cache. The limit must leave room for that run:
+    # one that is cancelled saves no cache, so the next one is as slow.
+    timeout-minutes: 40
+    steps:
+      # The root disk of the hosted runner fills while `ate-setup --kind deploy`
+      # builds the envoy-dataplane image (a rust:bookworm builder stage) next
+      # to the Nix store, the Go caches and the Kind node image: the job failed
+      # with "no space left on device" on every run from 2026-11-11 17:55Z on,
+      # with the runner image, the caches and the base images unchanged. The
+      # toolchains removed here are preinstalled on the runner and not used:
+      # the job takes its tools from Nix. `df` before and after puts the free
+      # space in the log, which had no trace of it.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # A separate scope from the Go job: ko's build flags differ, so the two
+      # caches don't share entries (see the action for details).
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: restore
+          scope: e2e
+      - name: Run E2E Kind and Smoke Test via Nix
+        shell: nix develop -c bash -eo pipefail {0}
+        run: ci-e2e
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: save
+          scope: e2e
+
+  # Required status check on main (or planned); renaming requires a matching ruleset update.
+  openhands:
+    # A job of its own: openhands-sdk and the agent-server the tests start pull
+    # in a large dependency set that the other Python checks do not need. It runs
+    # in the .#openhands devShell, whose env nix/python.nix builds from uv.lock.
+    name: OpenHands integration
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run OpenHands tests and ruff
+        shell: nix develop .#openhands -c bash -eo pipefail {0}
+        run: |
+          python -m pytest integrations/openhands/tests -q
+          ruff check integrations/openhands examples/openhands
+
+  harbor:
+    # Its own job: harbor pulls a large dependency set, and the trial test
+    # starts containers through the runner's docker daemon. It runs in the
+    # .#harbor devShell via pip venv, like the OpenHands job: harbor is pinned
+    # to one minor in integrations/harbor/pyproject.toml and is not in nixpkgs.
+    name: Harbor integration
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run Harbor tests and ruff
+        shell: nix develop .#harbor -c bash -eo pipefail {0}
+        run: |
+          python -m pytest integrations/harbor/tests -q
+          ruff check integrations/harbor
+
+  e2b:
+    # Its own job, like OpenHands and Harbor: the e2b SDK and its HTTP stack
+    # are a dependency set that no other Python check needs. The tests need no
+    # cluster and no Docker: a fake ate-env-api stands in. tests/test_envd_e2e.py
+    # and tests/test_sandbox_e2e.py are skipped here; the Kind E2E job runs them.
+    name: E2B integration
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run E2B tests and ruff
+        shell: nix develop .#e2b -c bash -eo pipefail {0}
+        run: |
+          python -m pytest integrations/e2b/tests -q
+          ruff check integrations/e2b
+
+  dafny:
+    # The hand-written Dafny models of the telemetry and warm-pool code
+    # (docs/plans/telemetry/verify). Some lemmas fail by design, so the check
+    # compares the results with the README's counts and failing lemmas
+    # instead of requiring a clean run. A job of its own: the .#dafny devShell
+    # brings the .NET SDK and Z3, which no other check needs.
+    name: Dafny models
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify the Dafny models against their README
+        shell: nix develop .#dafny -c bash -eo pipefail {0}
+        run: |
+          dafny --version
+          python3 hack/verify/dafny.py
+
+  validate-release:
+    name: Validate release builds and distributions
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
+    steps:
+      # As in the Kind E2E job: the hosted runner's root disk fills while
+      # ci-release cross-compiles ate-env across four OS/arch targets next to
+      # the Nix store and the Go caches.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # A separate scope from the Go job: ci-release cross-compiles with
+      # CGO_ENABLED=0 and -trimpath across linux/darwin x amd64/arm64, so the
+      # Go job's -race build cache gives no hits and only fills the disk.
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: restore
+          scope: release
+      - name: Validate release builds and distributions via Nix
+        shell: nix develop -c bash -eo pipefail {0}
+        run: ci-release
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: save
+          scope: release
