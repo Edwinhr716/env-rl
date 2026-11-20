@@ -98,6 +98,44 @@ def _as_root(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
+def _split_copy_dest(src_path: str, dest_path: str) -> tuple[str, str]:
+    # A dest_path that ends with "/" names the directory to copy into:
+    # the member keeps the source's name (an empty member name makes
+    # tar fail).
+    if dest_path.endswith("/"):
+        dest_dir = dest_path.rstrip("/") or "/"
+        arcname = os.path.basename(os.path.normpath(src_path))
+    else:
+        dest_dir = os.path.dirname(dest_path) or "/"
+        arcname = os.path.basename(dest_path)
+    return dest_dir, arcname
+
+
+class _CopyBatch:
+    """In-memory tar buffer coalescing consecutive copies into one directory."""
+
+    def __init__(self, dest_dir: str) -> None:
+        self.dest_dir = dest_dir
+        self.buf = io.BytesIO()
+        self.tar = tarfile.open(fileobj=self.buf, mode="w")
+        self.pairs: list[tuple[str, str]] = []
+        self.copied_dests: set[str] = set()
+        self.chmod_paths: list[str] = []
+
+    def add(self, src_path: str, dest_path: str, arcname: str) -> None:
+        # Members are owned by root, and the extract does not restore owners:
+        # a sandbox root cannot chown to the host uid (tar exits 2).
+        self.tar.add(src_path, arcname=arcname, filter=_as_root)
+        self.pairs.append((src_path, dest_path))
+        self.copied_dests.add(
+            os.path.join(self.dest_dir, arcname) if dest_path.endswith("/") else dest_path
+        )
+
+    def finish(self) -> bytes:
+        self.tar.close()
+        return self.buf.getvalue()
+
+
 def _import_r2egym():
     try:
         from r2egym.agenthub.environment.env import EnvArgs, RepoEnv  # noqa: F401
@@ -208,6 +246,8 @@ def _build_classes() -> tuple[type, type]:
 
         def __init__(self, handle: Any, *, command=("/bin/bash", "-l"), logger=None, **docker_kwargs):
             self._handle = handle
+            self._batching_copies = False
+            self._copy_batch: _CopyBatch | None = None
             ds = _dataset_row(handle)
             # Check docker_kwargs["environment"] before the base constructor
             # runs its setup commands: a bad value must raise here, with no
@@ -255,6 +295,14 @@ def _build_classes() -> tuple[type, type]:
             # invalid after construction raises TypeError, it is not a
             # transport failure.
             env = self._exec_env()
+            batch = self._copy_batch
+            if batch is not None and batch.pairs:
+                if not args and code.startswith("chmod +x "):
+                    target = code[len("chmod +x ") :]
+                    if target.startswith("/") and target in batch.copied_dests:
+                        batch.chmod_paths.append(target)
+                        return "", "0"
+                self._flush_copy_batch()
             try:
                 # check=False: a non-zero exit or a timeout is a result here,
                 # mapped below as R2E-Gym's backends map it; only transport
@@ -274,40 +322,80 @@ def _build_classes() -> tuple[type, type]:
                 return output, f"Error: Exit code {res.exit_code}"
             return _ANSI.sub("", output), str(res.exit_code)
 
-        def _copy_to_container_kubernetes(self, src_path, dest_path) -> None:
-            # A dest_path that ends with "/" names the directory to copy into:
-            # the member keeps the source's name (an empty member name makes
-            # tar fail).
-            if dest_path.endswith("/"):
-                dest_dir = dest_path.rstrip("/") or "/"
-                arcname = os.path.basename(os.path.normpath(src_path))
-            else:
-                dest_dir = os.path.dirname(dest_path) or "/"
-                arcname = os.path.basename(dest_path)
-            buf = io.BytesIO()
-            # Members are owned by root, and the extract does not restore owners:
-            # a sandbox root cannot chown to the host uid (tar exits 2).
-            with tarfile.open(fileobj=buf, mode="w") as tar:
-                tar.add(src_path, arcname=arcname, filter=_as_root)
+        @contextlib.contextmanager
+        def _batch_copies(self) -> Iterator[None]:
+            if self._batching_copies:
+                yield
+                return
+            self._batching_copies = True
+            try:
+                yield
+                self._flush_copy_batch()
+            finally:
+                if self._copy_batch is not None:
+                    with contextlib.suppress(Exception):
+                        self._copy_batch.tar.close()
+                    self._copy_batch = None
+                self._batching_copies = False
+
+        def _flush_copy_batch(self) -> None:
+            batch = self._copy_batch
+            if batch is None or not batch.pairs:
+                return
+            self._copy_batch = None
+            data = batch.finish()
+            self._stage_and_extract(batch.dest_dir, data, batch.pairs, batch.chmod_paths)
+
+        def _stage_and_extract(
+            self,
+            dest_dir: str,
+            data: bytes,
+            pairs: list[tuple[str, str]],
+            chmod_paths: list[str] | tuple[str, ...] = (),
+        ) -> None:
             staged = f"/tmp/ate-env-copy-{uuid.uuid4().hex[:12]}.tar"
-            self._handle.write_file(staged, buf.getvalue())
-            cmd = (
+            self._handle.write_file(staged, data)
+            unpack = (
                 f"mkdir -p -- {shlex.quote(dest_dir)} && tar --no-same-owner -xmf {shlex.quote(staged)} "
-                f"-C {shlex.quote(dest_dir)}; rc=$?; rm -f {shlex.quote(staged)}; exit $rc"
+                f"-C {shlex.quote(dest_dir)}"
             )
+            if chmod_paths:
+                chmods = " ".join(
+                    shlex.quote(f"./{p}" if p.startswith("-") else p)
+                    for p in dict.fromkeys(chmod_paths)
+                )
+                unpack = f"{unpack} && chmod +x {chmods}"
+            cmd = f"{unpack}; rc=$?; rm -f {shlex.quote(staged)}; exit $rc"
+            desc = ", ".join(f"{src} -> {dest}" for src, dest in pairs)
             res = self._handle.exec(cmd, timeout_s=_COPY_TIMEOUT_S, check=False)
             if res.timed_out:
                 # The guest killed the shell before its rm -f ran.
                 with contextlib.suppress(Exception):
                     self._handle.exec(f"rm -f {shlex.quote(staged)}", timeout_s=30, check=False)
                 raise RuntimeError(
-                    f"copy {src_path} -> {dest_path} timed out after {_COPY_TIMEOUT_S} s"
+                    f"copy {desc} timed out after {_COPY_TIMEOUT_S} s"
                 )
             if res.exit_code != 0:
                 detail = (res.stderr or "").strip() or (res.stdout or "").strip()
                 raise RuntimeError(
-                    f"copy {src_path} -> {dest_path} failed (exit {res.exit_code}): {detail}"
+                    f"copy {desc} failed (exit {res.exit_code}): {detail}"
                 )
+
+        def _copy_to_container_kubernetes(self, src_path, dest_path) -> None:
+            dest_dir, arcname = _split_copy_dest(src_path, dest_path)
+            if self._batching_copies:
+                if self._copy_batch is not None and self._copy_batch.dest_dir != dest_dir:
+                    self._flush_copy_batch()
+                if self._copy_batch is None:
+                    self._copy_batch = _CopyBatch(dest_dir)
+                self._copy_batch.add(src_path, dest_path, arcname)
+                return
+            buf = io.BytesIO()
+            # Members are owned by root, and the extract does not restore owners:
+            # a sandbox root cannot chown to the host uid (tar exits 2).
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                tar.add(src_path, arcname=arcname, filter=_as_root)
+            self._stage_and_extract(dest_dir, buf.getvalue(), [(src_path, dest_path)])
 
     class AteEnvRepoEnv(RepoEnv):
         """``RepoEnv`` whose runtime is an ``AteEnvRuntime``: no cold start."""
@@ -335,6 +423,17 @@ def _build_classes() -> tuple[type, type]:
             self.step_timeout = step_timeout
             self.reward_timeout = reward_timeout
             self.logger.info("Initialized AteEnvRepoEnv: %s image: %s", self.runtime.repo_name, self.runtime.docker_image)
+
+        def add_commands(self, cmd_files):
+            """Copy and chmod command files in one archive and one unpack."""
+            prev_commands = list(self.commands)
+            batch = getattr(self.runtime, "_batch_copies", None)
+            try:
+                with batch() if batch is not None else contextlib.nullcontext():
+                    return super().add_commands(cmd_files)
+            except Exception:
+                self.commands = prev_commands
+                raise
 
         def reset(self):
             """Soft reset: the binding is checked again, nothing is recreated. For

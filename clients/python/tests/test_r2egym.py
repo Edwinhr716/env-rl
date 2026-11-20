@@ -52,11 +52,13 @@ class _Handle:
         self.execs: list[tuple[str, str, float | None]] = []
         self.envs: list[dict | None] = []
         self.files: dict[str, bytes] = {}
+        self.calls: list[tuple[str, str]] = []
         self.replies: dict[str, _ExecResult] = {}
 
     def exec(self, command, cwd="", env=None, timeout_s=None, check=True):
         # Mirrors SandboxHandle.exec: with check=True a timeout or a non-zero
         # exit raises instead of returning the result.
+        self.calls.append(("exec", command))
         self.execs.append((command, cwd, timeout_s))
         self.envs.append(env)
         res = _ExecResult(0, stdout=f"ran: {command}\n")
@@ -73,6 +75,7 @@ class _Handle:
         return res
 
     def write_file(self, path, content):
+        self.calls.append(("write_file", path))
         self.files[path] = content if isinstance(content, bytes) else content.encode()
 
 
@@ -115,17 +118,46 @@ class _FakeBaseRuntime:
     def copy_to_container(self, src, dest):
         return self._copy_to_container_kubernetes(src, dest)
 
-    def add_commands(self, files):
-        for f in files:
-            self.copy_to_container(f, "/usr/local/bin/" + os.path.basename(f))
-
     def get_task_instruction(self):
         return "instruction"
 
 
+class _FakeCommandParser:
+    def parse_command_file(self, path):
+        with open(path) as f:
+            f.read()
+        return [SimpleNamespace(name=os.path.splitext(os.path.basename(path))[0])]
+
+
 class _FakeBaseRepoEnv:
-    def add_commands(self, files):
-        self.runtime.add_commands(files)
+    """Mirrors R2E-Gym's RepoEnv.add_commands: parse each file, strip .py,
+    copy into /usr/local/bin, and chmod +x (or source .sh / non-shebang files)."""
+
+    def _is_shebang_script(self, cmd_file):
+        with open(cmd_file) as f:
+            return f.readline().strip().startswith("#!")
+
+    def add_commands(self, cmd_files):
+        cmds = []
+        for cmd_file in cmd_files:
+            cmds.extend(self.cmd_parser.parse_command_file(cmd_file))
+            _, ext = os.path.splitext(cmd_file)
+            cmd_name = os.path.basename(cmd_file)
+            if ext == ".py" or self._is_shebang_script(cmd_file):
+                container_cmd_name = cmd_name[:-3] if ext == ".py" else cmd_name
+                container_path = f"/usr/local/bin/{container_cmd_name}"
+                self.runtime.copy_to_container(cmd_file, container_path)
+                self.runtime.run(f"chmod +x {container_path}")
+            elif ext == ".sh":
+                container_path = f"/usr/local/bin/{cmd_name}"
+                self.runtime.copy_to_container(cmd_file, container_path)
+                self.runtime.run(f"bash -c 'source {container_path}'")
+            else:
+                container_path = f"/usr/local/bin/{cmd_name}"
+                self.runtime.copy_to_container(cmd_file, container_path)
+                self.runtime.run(f"chmod +x {container_path}")
+                self.runtime.run(f"bash -c 'source {container_path}'")
+        self.commands = cmds
 
     def close(self):
         self.runtime.close()
@@ -172,7 +204,7 @@ def fake_r2egym(monkeypatch):
     mod("r2egym.agenthub.utils")
     mod("r2egym.agenthub.utils.log").get_logger = lambda *a, **k: MagicMock()
     mod("r2egym.agenthub.agent")
-    mod("r2egym.agenthub.agent.commands").ParseCommandBash = lambda: None
+    mod("r2egym.agenthub.agent.commands").ParseCommandBash = _FakeCommandParser
     yield docker_mod
     adapter._CLASSES = None
 
@@ -283,18 +315,23 @@ def test_run_maps_exit_codes_timeouts_and_errors(fake_r2egym):
 def test_copy_stages_a_tar_and_extracts_into_the_destination(fake_r2egym, tmp_path):
     handle = _Handle()
     env = adapter.make_fleet_repo_env(handle)
+    handle.calls.clear()
     src = tmp_path / "tool.py"
     src.write_text("print(1)\n")
     env.runtime.copy_to_container(str(src), "/usr/local/bin/renamed.py")
+    # One copy is two guest calls: write_file of the tar, then unpack-and-remove.
+    assert [kind for kind, _ in handle.calls] == ["write_file", "exec"]
     (staged, data), = handle.files.items()
     assert staged.startswith("/tmp/ate-env-copy-") and staged.endswith(".tar")
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
         assert tar.getnames() == ["renamed.py"]
     command = handle.execs[-1][0]
     assert f"tar --no-same-owner -xmf {staged} -C /usr/local/bin" in command and f"rm -f {staged}" in command
+    handle.calls.clear()
     handle.replies["-xmf"] = _ExecResult(1, stderr="tar: no space")
     with pytest.raises(RuntimeError, match="no space"):
         env.runtime.copy_to_container(str(src), "/usr/local/bin/again.py")
+    assert [kind for kind, _ in handle.calls] == ["write_file", "exec"]
 
 
 def test_copy_archives_members_as_root(fake_r2egym, tmp_path):
@@ -371,15 +408,73 @@ def test_requires_the_dataset_row(fake_r2egym):
         adapter.make_fleet_repo_env(_Handle(with_ds=False))
 
 
-def test_command_files_are_copied_in(fake_r2egym, tmp_path):
-    files = []
-    for name in ("a.py", "b.py"):
-        p = tmp_path / name
-        p.write_text("x")
-        files.append(str(p))
+def _make_four_tool_files(root):
+    tools_dir = root / "tools"
+    (tools_dir / "r2egym").mkdir(parents=True)
+    rels = ("r2egym/file_editor.py", "search.py", "r2egym/execute_bash.py", "finish.py")
+    paths = []
+    for rel in rels:
+        p = tools_dir / rel
+        p.write_text(f"#!/usr/bin/env python3\n# {rel}\n")
+        p.chmod(0o644)
+        paths.append(str(p))
+    return paths
+
+
+def test_command_files_are_copied_in_one_batch(fake_r2egym, tmp_path):
+    files = _make_four_tool_files(tmp_path)
     handle = _Handle()
-    adapter.make_fleet_repo_env(handle, command_files=files)
-    assert len(handle.files) == 2
+    env = adapter.make_fleet_repo_env(handle)
+    handle.calls.clear()
+    env.add_commands(files)
+    # Four tools take two guest calls in total: one archive write and one unpack+chmod+rm.
+    assert [kind for kind, _ in handle.calls] == ["write_file", "exec"]
+    (staged, data), = handle.files.items()
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        members = tar.getmembers()
+    assert [m.name for m in members] == ["file_editor", "search", "execute_bash", "finish"]
+    assert all((m.uid, m.gid, m.uname, m.gname) == (0, 0, "root", "root") for m in members)
+    command = handle.execs[-1][0]
+    assert f"tar --no-same-owner -xmf {staged} -C /usr/local/bin" in command
+    assert (
+        "chmod +x /usr/local/bin/file_editor /usr/local/bin/search "
+        "/usr/local/bin/execute_bash /usr/local/bin/finish"
+    ) in command
+    assert f"rm -f {staged}" in command
+    assert [c.name for c in env.commands] == ["file_editor", "search", "execute_bash", "finish"]
+
+
+def test_batch_flushes_before_sourcing_shell_command_files(fake_r2egym, tmp_path):
+    py1 = tmp_path / "file_editor.py"
+    py1.write_text("#!/usr/bin/env python3\n")
+    sh = tmp_path / "helper.sh"
+    sh.write_text("helper() {\n  echo hi\n}\n")
+    py2 = tmp_path / "finish.py"
+    py2.write_text("#!/usr/bin/env python3\n")
+    handle = _Handle()
+    env = adapter.make_fleet_repo_env(handle)
+    handle.calls.clear()
+    env.add_commands([str(py1), str(sh), str(py2)])
+    # First batch (file_editor + helper.sh) unpacks before `source /usr/local/bin/helper.sh`,
+    # then finish unpacks after.
+    assert [kind for kind, _ in handle.calls] == [
+        "write_file",
+        "exec",
+        "exec",
+        "write_file",
+        "exec",
+    ]
+    assert "chmod +x /usr/local/bin/file_editor" in handle.calls[1][1]
+    assert "chmod +x /usr/local/bin/helper.sh" not in handle.calls[1][1]
+    assert "source /usr/local/bin/helper.sh" in handle.calls[2][1]
+
+    # A missing file midway raises before flushing any queued tar to the guest.
+    handle.calls.clear()
+    prev = list(env.commands)
+    with pytest.raises(FileNotFoundError):
+        env.add_commands([str(py1), str(tmp_path / "missing.py")])
+    assert handle.calls == []
+    assert env.commands == prev
 
 
 def test_fresh_eval_env_acquires_a_second_environment_and_releases_it(fake_r2egym):
@@ -440,15 +535,22 @@ class _ShellHandle(_Handle):
     """A handle whose exec runs the command in a real shell (cwd: ``root``) and
     whose write_file writes the real path."""
 
-    def __init__(self, root):
+    def __init__(self, root, *, remap_usr_local_bin: bool = False):
         super().__init__()
         self.root = str(root)
+        self._remap_usr_local_bin = remap_usr_local_bin
 
     def exec(self, command, cwd="", env=None, timeout_s=None, check=True):
+        self.calls.append(("exec", command))
         self.execs.append((command, cwd, timeout_s))
         if command == "echo setup":
             return _ExecResult(0)
-        done = subprocess.run(["/bin/sh", "-c", command], cwd=self.root, capture_output=True, text=True)
+        shell_cmd = (
+            command.replace("/usr/local/bin", f"{self.root}/usr/local/bin")
+            if self._remap_usr_local_bin
+            else command
+        )
+        done = subprocess.run(["/bin/sh", "-c", shell_cmd], cwd=self.root, capture_output=True, text=True)
         return _ExecResult(done.returncode, stdout=done.stdout, stderr=done.stderr)
 
     def write_file(self, path, content):
@@ -471,7 +573,9 @@ def test_copy_extracts_with_real_tar_and_mkdir(fake_r2egym, tmp_path):
     tree.mkdir()
     (tree / "a.sh").write_text("echo a\n")
 
+    handle.calls.clear()
     env.runtime.copy_to_container(str(src), f"{root}/opt/tools/")
+    assert [kind for kind, _ in handle.calls] == ["write_file", "exec"]
     assert (root / "opt/tools/tool.py").read_text() == "print(1)\n"
     env.runtime.copy_to_container(str(tree) + "/", f"{root}/opt/")
     assert (root / "opt/cmds/a.sh").read_text() == "echo a\n"
@@ -481,6 +585,86 @@ def test_copy_extracts_with_real_tar_and_mkdir(fake_r2egym, tmp_path):
     assert (root / "opt/tools/renamed.py").read_text() == "print(1)\n"
     for staged in handle.files:  # each staged tar is removed after the extract
         assert not os.path.exists(staged)
+
+
+def test_failed_unpack_in_real_shell_removes_staged_tar_and_preserves_exit(fake_r2egym, tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    handle = _ShellHandle(root)
+    env = adapter.make_fleet_repo_env(handle)
+    src = tmp_path / "x.patch"
+    src.write_text("diff\n")
+
+    # Non-empty directory at the destination file path: mkdir -p succeeds, tar exits 2,
+    # rm -f removes the staged archive, and tar's exit code and stderr surface.
+    blocker = root / "sub" / "x.patch"
+    blocker.mkdir(parents=True)
+    (blocker / "keep").write_text("1\n")
+    handle.calls.clear()
+    with pytest.raises(RuntimeError, match=r"failed \(exit 2\):.*tar:"):
+        env.runtime.copy_to_container(str(src), str(blocker))
+    assert [kind for kind, _ in handle.calls] == ["write_file", "exec"]
+    staged = handle.calls[0][1]
+    assert not os.path.exists(staged)
+
+    # Regular file at the parent path: mkdir -p fails before tar runs, rm -f still removes
+    # the staged archive, and mkdir's non-zero exit surfaces.
+    file_parent = root / "not_a_dir"
+    file_parent.write_text("x\n")
+    handle.calls.clear()
+    with pytest.raises(RuntimeError, match=r"failed \(exit 1\):"):
+        env.runtime.copy_to_container(str(src), f"{file_parent}/x.patch")
+    assert [kind for kind, _ in handle.calls] == ["write_file", "exec"]
+    assert not os.path.exists(handle.calls[0][1])
+
+
+def test_four_tool_batch_in_real_shell_sets_modes_and_cleans_up_on_success_and_failure(fake_r2egym, tmp_path):
+    files = _make_four_tool_files(tmp_path)
+    root = tmp_path / "ok"
+    root.mkdir()
+    handle = _ShellHandle(root, remap_usr_local_bin=True)
+    env = adapter.make_fleet_repo_env(handle, command_files=files)
+    # 1 setup exec + 2 calls (write_file + exec) for all 4 tools.
+    assert [kind for kind, _ in handle.calls] == ["exec", "write_file", "exec"]
+    for name, rel in (
+        ("file_editor", "r2egym/file_editor.py"),
+        ("search", "search.py"),
+        ("execute_bash", "r2egym/execute_bash.py"),
+        ("finish", "finish.py"),
+    ):
+        dest = root / "usr/local/bin" / name
+        assert dest.read_text() == f"#!/usr/bin/env python3\n# {rel}\n"
+        assert os.access(dest, os.X_OK)
+    for staged in handle.files:
+        assert not os.path.exists(staged)
+    assert len(env.commands) == 4
+
+    # Failed unpack of the batch removes the staged tar, surfaces tar's error, and leaves
+    # env.commands untouched.
+    bad_root = tmp_path / "bad"
+    blocker = bad_root / "usr/local/bin" / "search"
+    blocker.mkdir(parents=True)
+    (blocker / "keep").write_text("1\n")
+    bad_handle = _ShellHandle(bad_root, remap_usr_local_bin=True)
+    bad_env = adapter.make_fleet_repo_env(bad_handle)
+    bad_handle.calls.clear()
+    with pytest.raises(RuntimeError, match=r"failed \(exit 2\):.*tar:"):
+        bad_env.add_commands(files)
+    assert [kind for kind, _ in bad_handle.calls] == ["write_file", "exec"]
+    assert not os.path.exists(bad_handle.calls[0][1])
+    assert bad_env.commands == []
+
+    # Timeout on the batched unpack runs the fallback rm -f and leaves env.commands untouched.
+    to_handle = _Handle()
+    to_env = adapter.make_fleet_repo_env(to_handle)
+    to_handle.calls.clear()
+    to_handle.replies["-xmf"] = _ExecResult(None, timed_out=True)
+    with pytest.raises(RuntimeError, match="timed out after 120 s"):
+        to_env.add_commands(files)
+    (staged_to, _), = to_handle.files.items()
+    assert [kind for kind, _ in to_handle.calls] == ["write_file", "exec", "exec"]
+    assert to_handle.calls[-1] == ("exec", f"rm -f {staged_to}")
+    assert to_env.commands == []
 
 
 def test_reset_rebinds_and_detects_a_failed_rebind(fake_r2egym):
